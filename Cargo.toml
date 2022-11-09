@@ -1,0 +1,22 @@
+[package]
+name = "leto-rs"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = "0"
+log4rs = "1"
+clap = "4"
+crypto = { package = "libcrypto", git = "https://github.com/libdist-rs/libcrypto-rs.git" }
+storage = { package = "libstorage-rs", git = "https://github.com/libdist-rs/libstorage-rs.git" }
+mempool = { package = "libmempool-rs", git = "https://github.com/libdist-rs/libmempool-rs.git" }
+network = { package = "network", git = "https://github.com/libdist-rs/libnet-rs.git" }
+serde = { version = "1", features = ["derive"]}
+bincode = "1"
+base64 = "0"
+anyhow = "1"
+fnv = "1"
+tokio = "1"
+config = "0"

@@ -1,0 +1,36 @@
+# ID must be specified when invoking the program
+
+[mempool_config]
+# The number of recent blocks to retain in memory
+gc_depth = 5
+# The number of nodes to try to contact if a synchronization request fails
+sync_retry_nodes = 4
+
+# This parameter denotes the amount of time to wait before re-sending a sync request
+[mempool_config.sync_retry_delay]
+secs = 0
+nanos = 100_000_000
+
+[consensus_config]
+num_nodes = 4
+mempool_port = 6000 # Port for incoming mempool connections
+consensus_port = 7000 # Port to listen to other servers
+
+# Address to listen to other mempools
+[consensus_config.mempool_addresses]
+0 = ["127.0.0.1", "6001"]
+1 = ["127.0.0.1", "6002"]
+2 = ["127.0.0.1", "6003"]
+3 = ["127.0.0.1", "6004"]
+
+# Address for other consensus pools
+[consensus_config.consensus_addresses]
+0 = ["127.0.0.1", "7001"]
+1 = ["127.0.0.1", "7002"]
+2 = ["127.0.0.1", "7003"]
+3 = ["127.0.0.1", "7004"]
+
+[storage]
+# The base path
+base = "src/server/test"
+prefix = "db-"
