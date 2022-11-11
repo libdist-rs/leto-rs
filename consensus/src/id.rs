@@ -13,6 +13,22 @@ impl From<usize> for Id {
     }
 }
 
+impl TryFrom<String> for Id {
+    type Error = anyhow::Error;
+    // forward it to the &str implementation
+    fn try_from(value: String) -> anyhow::Result<Self> {
+        Self::try_from(value.as_str())
+    }
+}
+
+impl<'a> TryFrom<&'a str> for Id {
+    type Error = anyhow::Error;
+    fn try_from(value: &'a str) -> anyhow::Result<Self> {
+        let usize_val: usize = value.parse()?;
+        Ok(usize_val.into())
+    }
+}
+
 impl Display for Id {
     fn fmt(
         &self,

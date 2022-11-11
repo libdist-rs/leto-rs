@@ -1,6 +1,7 @@
-use super::Round;
+use crate::{Id, Round};
+use fnv::FnvHashMap as HashMap;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, env, fmt};
+use std::{env, fmt};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Log {
@@ -33,6 +34,19 @@ impl fmt::Display for ENV {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Party {
+    pub id: Id,
+    pub mempool_address: String,
+    /// Port for mempool communication
+    pub mempool_port: u16,
+    pub consensus_address: String,
+    /// Port for consensus communication
+    pub consensus_port: u16,
+    /// Port for clients to communicate
+    pub client_port: u16,
+}
+
 impl From<&str> for ENV {
     fn from(env: &str) -> Self {
         match env {
@@ -45,14 +59,28 @@ impl From<&str> for ENV {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
-    pub mempool_addresses: HashMap<usize, (String, String)>,
-    pub mempool_port: u16,
-    // mempool config
-    // net config
-    // crypto config
-    pub num_nodes: usize,
-    pub consensus_port: u16,
-    pub consensus_addresses: HashMap<usize, (String, String)>,
+    /// All the parties in the system
+    pub parties: HashMap<Id, Party>,
+}
+
+impl Config {
+    /// Returns the number of nodes in the consensus system
+    pub fn num_nodes(&self) -> usize {
+        self.parties.len()
+    }
+
+    /// Returns the party corresponding to Id
+    pub fn get(
+        &self,
+        id: &Id,
+    ) -> Option<&Party> {
+        self.parties.get(id)
+    }
+
+    /// Returns all the parties
+    pub fn get_all_ids(&self) -> Vec<Id> {
+        self.parties.keys().cloned().collect()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -63,11 +91,11 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(config_file_name: String) -> anyhow::Result<Self> {
         let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "development".into());
         let conf = config::Config::builder()
             // DEFAULT settings Add in `./Settings.json`
-            .add_source(config::File::with_name("./src/server/test/Default").required(true))
+            .add_source(config::File::with_name(&config_file_name).required(true))
             // Add in the current environment file (Testing, Dev or Prod)
             // Default to 'development' env
             // Note that this file is _optional_

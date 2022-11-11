@@ -1,0 +1,24 @@
+[package]
+name = "node"
+version = "0.1.0"
+edition = "2021"
+authors = ["Adithya Bhat <dth.bht@gmail.com>"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = "0"
+log4rs = "1"
+anyhow = "1"
+consensus = { package = "leto", path = "../consensus" }
+signal-hook = "0"
+
+[dependencies.clap]
+version = "4"
+features = ["derive"]
+
+[dependencies.tokio]
+version = "1"
+features = [
+    "full",
+]

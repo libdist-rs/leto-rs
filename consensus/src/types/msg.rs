@@ -1,4 +1,5 @@
 use super::Proposal;
+use mempool::Transaction;
 use network::Identifier;
 use serde::{Deserialize, Serialize};
 
@@ -16,3 +17,13 @@ where
     Round: network::Message,
 {
 }
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum ClientMsg<Tx> {
+    NewTx(Tx),
+}
+
+impl<Tx> network::Message for ClientMsg<Tx> 
+where 
+    Tx: Transaction,
+{}
