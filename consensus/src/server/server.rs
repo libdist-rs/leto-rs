@@ -1,5 +1,5 @@
 use super::{Handler, Settings};
-use crate::{Id, Transaction, to_socket_address};
+use crate::{to_socket_address, Id, Transaction};
 use anyhow::{anyhow, Result};
 use fnv::FnvHashMap;
 use log::*;
@@ -8,10 +8,7 @@ use network::{
     plaintcp::{TcpReceiver, TcpSimpleSender},
     Acknowledgement,
 };
-use std::{
-    net::SocketAddr,
-    path::PathBuf,
-};
+use std::{net::SocketAddr, path::PathBuf};
 use storage::rocksdb::Storage;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 

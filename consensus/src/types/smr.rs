@@ -17,4 +17,10 @@ pub struct Data {
     tx: Vec<u8>,
 }
 
+impl Data {
+    pub fn new(tx: Vec<u8>) -> Self {
+        Self { tx }
+    }
+}
+
 impl network::Message for Data {}

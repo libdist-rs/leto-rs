@@ -10,3 +10,4 @@ Cargo.lock
 **/*.rs.bk
 src/types/sig.rs
 consensus/src/server/db-*
+consensus/src/client/db-*

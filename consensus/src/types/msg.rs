@@ -23,7 +23,4 @@ pub enum ClientMsg<Tx> {
     NewTx(Tx),
 }
 
-impl<Tx> network::Message for ClientMsg<Tx> 
-where 
-    Tx: Transaction,
-{}
+impl<Tx> network::Message for ClientMsg<Tx> where Tx: Transaction {}

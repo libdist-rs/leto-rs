@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use consensus::{
-    server, client,
+    client::{self, Stressor},
+    server,
     server::Server,
     Id,
 };
@@ -9,6 +10,7 @@ use log::*;
 use log4rs::{
     append::console::ConsoleAppender,
     config::{Appender, Root},
+    encode::pattern::PatternEncoder,
     Config,
 };
 use signal_hook::{
@@ -70,9 +72,18 @@ enum SubCommand {
 }
 
 // generate a default stdout logger
-fn default_logger(level: log::Level) -> Result<log4rs::Handle> {
+fn default_logger(
+    id: String,
+    level: log::Level,
+) -> Result<log4rs::Handle> {
     let level_filter = level.to_level_filter();
-    let stdout = ConsoleAppender::builder().build();
+    let log_str = format!(
+        "{{f}}:{{L}}| NodeId:{} |{{d}} [{{l}}] {{h({{m}})}}{{n}}",
+        id
+    );
+    let stdout = ConsoleAppender::builder()
+        .encoder(Box::new(PatternEncoder::new(&log_str)))
+        .build();
 
     let config = Config::builder()
         .appender(Appender::builder().build("stdout", Box::new(stdout)))
@@ -111,13 +122,19 @@ async fn main() -> Result<()> {
         _ => log::Level::Trace,
     };
 
+    let id = match &args.mode {
+        SubCommand::Server { id, .. } => id.clone(),
+        SubCommand::Client { id, .. } => id.clone(),
+        _ => format!("Other"),
+    };
+
     // Setup logging
     match args.log_config {
         // Use config file if some file is specified
         Some(log_file) => logger_from_file(log_level, log_file),
         // Use default logger
         None => {
-            default_logger(log_level)?;
+            default_logger(id, log_level)?;
             Ok(())
         }
     }?;
@@ -135,6 +152,7 @@ async fn main() -> Result<()> {
             info!("Using the settings: {:?}", settings);
 
             let all_ids = settings.consensus_config.get_all_ids();
+
             // Start the Server
             let _exit_tx = Server::spawn(server_id, all_ids, settings)?;
 
@@ -142,11 +160,10 @@ async fn main() -> Result<()> {
             let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
             signals.forever().next();
             info!("Received termination signal");
-            info!("Shutting down node");
+            info!("Shutting down server");
         }
         SubCommand::Client { id, config } => {
-            // TODO: Use this
-            let _client_id = Id::try_from(id)?;
+            let client_id = Id::try_from(id)?;
 
             // Get the config file, or use a default config file
             let config_file =
@@ -155,6 +172,14 @@ async fn main() -> Result<()> {
 
             let settings = client::Settings::new(config_file)?;
             info!("Using the settings: {:?}", settings);
+
+            // Start the client
+            let _exit_tx = Stressor::spawn(client_id, settings)?;
+            // Implement a waiting strategy
+            let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
+            signals.forever().next();
+            info!("Received termination signal");
+            info!("Shutting down server");
         }
         _ => {
             todo!()

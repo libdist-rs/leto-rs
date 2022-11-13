@@ -1,6 +1,42 @@
-use crate::server::Config;
+use crate::Id;
+use fnv::FnvHashMap as HashMap;
 use serde::{Deserialize, Serialize};
 use std::env;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Party {
+    pub id: Id,
+    pub address: String,
+    /// Port for sending transactions, corresponds to the client_port of the
+    /// server
+    pub port: u16,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct Config {
+    /// All the parties in the system
+    pub parties: HashMap<Id, Party>,
+}
+
+impl Config {
+    /// Returns the number of nodes in the consensus system
+    pub fn num_nodes(&self) -> usize {
+        self.parties.len()
+    }
+
+    /// Returns the party corresponding to Id
+    pub fn get(
+        &self,
+        id: &Id,
+    ) -> Option<&Party> {
+        self.parties.get(id)
+    }
+
+    /// Returns all the parties
+    pub fn get_all_ids(&self) -> Vec<Id> {
+        self.parties.keys().cloned().collect()
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {

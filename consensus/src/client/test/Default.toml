@@ -3,33 +3,21 @@ port = "9001"
 # Address to listen to other consensus servers
 [consensus_config.parties.0]
 id = 0
-mempool_address = "127.0.0.1"
-mempool_port = "6001"
-consensus_address = "127.0.0.1"
-consensus_port = "7001"
-client_port = "8001"
+address = "127.0.0.1"
+port = "8001"
 
 [consensus_config.parties.1]
 id = 1
-mempool_address = "127.0.0.1"
-mempool_port = "6002"
-consensus_address = "127.0.0.1"
-consensus_port = "7002"
-client_port = "8002"
+address = "127.0.0.1"
+port = "8002"
 
 [consensus_config.parties.2]
 id = 2
-mempool_address = "127.0.0.1"
-mempool_port = "6003"
-consensus_address = "127.0.0.1"
-consensus_port = "7003"
-client_port = "8003"
+address = "127.0.0.1"
+port = "8003"
 
 [consensus_config.parties.3]
 id = 3
-mempool_address = "127.0.0.1"
-mempool_port = "6004"
-consensus_address = "127.0.0.1"
-consensus_port = "7004"
-client_port = "8004"
+address = "127.0.0.1"
+port = "8004"
 

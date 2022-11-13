@@ -4,11 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::{env, fmt};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Log {
-    pub file: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StorageConfig {
     pub base: String,
     pub prefix: String,
@@ -34,6 +29,16 @@ impl fmt::Display for ENV {
     }
 }
 
+impl From<&str> for ENV {
+    fn from(env: &str) -> Self {
+        match env {
+            "Testing" => ENV::Testing,
+            "Production" => ENV::Production,
+            _ => ENV::Development,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Party {
     pub id: Id,
@@ -45,16 +50,6 @@ pub struct Party {
     pub consensus_port: u16,
     /// Port for clients to communicate
     pub client_port: u16,
-}
-
-impl From<&str> for ENV {
-    fn from(env: &str) -> Self {
-        match env {
-            "Testing" => ENV::Testing,
-            "Production" => ENV::Production,
-            _ => ENV::Development,
-        }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
