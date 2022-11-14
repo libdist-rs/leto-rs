@@ -15,12 +15,15 @@ pub struct Party {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     /// All the parties in the system
-    parties: HashMap<Id, Party>,
+    pub parties: HashMap<Id, Party>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 /// Benchmark configurations
 pub struct Bench {
+    /// The amount of bytes to send
+    /// Must be above 8 bytes as we will add a tag
+    pub tx_size: usize,
     /// Every `burst_interval_ms`, `txs_per_burst` transactions are sent to all
     /// the servers
     pub burst_interval_ms: u64,

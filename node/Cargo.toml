@@ -12,6 +12,8 @@ log4rs = "1"
 anyhow = "1"
 consensus = { package = "leto", path = "../consensus" }
 signal-hook = "0"
+serde_json = "1"
+fnv = "1"
 
 [dependencies.clap]
 version = "4"
@@ -22,3 +24,7 @@ version = "1"
 features = [
     "full",
 ]
+
+[dependencies.mempool]
+package = "libmempool-rs"
+git = "https://github.com/libdist-rs/libmempool-rs.git"

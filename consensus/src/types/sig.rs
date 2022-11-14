@@ -2,9 +2,10 @@ use anyhow::Result;
 use crypto::hash::Hash;
 use crypto::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
+use std::fmt::{self, Debug, Display};
 use std::marker::PhantomData;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 /// A Signature contains (source, raw signature bytes)
 pub struct Signature<Id, T> {
     raw: Vec<u8>,
@@ -70,5 +71,35 @@ where
             return Err(anyhow::Error::msg("Signature Verification Failed"));
         }
         Ok(())
+    }
+}
+
+impl<Id, T> Debug for Signature<Id, T>
+where
+    Id: Debug,
+{
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        f.debug_struct("Signature")
+            .field("sig", &base64::encode(&self.raw))
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
+impl<Id, T> Display for Signature<Id, T>
+where
+    Id: Debug,
+{
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        f.debug_struct("Signature")
+            .field("sig", &base64::encode(&self.raw))
+            .field("id", &self.id)
+            .finish()
     }
 }

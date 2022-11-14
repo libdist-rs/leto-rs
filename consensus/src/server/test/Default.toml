@@ -48,3 +48,6 @@ client_port = "8004"
 # The base path
 base = "consensus/src/client/test"
 prefix = "db"
+
+[bench_config.sealer.Sized]
+size = 8000

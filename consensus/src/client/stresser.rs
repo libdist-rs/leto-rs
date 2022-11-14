@@ -12,6 +12,8 @@ use network::{
     plaintcp::{TcpReceiver, TcpSimpleSender},
     Acknowledgement, NetSender,
 };
+use serde::Deserialize;
+use serde::Serialize;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
     oneshot,
@@ -22,25 +24,38 @@ pub struct Stressor {
     pub id: Id,
 }
 
-/*
- * TODO: Implement ConsensusHandler
- * TODO: Implement Client
- * TODO: Use the args
- * TODO: Add data size
- */
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ExtraData {
+    pub tag: usize,
+    pub source: Id,
+}
+
+impl ExtraData {
+    pub fn new(
+        tag: usize,
+        source: Id,
+    ) -> Self {
+        Self { tag, source }
+    }
+}
 
 // Generates a mock transaction with this Id
-fn mock_transaction(id: usize) -> Transaction {
-    let data = Data::new(id.to_le_bytes().to_vec());
+fn mock_transaction(
+    tx_id: usize,
+    client_id: Id,
+    data_len: usize,
+) -> Transaction {
+    let data = Data::new(vec![0 as u8; data_len]);
+    let extra_data = ExtraData::new(tx_id, client_id);
     Transaction {
         data,
-        extra: vec![],
+        extra: bincode::serialize(&extra_data).unwrap(),
     }
 }
 
 impl Stressor {
     pub fn spawn(
-        _my_id: Id,
+        my_id: Id,
         settings: Settings,
     ) -> Result<oneshot::Sender<()>> {
         let mut peer_map = FnvHashMap::default();
@@ -55,31 +70,37 @@ impl Stressor {
             peer_map.insert(id.clone(), consensus_addr);
         }
 
-        let burst = settings.bench_config.txs_per_burst;
-        let my_addr = to_socket_address("0.0.0.0", settings.port)?;
+        // Get stress settings
+        let burst_tx = settings.bench_config.txs_per_burst;
+        let tx_size = settings.bench_config.tx_size;
 
+        // Networking setup
         let (consensus_tx, mut consensus_rx) = unbounded_channel();
+        let my_addr = to_socket_address("0.0.0.0", settings.port)?;
         TcpReceiver::spawn(my_addr, Handler::new(consensus_tx));
-        let (exit_tx, mut exit_rx) = oneshot::channel();
         let mut consensus_sender =
             TcpSimpleSender::<Id, Transaction, Acknowledgement>::with_peers(peer_map);
+
+        // Start the client
+        let (exit_tx, mut exit_rx) = oneshot::channel();
         tokio::spawn(async move {
-            let mut timer = tokio::time::interval(Duration::from_millis(
+            let mut tx_id: usize = 0;
+            // Burst timer
+            let mut burst_timer = tokio::time::interval(Duration::from_millis(
                 settings.bench_config.burst_interval_ms,
             ));
-            let mut test_id: usize = 0;
             loop {
                 tokio::select! {
                     _ = &mut exit_rx => {
                         info!("Shutting down the client");
                         break;
                     }
-                    _ = timer.tick() => {
+                    _ = burst_timer.tick() => {
                         // Time to send a burst of transactions
-                        // TODO: Send X every interval
-                        for _i in 0..burst {
-                            let tx = mock_transaction(test_id);
-                            test_id = test_id + 1;
+                        // Send `burst_tx` transactions every interval
+                        for _i in 0..burst_tx {
+                            let tx = mock_transaction(tx_id, my_id, tx_size);
+                            tx_id = tx_id + 1;
                             consensus_sender.broadcast(
                                 tx,
                                 &all_ids, // SendAll
@@ -88,6 +109,7 @@ impl Stressor {
                     }
                     confirmation = consensus_rx.recv() => {
                         info!("Received a confirmation message: {:?}", confirmation);
+                        // TODO: Handle tx confirmation
                     }
                 }
             }

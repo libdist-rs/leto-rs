@@ -79,10 +79,23 @@ impl Config {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum SealerType {
+    Timed { timeout_ms: u64 },
+    Sized { size: usize },
+    Hybrid { timeout_ms: u64, size: usize },
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BenchConfig {
+    pub sealer: SealerType,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
     pub mempool_config: mempool::Config<Round>,
     pub consensus_config: Config,
     pub storage: StorageConfig,
+    pub bench_config: Option<BenchConfig>,
 }
 
 impl Settings {

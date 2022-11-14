@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::fmt::{self, Display};
+use std::fmt::{self, Debug, Display};
 
-#[derive(Debug, Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
+#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
 pub struct Id(usize);
 
 impl network::Message for Id {}
@@ -34,6 +34,15 @@ impl Display for Id {
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        self.0.fmt(f)
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Debug for Id {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }

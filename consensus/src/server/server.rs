@@ -1,14 +1,17 @@
-use super::{Handler, Settings};
+use super::{Handler, SealerType, Settings};
 use crate::{to_socket_address, Id, Transaction};
 use anyhow::{anyhow, Result};
 use fnv::FnvHashMap;
 use log::*;
-use mempool::MempoolMsg;
+use mempool::{
+    sealer::{HybridSealer, Sized, Timed},
+    MempoolMsg,
+};
 use network::{
     plaintcp::{TcpReceiver, TcpSimpleSender},
     Acknowledgement,
 };
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use storage::rocksdb::Storage;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 
@@ -67,8 +70,9 @@ impl Server {
         // TODO: Use this sender when implementing
         let (_tx_consensus_to_mem, rx_consensus_to_mem) = unbounded_channel();
         let (tx_processor, rx_processor) = unbounded_channel();
-        let (tx_batcher, mut rx_batcher) = unbounded_channel();
+        let (tx_batcher_in, rx_batcher_in) = unbounded_channel();
         let (consensus_net_tx, mut consensus_net_rx) = unbounded_channel();
+        let (tx_batcher_out, mut rx_batcher_out) = unbounded_channel();
         let mempool_addr = to_socket_address("0.0.0.0", me.mempool_port)?;
         let consensus_addr = to_socket_address("0.0.0.0", me.consensus_port)?;
         let client_addr = to_socket_address("0.0.0.0", me.client_port)?;
@@ -84,7 +88,7 @@ impl Server {
             _store,
             mempool_net,
             rx_consensus_to_mem,
-            tx_batcher,
+            tx_batcher_in,
             tx_processor,
             rx_processor,
             tx_mem_to_consensus,
@@ -92,6 +96,26 @@ impl Server {
             client_addr,
         );
 
+        // Start the batcher
+        let sealer: SealerType = match settings.bench_config {
+            None => SealerType::Timed { timeout_ms: 1_000 },
+            Some(config) => config.sealer,
+        };
+        match sealer {
+            SealerType::Timed { timeout_ms } => mempool::batcher::Batcher::spawn(
+                rx_batcher_in,
+                tx_batcher_out,
+                Timed::new(Duration::from_millis(timeout_ms)),
+            ),
+            SealerType::Sized { size } => {
+                mempool::batcher::Batcher::spawn(rx_batcher_in, tx_batcher_out, Sized::new(size))
+            }
+            SealerType::Hybrid { timeout_ms, size } => mempool::batcher::Batcher::spawn(
+                rx_batcher_in,
+                tx_batcher_out,
+                HybridSealer::new(Duration::from_millis(timeout_ms), size),
+            ),
+        };
         tokio::spawn(async move {
             info!("Starting the server");
             loop {
@@ -101,8 +125,13 @@ impl Server {
                         break;
                     }
                     // Handle batch ready messages from the mempool
-                    batch = rx_batcher.recv() => {
-                        info!("Got a batch: {:?}", batch);
+                    batch = rx_batcher_out.recv() => {
+                        if let None = batch {
+                            warn!("Got an empty batch");
+                            continue;
+                        }
+                        let batch = batch.unwrap();
+                        info!("Got a batch of size {:?}", batch.payload.len());
                     }
                     // Handle outputs from the mempool
                     mem_msg = rx_mem_to_consensus.recv() => {

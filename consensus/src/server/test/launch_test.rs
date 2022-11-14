@@ -39,6 +39,7 @@ fn dummy_settings(num_nodes: usize) -> Settings {
         mempool_config,
         consensus_config: crate::server::Config { parties },
         storage: storage_config,
+        bench_config: None,
     }
 }
 
