@@ -97,7 +97,7 @@ impl Server {
             loop {
                 tokio::select! {
                     _ = &mut exit_rx => {
-                        info!("Termination signal received. Shutting down server.");
+                        info!("Termination signal received by the server. Exiting.");
                         break;
                     }
                     // Handle batch ready messages from the mempool

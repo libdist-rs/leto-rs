@@ -1,5 +1,5 @@
-use super::Hash;
 use anyhow::Result;
+use crypto::hash::Hash;
 use crypto::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 use std::marker::PhantomData;
@@ -31,7 +31,7 @@ impl<Id, T> Signature<Id, T> {
         id: Id,
         sk: &SecretKey,
     ) -> Result<Self> {
-        let raw = sk.sign(&msg_hash.hash)?;
+        let raw = sk.sign(&msg_hash.as_ref())?;
         Ok(Self {
             raw,
             id,
@@ -66,7 +66,7 @@ where
         msg_hash: &Hash<T>,
         pk: &PublicKey,
     ) -> Result<()> {
-        if !pk.verify(&msg_hash.hash, &self.raw) {
+        if !pk.verify(&msg_hash.as_ref(), &self.raw) {
             return Err(anyhow::Error::msg("Signature Verification Failed"));
         }
         Ok(())

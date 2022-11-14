@@ -18,9 +18,11 @@ where
 {
 }
 
+/// `ClientMsg` are messages sent between the client and the servers
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ClientMsg<Tx> {
     NewTx(Tx),
+    // Confirmation(Dig<Tx>),
 }
 
 impl<Tx> network::Message for ClientMsg<Tx> where Tx: Transaction {}

@@ -15,7 +15,18 @@ pub struct Party {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     /// All the parties in the system
-    pub parties: HashMap<Id, Party>,
+    parties: HashMap<Id, Party>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+/// Benchmark configurations
+pub struct Bench {
+    /// Every `burst_interval_ms`, `txs_per_burst` transactions are sent to all
+    /// the servers
+    pub burst_interval_ms: u64,
+    /// Every `burst_interval_ms`, `txs_per_burst` transactions are sent to all
+    /// the servers
+    pub txs_per_burst: usize,
 }
 
 impl Config {
@@ -42,6 +53,7 @@ impl Config {
 pub struct Settings {
     pub port: u16,
     pub consensus_config: Config,
+    pub bench_config: Bench,
 }
 
 impl Settings {

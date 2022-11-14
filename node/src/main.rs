@@ -78,7 +78,7 @@ fn default_logger(
 ) -> Result<log4rs::Handle> {
     let level_filter = level.to_level_filter();
     let log_str = format!(
-        "{{f}}:{{L}}| NodeId:{} |{{d}} [{{l}}] {{h({{m}})}}{{n}}",
+        "{{f}}:{{L}} |NodeId:{} |{{d}} [{{l}}] {{h({{m}})}}{{n}}",
         id
     );
     let stdout = ConsoleAppender::builder()

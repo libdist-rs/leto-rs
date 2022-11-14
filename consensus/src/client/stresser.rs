@@ -55,14 +55,18 @@ impl Stressor {
             peer_map.insert(id.clone(), consensus_addr);
         }
 
-        let (consensus_tx, mut consensus_rx) = unbounded_channel();
+        let burst = settings.bench_config.txs_per_burst;
         let my_addr = to_socket_address("0.0.0.0", settings.port)?;
+
+        let (consensus_tx, mut consensus_rx) = unbounded_channel();
         TcpReceiver::spawn(my_addr, Handler::new(consensus_tx));
         let (exit_tx, mut exit_rx) = oneshot::channel();
         let mut consensus_sender =
             TcpSimpleSender::<Id, Transaction, Acknowledgement>::with_peers(peer_map);
         tokio::spawn(async move {
-            let mut timer = tokio::time::interval(Duration::from_millis(10));
+            let mut timer = tokio::time::interval(Duration::from_millis(
+                settings.bench_config.burst_interval_ms,
+            ));
             let mut test_id: usize = 0;
             loop {
                 tokio::select! {
@@ -72,12 +76,15 @@ impl Stressor {
                     }
                     _ = timer.tick() => {
                         // Time to send a burst of transactions
-                        let tx = mock_transaction(test_id);
-                        test_id = test_id + 1;
-                        consensus_sender.broadcast(
-                            tx,
-                            &all_ids, // SendAll
-                        ).await;
+                        // TODO: Send X every interval
+                        for _i in 0..burst {
+                            let tx = mock_transaction(test_id);
+                            test_id = test_id + 1;
+                            consensus_sender.broadcast(
+                                tx,
+                                &all_ids, // SendAll
+                            ).await;
+                        }
                     }
                     confirmation = consensus_rx.recv() => {
                         info!("Received a confirmation message: {:?}", confirmation);

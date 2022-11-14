@@ -1,5 +1,6 @@
-use super::{Hash, Signature};
+use super::Signature;
 use anyhow::Result;
+use crypto::hash::Hash;
 use crypto::PublicKey;
 use fnv::{FnvHashMap, FnvHashSet};
 use serde::{Deserialize, Serialize};
