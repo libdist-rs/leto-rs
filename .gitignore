@@ -10,3 +10,6 @@ Cargo.lock
 **/*.rs.bk
 db-*
 *.log
+keys-*.json
+server.json
+client-*.json

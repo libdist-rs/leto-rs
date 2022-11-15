@@ -92,9 +92,12 @@ pub struct BenchConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
-    pub mempool_config: mempool::Config<Round>,
+    /// Contains information about contacting the parties
     pub consensus_config: Config,
+    /// Contains information about the mempool settings
+    pub mempool_config: mempool::Config<Round>,
     pub storage: StorageConfig,
+    /// Contains information about the sealing settings
     pub bench_config: Option<BenchConfig>,
 }
 

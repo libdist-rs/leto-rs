@@ -1,0 +1,3 @@
+boto3==1.26.0
+fabric==2.7.1
+matplotlib==3.6.2

@@ -1,12 +1,4 @@
 {
-  "mempool_config": {
-    "gc_depth": 5,
-    "sync_retry_delay": {
-      "secs": 1,
-      "nanos": 0
-    },
-    "sync_retry_nodes": 4
-  },
   "consensus_config": {
     "parties": {
       "1": {
@@ -42,6 +34,14 @@
         "client_port": 9002
       }
     }
+  },
+  "mempool_config": {
+    "gc_depth": 5,
+    "sync_retry_delay": {
+      "secs": 1,
+      "nanos": 0
+    },
+    "sync_retry_nodes": 4
   },
   "storage": {
     "base": ".",
