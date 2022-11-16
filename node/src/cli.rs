@@ -150,11 +150,6 @@ pub struct CreateConfig {
     #[clap(default_value_t = format!("db"))]
     pub db_prefix: String,
 
-    /// Type of block sealer
-    #[arg(short = 'T', long, value_enum)]
-    #[clap(default_value_t = SealerType::Sized)]
-    pub sealer_type: SealerType,
-
     /// Sized Sealer size in bytes
     #[arg(short = 'S', long)]
     #[clap(default_value_t = 1_024)]

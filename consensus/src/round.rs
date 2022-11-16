@@ -4,6 +4,10 @@ use std::fmt::{self, Display};
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Copy, Clone)]
 pub struct Round(usize);
 
+impl Round {
+    pub const START:Self = Self ( 0 );
+}
+
 impl Default for Round {
     fn default() -> Self {
         Self(10)

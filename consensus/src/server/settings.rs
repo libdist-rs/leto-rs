@@ -1,7 +1,7 @@
 use crate::{Id, Round};
 use fnv::FnvHashMap as HashMap;
 use serde::{Deserialize, Serialize};
-use std::{env, fmt};
+use std::{env, fmt, time::Duration};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StorageConfig {
@@ -79,15 +79,18 @@ impl Config {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum SealerType {
-    Timed { timeout_ms: u64 },
-    Sized { size: usize },
-    Hybrid { timeout_ms: u64, size: usize },
+pub struct BenchConfig {
+    pub batch_size: usize,
+    pub batch_timeout: Duration,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct BenchConfig {
-    pub sealer: SealerType,
+impl Default for BenchConfig {
+    fn default() -> Self {
+        Self { 
+            batch_size: 1_000, 
+            batch_timeout: Duration::from_millis(1_000),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -98,7 +101,7 @@ pub struct Settings {
     pub mempool_config: mempool::Config<Round>,
     pub storage: StorageConfig,
     /// Contains information about the sealing settings
-    pub bench_config: Option<BenchConfig>,
+    pub bench_config: BenchConfig,
 }
 
 impl Settings {

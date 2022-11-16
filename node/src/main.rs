@@ -163,23 +163,9 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
     };
 
     // Create Bench config
-    let bench_config = match config.sealer_type {
-        SealerType::Sized => BenchConfig {
-            sealer: server::SealerType::Sized {
-                size: config.sealer_size,
-            },
-        },
-        SealerType::Timed => BenchConfig {
-            sealer: server::SealerType::Timed {
-                timeout_ms: config.timeout_ms,
-            },
-        },
-        SealerType::Hybrid => BenchConfig {
-            sealer: server::SealerType::Hybrid {
-                timeout_ms: config.timeout_ms,
-                size: config.sealer_size,
-            },
-        },
+    let bench_config = BenchConfig {
+        batch_size: config.sealer_size,
+        batch_timeout: Duration::from_millis(config.timeout_ms),
     };
 
     // Create server settings from this information
@@ -187,7 +173,7 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
         mempool_config,
         consensus_config,
         storage: storage_config,
-        bench_config: Some(bench_config),
+        bench_config,
     };
 
     // Create client settings from this information

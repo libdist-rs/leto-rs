@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::server::{Id, Party, Round, Server, Settings, StorageConfig};
+use crate::server::{Id, Party, Round, Server, Settings, StorageConfig, BenchConfig};
 use anyhow::{anyhow, Result};
 use fnv::FnvHashMap;
 
@@ -39,7 +39,7 @@ fn dummy_settings(num_nodes: usize) -> Settings {
         mempool_config,
         consensus_config: crate::server::Config { parties },
         storage: storage_config,
-        bench_config: None,
+        bench_config: BenchConfig::default(),
     }
 }
 

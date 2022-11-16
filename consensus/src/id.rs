@@ -7,6 +7,10 @@ pub struct Id(usize);
 impl network::Message for Id {}
 impl network::Identifier for Id {}
 
+impl Id {
+    pub const START: Self = Self ( 0 );
+}
+
 impl From<usize> for Id {
     fn from(i: usize) -> Self {
         Self(i)
