@@ -86,8 +86,8 @@ pub struct BenchConfig {
 
 impl Default for BenchConfig {
     fn default() -> Self {
-        Self { 
-            batch_size: 1_000, 
+        Self {
+            batch_size: 1_000,
             batch_timeout: Duration::from_millis(1_000),
         }
     }

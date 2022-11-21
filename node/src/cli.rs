@@ -34,6 +34,9 @@ pub enum SubCommand {
         #[arg(short, long, value_name = "FILE")]
         #[clap(default_value = "examples/server.json")]
         config: PathBuf,
+        /// Keys file
+        #[arg(short, long, value_name = "FILE")]
+        key_file: PathBuf,
     },
     /// Runs a client
     Client {
@@ -110,28 +113,28 @@ pub struct CreateConfig {
 
     /// Mempool port (or base mempool port for local testing)
     #[arg(short = 'M', long)]
-    #[clap(default_value_t = 7000)]
+    #[clap(default_value_t = 7001)]
     #[arg(value_parser = clap::value_parser!(u16).range(1023..))]
     pub mempool_port: u16,
 
     /// Consensus port (or base consensus port for local testing)
     #[arg(long)]
     #[arg(short = 'C')]
-    #[clap(default_value_t = 8000)]
+    #[clap(default_value_t = 8001)]
     #[arg(value_parser = clap::value_parser!(u16).range(1023..))]
     pub consensus_port: u16,
 
     /// Client port for the servers (or base client port for local testing)
     #[arg(long)]
     #[arg(short = 'P')]
-    #[clap(default_value_t = 9000)]
+    #[clap(default_value_t = 9001)]
     #[arg(value_parser = clap::value_parser!(u16).range(1023..))]
     pub server_client_port: u16,
 
     /// Client port for the servers (or base client port for local testing)
     #[arg(long)]
     #[arg(short = 'j')]
-    #[clap(default_value_t = 10_000)]
+    #[clap(default_value_t = 10_001)]
     #[arg(value_parser = clap::value_parser!(u16).range(1023..))]
     pub client_port: u16,
 

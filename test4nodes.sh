@@ -1,12 +1,31 @@
 #!/bin/bash
 
+# Killall previous instances
+killall node
+
+N=${N:-4}
+
+echo "Building..."
 cargo b --all
 
-echo "Starting 4 servers"
-cargo r -p node -- server --id 0 &> test-log0.log &
-cargo r -p node -- server --id 1 &> test-log1.log &
-cargo r -p node -- server --id 2 &> test-log2.log &
-cargo r -p node -- server --id 3 &> test-log3.log &
+echo "Clearing the database"
+rm -rf db-*.db
+
+echo "Starting ${N} servers"
+for((i=0;i<$N;i++)); do
+    # Start the server
+    cargo r -p node \
+        -- \
+        -vvvv \
+        server \
+        --id "${i}" \
+        --key-file examples/keys-${i}.json &> test-log${i}.log &
+done
+
 sleep 1 
 echo "Starting the client" 
-cargo r -p node -- client --id 4
+cargo r -p node \
+    -- \
+    -vvvv \
+    client \
+    --id 4 &> test-log-client.log

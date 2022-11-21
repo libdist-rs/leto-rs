@@ -18,6 +18,3 @@ pub use leto::*;
 
 #[cfg(test)]
 mod test;
-
-use crate::{types, Id, Round};
-pub type ProtocolMsg = types::ProtocolMsg<Id, types::Data, Round>;

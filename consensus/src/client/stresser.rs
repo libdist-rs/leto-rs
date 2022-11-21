@@ -1,7 +1,9 @@
+use std::marker::PhantomData;
 use std::time::Duration;
 
 use super::Settings;
-use crate::{client::ClientMsg, to_socket_address, types::Data, Id, Transaction};
+use crate::types::{self, ClientMsg, Data, SimpleData, SimpleTx};
+use crate::{to_socket_address, Id};
 use anyhow::anyhow;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -20,8 +22,9 @@ use tokio::sync::{
 };
 
 /// This is a client implementation that stresses the BFT-system
-pub struct Stressor {
+pub struct Stressor<Transaction> {
     pub id: Id,
+    _x: PhantomData<Transaction>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -44,20 +47,21 @@ fn mock_transaction(
     tx_id: usize,
     client_id: Id,
     data_len: usize,
-) -> Transaction {
-    let data = Data::new(vec![0 as u8; data_len]);
+) -> SimpleTx<SimpleData> {
+    let data = SimpleData::with_payload(&vec![0 as u8; data_len]);
     let extra_data = ExtraData::new(tx_id, client_id);
-    Transaction {
+    SimpleTx {
         data,
         extra: bincode::serialize(&extra_data).unwrap(),
     }
 }
 
-impl Stressor {
+impl Stressor<SimpleTx<SimpleData>> {
     pub fn spawn(
         my_id: Id,
         settings: Settings,
     ) -> Result<oneshot::Sender<()>> {
+        type Tx = SimpleTx<SimpleData>;
         let mut peer_map = FnvHashMap::default();
         // These are all server Ids
         let all_ids = settings.consensus_config.get_all_ids();
@@ -69,6 +73,7 @@ impl Stressor {
             let consensus_addr = to_socket_address(&party.address, party.port)?;
             peer_map.insert(id.clone(), consensus_addr);
         }
+        debug!("Using servers: {:?}", peer_map);
 
         // Get stress settings
         let burst_tx = settings.bench_config.txs_per_burst;
@@ -77,9 +82,8 @@ impl Stressor {
         // Networking setup
         let (consensus_tx, mut consensus_rx) = unbounded_channel();
         let my_addr = to_socket_address("0.0.0.0", settings.port)?;
-        TcpReceiver::spawn(my_addr, Handler::new(consensus_tx));
-        let mut consensus_sender =
-            TcpSimpleSender::<Id, Transaction, Acknowledgement>::with_peers(peer_map);
+        TcpReceiver::spawn(my_addr, Handler::<Tx>::new(consensus_tx));
+        let mut consensus_sender = TcpSimpleSender::<Id, Tx, Acknowledgement>::with_peers(peer_map);
 
         // Start the client
         let (exit_tx, mut exit_rx) = oneshot::channel();
@@ -119,21 +123,24 @@ impl Stressor {
 }
 
 #[derive(Debug, Clone)]
-struct Handler {
-    tx: UnboundedSender<ClientMsg>,
+struct Handler<Transaction> {
+    tx: UnboundedSender<ClientMsg<Transaction>>,
 }
 
-impl Handler {
-    pub fn new(tx: UnboundedSender<ClientMsg>) -> Self {
+impl<Transaction> Handler<Transaction> {
+    pub fn new(tx: UnboundedSender<ClientMsg<Transaction>>) -> Self {
         Self { tx }
     }
 }
 
 #[async_trait]
-impl network::Handler<Acknowledgement, ClientMsg> for Handler {
+impl<Transaction> network::Handler<Acknowledgement, ClientMsg<Transaction>> for Handler<Transaction>
+where
+    Transaction: types::Transaction,
+{
     async fn dispatch(
         &self,
-        msg: ClientMsg,
+        msg: ClientMsg<Transaction>,
         writer: &mut network::Writer<Acknowledgement>,
     ) {
         // Forward the message

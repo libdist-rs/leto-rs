@@ -1,27 +1,24 @@
-use std::time::Duration;
-use mempool::{Transaction, Batch};
-use network::Identifier;
-use serde::{Serialize, Deserialize};
-use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver};
-use log::*;
-use anyhow::{Result, anyhow};
 use super::Txpool;
+use anyhow::{anyhow, Result};
+use futures_util::StreamExt;
+use log::*;
+use mempool::{Batch, Transaction};
+use network::Identifier;
+use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 /// Messages sent back and forth between the consensus and the batcher
 #[derive(Debug)]
 pub enum BatcherConsensusMsg<Id, Tx> {
-    /// On entering a new round, notify the batcher that it may be its turn to propose
-    NewRound{
-        leader: Id,
-    },
+    /// On entering a new round, notify the batcher that it may be its turn to
+    /// propose
+    NewRound { leader: Id },
     /// On committing a batch, clear the batch
-    Commit {
-        batch: Batch<Tx>,
-    },
-    /// Clear this batch so that future proposers don't propose the same batch in their turn if not committed
-    OptimisticClear {
-        batch: Batch<Tx>,
-    }
+    Commit { batch: Batch<Tx> },
+    /// Clear this batch so that future proposers don't propose the same batch
+    /// in their turn if not committed
+    OptimisticClear { batch: Batch<Tx> },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -34,27 +31,23 @@ pub struct Parameters<Id> {
 
 impl<Id> Parameters<Id> {
     pub fn new(
-        my_id: Id, 
-        initial_leader: Id, 
-        batch_size: usize, 
-        batch_timeout: Duration
-    ) -> Self { 
-        Self { 
-            my_id, 
-            initial_leader, 
-            batch_size, 
-            batch_timeout 
-        } 
+        my_id: Id,
+        initial_leader: Id,
+        batch_size: usize,
+        batch_timeout: Duration,
+    ) -> Self {
+        Self {
+            my_id,
+            initial_leader,
+            batch_size,
+            batch_timeout,
+        }
     }
-
-    
 }
-
 
 /// An implementation of the Round-Robin batcher
 #[derive(Debug)]
-pub struct RRBatcher<Id, Tx> 
-{
+pub struct RRBatcher<Id, Tx> {
     /// The ID of this server
     my_id: Id,
     /// The ID of the current leader
@@ -71,8 +64,8 @@ pub struct RRBatcher<Id, Tx>
     pool: Txpool<Tx>,
 }
 
-impl<Id, Tx> RRBatcher<Id, Tx> 
-where 
+impl<Id, Tx> RRBatcher<Id, Tx>
+where
     Id: Identifier,
     Tx: Transaction,
 {
@@ -81,8 +74,7 @@ where
         rx_incoming_tx: UnboundedReceiver<(Tx, usize)>,
         rx_incoming_consensus: UnboundedReceiver<BatcherConsensusMsg<Id, Tx>>,
         tx_outgoing_batch: UnboundedSender<Batch<Tx>>,
-    ) -> Result<()> 
-    {
+    ) -> Result<()> {
         tokio::spawn(async move {
             let res = Self {
                 my_id: params.my_id,
@@ -92,7 +84,8 @@ where
                 rx_incoming_consensus,
                 tx_outgoing_batch,
                 pool: Txpool::new(params.batch_size, params.batch_timeout),
-            }.run()
+            }
+            .run()
             .await;
             if let Err(e) = res {
                 error!("RR-Batcher terminated with {}", e);
@@ -101,17 +94,27 @@ where
         Ok(())
     }
 
-    async fn run(&mut self) -> Result<()> 
-    {
+    async fn run(&mut self) -> Result<()> {
+        debug!(
+            "My id: {:?}, Current leader: {:?}",
+            self.my_id, self.current_leader
+        );
         loop {
             tokio::select! {
-                tx = self.rx_incoming_tx.recv() => {
-                    let (tx, tx_size) = tx.ok_or(anyhow!("Incoming transaction channel has closed for the batcher. Terminating."))?;
-                    self.pool.add_tx(tx, tx_size);
-                },
-                batch = &mut self.pool, if self.my_id == self.current_leader => {
+                batch = &mut self.pool.next(), if self.my_id == self.current_leader && !self.proposed => {
                     // Make a batch even if we have insufficient transactions
+                    debug!("Proposing a batch");
+                    let batch = batch.ok_or(
+                        anyhow!("Failed to get a batch")
+                    )?;
                     self.propose(batch)?;
+                },
+                tx = self.rx_incoming_tx.recv() => {
+                    let (tx, tx_size) = tx.ok_or(anyhow!(
+                        "Incoming transaction channel has closed for the batcher. Terminating."
+                    ))?;
+                    trace!("Got a transaction: {:?}", tx);
+                    self.pool.add_tx(tx, tx_size);
                 },
                 msg_from_consensus = self.rx_incoming_consensus.recv() => {
                     let msg_from_consensus = msg_from_consensus.ok_or(
@@ -139,16 +142,21 @@ where
     }
 
     /// Will convert the in-memory mempool into a batch
-    /// If insufficient transactions are present, then a smaller (possibly) empty batch is created
-    /// 
+    /// If insufficient transactions are present, then a smaller (possibly)
+    /// empty batch is created
+    ///
     /// Can throw errors if the sending fails
-    fn propose(&mut self, batch: Batch<Tx>) -> Result<()> {
+    fn propose(
+        &mut self,
+        batch: Batch<Tx>,
+    ) -> Result<()> {
         self.proposed = true;
-        self.tx_outgoing_batch.send(batch)
+        self.tx_outgoing_batch
+            .send(batch)
             .map_err(anyhow::Error::new)
     }
 
-    /// Checks if we can propose, and proposes if we can 
+    /// Checks if we can propose, and proposes if we can
     /// Called the round changes so that the new leader can immediately propose
     fn try_propose(&mut self) -> Result<()> {
         if self.pool.ready() {

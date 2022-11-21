@@ -1,20 +1,17 @@
-use super::{Settings, Leto};
-use crate::{to_socket_address, Id, Transaction, types::Data};
+use super::{Leto, Settings};
+use crate::{to_socket_address, types, Id, KeyConfig};
 use anyhow::{anyhow, Result};
 use fnv::FnvHashMap;
-use mempool::{
-    MempoolMsg,
-};
-use network::{
-    plaintcp::TcpSimpleSender,
-    Acknowledgement,
-};
-use std::{net::SocketAddr, path::PathBuf};
+use mempool::MempoolMsg;
+use network::{plaintcp::TcpSimpleSender, Acknowledgement};
+use std::{marker::PhantomData, net::SocketAddr, path::PathBuf};
 use storage::rocksdb::Storage;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 
 /// This is the server that runs the protocol
-pub struct Server {}
+pub struct Server<Transaction> {
+    _x: PhantomData<Transaction>,
+}
 
 pub fn get_mempool_peers(
     my_id: Id,
@@ -56,10 +53,14 @@ pub fn get_consensus_peers(
     Ok(map)
 }
 
-impl Server {
+impl<Transaction> Server<Transaction>
+where
+    Transaction: types::Transaction,
+{
     pub fn spawn(
         my_id: Id,
         all_ids: Vec<Id>,
+        crypto_system: KeyConfig,
         settings: Settings,
     ) -> anyhow::Result<oneshot::Sender<()>> {
         // Create the DB
@@ -86,15 +87,9 @@ impl Server {
             TcpSimpleSender::<Id, MempoolMsg<Id, Transaction>, Acknowledgement>::with_peers(
                 mempool_peers,
             );
-        let mempool_addr = to_socket_address(
-            "0.0.0.0", 
-            me.mempool_port
-        )?;
-        let client_addr = to_socket_address(
-            "0.0.0.0", 
-            me.client_port
-        )?;
-        
+        let mempool_addr = to_socket_address("0.0.0.0", me.mempool_port)?;
+        let client_addr = to_socket_address("0.0.0.0", me.client_port)?;
+
         // A channel for the consensus to communicate with the mempool
         let (tx_consensus_to_mem, rx_consensus_to_mem) = unbounded_channel();
         // A channel for the mempool to communicate with the consensus
@@ -109,14 +104,14 @@ impl Server {
         // Start the mempool
         mempool::Mempool::spawn(
             my_id,
-            all_ids,
+            all_ids.clone(),
             settings.mempool_config.clone(),
             store.clone(),
             mempool_net,
             rx_consensus_to_mem,
             tx_mem_to_batcher,
             tx_processor.clone(), // A channel to send to the processor
-            rx_processor, // Because the mempool spawns the processor
+            rx_processor,         // Because the mempool spawns the processor
             tx_mem_to_consensus,
             mempool_addr,
             client_addr,
@@ -124,16 +119,18 @@ impl Server {
 
         // Start the Leto consensus protocol
         let (exit_tx, exit_rx) = oneshot::channel();
-        Leto::<Data, Transaction>::spawn(
+        Leto::<Transaction>::spawn(
             my_id,
+            crypto_system,
+            all_ids,
             settings,
-            store, 
-            exit_rx, 
+            store,
+            exit_rx,
             rx_mem_to_consensus,
             rx_mem_to_batcher,
             tx_processor,
             tx_consensus_to_mem,
-        );
+        )?;
         Ok(exit_tx)
     }
 }

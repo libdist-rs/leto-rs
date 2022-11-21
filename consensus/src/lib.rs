@@ -20,7 +20,5 @@ pub fn to_socket_address(
     Ok(addr.into())
 }
 
-pub type Transaction = types::Transaction<types::Data>;
-
 mod keys;
 pub use keys::*;

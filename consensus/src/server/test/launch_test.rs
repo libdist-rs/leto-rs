@@ -1,7 +1,12 @@
 use std::time::Duration;
 
-use crate::server::{Id, Party, Round, Server, Settings, StorageConfig, BenchConfig};
+use crate::{
+    server::{BenchConfig, Party, Server, Settings, StorageConfig},
+    types::{SimpleData, SimpleTx},
+    Id, KeyConfig, Round,
+};
 use anyhow::{anyhow, Result};
+use crypto::Algorithm;
 use fnv::FnvHashMap;
 
 fn dummy_ids(num_nodes: usize) -> Vec<Id> {
@@ -49,7 +54,9 @@ const DEFAULT_CONFIG_FILE_LOCATION: &'static str = "./src/server/test/Default";
 async fn test_one() -> Result<()> {
     let settings = Settings::new(DEFAULT_CONFIG_FILE_LOCATION.to_string())?;
     let ids = dummy_ids(settings.consensus_config.num_nodes());
-    let exit_tx = Server::spawn(ids[0], ids, settings)?;
+    let crypto_system = KeyConfig::generate(Algorithm::ED25519, 4)?;
+    let exit_tx =
+        Server::<SimpleTx<SimpleData>>::spawn(ids[0], ids, crypto_system[0].clone(), settings)?;
     tokio::time::sleep(Duration::from_millis(3_000)).await;
     let res = exit_tx.send(());
     res.map_err(|_| anyhow!("Server did not successfully terminate"))

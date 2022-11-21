@@ -1,19 +1,28 @@
-use super::Proposal;
-use mempool::Transaction;
+use super::{Proposal, Signature};
+use crypto::hash::Hash;
 use network::Identifier;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum ProtocolMsg<Id, Data, Round> {
-    Propose { prop: Proposal<Id, Data, Round> },
-    Relay {},
-    Blame {},
+pub enum ProtocolMsg<Id, Transaction, Round> {
+    Propose {
+        proposal: Proposal<Transaction, Round>,
+        auth: Signature<Id, Proposal<Transaction, Round>>,
+    },
+    Relay {
+        proposal: Proposal<Transaction, Round>,
+        auth: Signature<Id, Proposal<Transaction, Round>>,
+    },
+    Blame {
+        round: Round,
+        auth: Signature<Id, Round>,
+    },
 }
 
-impl<Id, Data, Round> network::Message for ProtocolMsg<Id, Data, Round>
+impl<Id, Transaction, Round> network::Message for ProtocolMsg<Id, Transaction, Round>
 where
     Id: Identifier,
-    Data: network::Message,
+    Transaction: super::Transaction,
     Round: network::Message,
 {
 }
@@ -22,7 +31,7 @@ where
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ClientMsg<Tx> {
     NewTx(Tx),
-    // Confirmation(Dig<Tx>),
+    Confirmation(Hash<Tx>),
 }
 
-impl<Tx> network::Message for ClientMsg<Tx> where Tx: Transaction {}
+impl<Tx> network::Message for ClientMsg<Tx> where Tx: super::Transaction {}

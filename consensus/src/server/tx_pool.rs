@@ -1,9 +1,12 @@
-use std::{pin::Pin, task::{Context, Poll}, time::Duration};
-
-use futures_util::Future;
-use linked_hash_map::LinkedHashMap;
 use crypto::hash::Hash;
-use mempool::{Transaction, Batch};
+use futures_util::Stream;
+use linked_hash_map::LinkedHashMap;
+use mempool::{Batch, Transaction};
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 use tokio::time::Interval;
 
 /// Txpool holds the transactions and releases them when it is time
@@ -16,31 +19,36 @@ pub struct Txpool<Tx> {
     timer: Interval,
 }
 
-impl<Tx> Future for Txpool<Tx>
-where 
+impl<Tx> Stream for Txpool<Tx>
+where
     Tx: Transaction,
 {
-    type Output = Batch<Tx>;
+    type Item = Batch<Tx>;
 
-    fn poll(
-        mut self: Pin<&mut Self>, 
-        cx: &mut Context<'_>
-    ) -> Poll<Self::Output> {
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        // If timer has expired, make a batch
         if let Poll::Ready(_) = self.timer.poll_tick(cx) {
-            return Poll::Ready(self.as_mut().make_batch());
+            return Poll::Ready(Some(self.as_mut().make_batch()));
+        }
+        // If we have enough, make a transaction
+        if self.current_size > self.batch_size {
+            return Poll::Ready(Some(self.as_mut().make_batch()));
         }
         Poll::Pending
     }
 }
 
-impl<Tx> Txpool<Tx> 
+impl<Tx> Txpool<Tx>
 where
     Tx: Transaction,
 {
     /// Creates a new transaction pool
     pub fn new(
-        batch_size: usize, 
-        batch_timeout: Duration
+        batch_size: usize,
+        batch_timeout: Duration,
     ) -> Self {
         Self {
             linked_hash_map: LinkedHashMap::new(),
@@ -51,14 +59,21 @@ where
     }
 
     /// Adds a transaction to the transaction pool
-    pub fn add_tx(&mut self, tx: Tx, tx_size: usize) {
+    pub fn add_tx(
+        &mut self,
+        tx: Tx,
+        tx_size: usize,
+    ) {
         let hash = Hash::ser_and_hash(&tx);
         self.current_size += tx_size;
         self.linked_hash_map.insert(hash, (tx, tx_size));
     }
 
     /// Removes all the transactions from the transaction pool if they exist
-    pub fn clear_batch(&mut self, batch: Batch<Tx>) {
+    pub fn clear_batch(
+        &mut self,
+        batch: Batch<Tx>,
+    ) {
         for tx in batch.payload {
             let hash = Hash::ser_and_hash(&tx);
             if let Some((_, tx_size)) = self.linked_hash_map.remove(&hash) {
@@ -71,7 +86,13 @@ where
     pub fn make_batch(&mut self) -> Batch<Tx> {
         let mut current_batch_size = 0;
         let mut payload = Vec::new();
-        while current_batch_size < self.batch_size {
+        // Stop if
+        // (1) We collect enough transactions, then stop
+        // (2) We run out of transactions
+        while current_batch_size < self.batch_size && // Collected enough
+            !self.linked_hash_map.is_empty()
+        // Pool is not empty
+        {
             if let Some((_, (tx, tx_size))) = self.linked_hash_map.pop_front() {
                 payload.push(tx);
                 current_batch_size += tx_size;
@@ -82,9 +103,9 @@ where
         Batch { payload }
     }
 
-    /// Checks whether there are sufficient transactions in the pool to make a batch
+    /// Checks whether there are sufficient transactions in the pool to make a
+    /// batch
     pub fn ready(&self) -> bool {
         self.current_size > self.batch_size
     }
 }
-

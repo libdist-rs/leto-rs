@@ -4,6 +4,7 @@ use consensus::{
     client::{self, Stressor},
     server,
     server::{BenchConfig, Server, StorageConfig},
+    types::{SimpleData, SimpleTx},
     Id, KeyConfig, Round,
 };
 use fnv::FnvHashMap;
@@ -276,7 +277,11 @@ async fn main() -> Result<()> {
     }?;
 
     match args.mode {
-        SubCommand::Server { id, config } => {
+        SubCommand::Server {
+            id,
+            config,
+            key_file,
+        } => {
             let server_id = id;
 
             // Get the config file, or use a default config file
@@ -291,13 +296,21 @@ async fn main() -> Result<()> {
 
             let all_ids = settings.consensus_config.get_all_ids();
 
+            // Load the keys
+            let key_reader = File::open(key_file)?;
+            let crypto_system = serde_json::from_reader(key_reader)?;
+
             // Start the Server
-            let _exit_tx = Server::spawn(server_id, all_ids, settings)?;
+            let exit_tx =
+                Server::<SimpleTx<SimpleData>>::spawn(server_id, all_ids, crypto_system, settings)?;
 
             // Implement a waiting strategy
             let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
             signals.forever().next();
             info!("Received termination signal");
+            exit_tx
+                .send(())
+                .map_err(|_| anyhow!("Server already shut down"))?;
             info!("Shutting down server");
         }
         SubCommand::Client { id, config } => {
@@ -314,12 +327,15 @@ async fn main() -> Result<()> {
             info!("Using the settings: {:?}", settings);
 
             // Start the client
-            let _exit_tx = Stressor::spawn(client_id, settings)?;
+            let exit_tx = Stressor::<SimpleTx<SimpleData>>::spawn(client_id, settings)?;
             // Implement a waiting strategy
             let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
             signals.forever().next();
             info!("Received termination signal");
-            info!("Shutting down server");
+            exit_tx
+                .send(())
+                .map_err(|_| anyhow!("Client already shut down"))?;
+            info!("Shutting down client");
         }
         SubCommand::Keys {
             output,

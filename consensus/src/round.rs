@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
-use std::fmt::{self, Display};
+use std::fmt::{self, Display, Debug};
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Copy, Clone)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Copy, Clone)]
 pub struct Round(usize);
 
 impl Round {
-    pub const START:Self = Self ( 0 );
+    pub const START: Self = Self(0);
 }
 
 impl Default for Round {
@@ -20,12 +20,19 @@ impl From<usize> for Round {
     }
 }
 
+impl Debug for Round {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result 
+    {
+        write!(f, "{}", self.0)
+    }
+}
+
 impl Display for Round {
     fn fmt(
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        self.0.fmt(f)
+        write!(f, "{}", self.0)
     }
 }
 
