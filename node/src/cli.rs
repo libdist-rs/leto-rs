@@ -80,6 +80,11 @@ pub struct CreateConfig {
     #[arg(short, long)]
     pub num_servers: usize,
 
+    /// Number of faults (f)
+    /// Default is (n-1)/3
+    #[arg(short = 'f', long)]
+    pub num_faults: Option<usize>,
+
     /// The Garbage collection depth
     #[arg(short, long)]
     #[clap(default_value_t = 5)]

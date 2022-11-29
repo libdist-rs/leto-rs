@@ -23,7 +23,7 @@ impl<Id, Tx, Round> network::Message for ProtocolMsg<Id, Tx, Round>
 where
     Id: Identifier,
     Tx: super::Transaction,
-    Round: network::Message,
+    Round: network::Message + mempool::Round,
 {}
 
 /// `ClientMsg` are messages sent between the client and the servers

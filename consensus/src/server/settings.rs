@@ -56,6 +56,7 @@ pub struct Party {
 pub struct Config {
     /// All the parties in the system
     pub parties: HashMap<Id, Party>,
+    pub num_faults: usize,
 }
 
 impl Config {

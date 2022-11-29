@@ -16,7 +16,7 @@ fn dummy_ids(num_nodes: usize) -> Vec<Id> {
     ids
 }
 
-fn dummy_settings(num_nodes: usize) -> Settings {
+fn dummy_settings(num_nodes: usize, num_faults: usize) -> Settings {
     // Returns dummy settings
     let ids = dummy_ids(num_nodes);
     let mempool_config = mempool::Config::<Round>::default();
@@ -41,7 +41,7 @@ fn dummy_settings(num_nodes: usize) -> Settings {
     }
     Settings {
         mempool_config,
-        consensus_config: crate::server::Config { parties },
+        consensus_config: crate::server::Config { parties, num_faults },
         storage: storage_config,
         bench_config: BenchConfig::default(),
     }

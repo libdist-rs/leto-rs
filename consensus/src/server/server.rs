@@ -1,5 +1,5 @@
 use super::{Leto, Settings};
-use crate::{to_socket_address, types, Id, KeyConfig};
+use crate::{to_socket_address, Id, KeyConfig};
 use anyhow::{anyhow, Result};
 use fnv::FnvHashMap;
 use mempool::MempoolMsg;

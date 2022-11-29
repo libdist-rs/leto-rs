@@ -1,24 +1,25 @@
-use super::Leto;
 use crate::{
     types::{self, Block, Proposal, ProtocolMsg, Signature},
-    Id, Round,
+    Id, Round, server::QuorumWaiter,
 };
 use anyhow::{anyhow, Result};
 use crypto::hash::Hash;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use log::*;
-use mempool::BatchHash;
+use mempool::{BatchHash, wait};
+use super::Leto;
 
-impl<Transaction> Leto<Transaction>
+impl<Tx> Leto<Tx>
 where
-    Transaction: types::Transaction,
+    Tx: types::Transaction,
 {
     pub fn handle_proposal(
         &mut self,
-        prop: Proposal<Transaction, Round>,
-        auth: Signature<Id, Proposal<Transaction, Round>>,
+        prop: Proposal<Tx, Round>,
+        auth: Signature<Id, Proposal<Tx, Round>>,
     ) -> Result<()>
     where
-        Transaction: types::Transaction,
+        Tx: types::Transaction,
     {
         debug!("Got a proposal: {:?}", prop);
         // TODO: Check correct leader
@@ -45,18 +46,21 @@ where
         auth: Signature<Id, Round>,
     ) -> Result<()>
     where
-        Transaction: types::Transaction,
+        Tx: types::Transaction,
     {
-        debug!("Got a blame for round {} from {}", blame_round, auth.id);
+        debug!("Got a blame for round {} from {}", 
+            blame_round, 
+            auth.id
+        );
         todo!();
     }
 
     pub async fn handle_new_batch(
         &mut self,
-        batch_hash: BatchHash<Transaction>,
+        batch_hash: BatchHash<Tx>,
     ) -> Result<()>
     where
-        Transaction: types::Transaction,
+        Tx: types::Transaction,
     {
         debug!("Got a batch hash: {}", batch_hash);
 
@@ -71,17 +75,28 @@ where
         
         // Create protocol msg
         let msg = ProtocolMsg
-            ::<Id, Transaction, Round>
+            ::<Id, Tx, Round>
             ::Propose { 
                 proposal, 
                 auth,
         };
 
         // Broadcast message
-        let _ = self
+        let handlers = self
             .consensus_net
             .broadcast(&self.broadcast_peers, msg.clone())
             .await;
+        
+        let quorum_waiter = QuorumWaiter::new(
+            self.settings.consensus_config.num_nodes()-self.settings.consensus_config.num_faults
+        );
+        quorum_waiter.wait(handlers).await?;
+        // let mut wait_stream = FuturesUnordered::new();
+        // for handler in handlers {
+        //     // wait_stream.push(handler);
+        //     // TODO: Use Quorum waiter
+        //     let _ack = handler.await?;
+        // }
         
         // Send to loopback
         self.tx_msg_loopback
