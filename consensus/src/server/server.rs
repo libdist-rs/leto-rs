@@ -133,7 +133,7 @@ impl Server {
             rx_mem_to_batcher,
             tx_processor,
             tx_consensus_to_mem,
-        );
+        )?;
         Ok(exit_tx)
     }
 }

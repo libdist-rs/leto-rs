@@ -3,10 +3,10 @@ use network::{Identifier, Message};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Proposal<Id, Data, Round> {
-    block: Block<Data>,
+pub struct Proposal<Id, Tx, Round> {
+    block: Block<Tx>,
     round: Round,
-    sig: Signature<Id, Block<Data>>,
+    sig: Signature<Id, Block<Tx>>,
 }
 
 impl<Id, Data, Round> Message for Proposal<Id, Data, Round>

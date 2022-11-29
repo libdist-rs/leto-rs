@@ -1,6 +1,6 @@
 use std::{pin::Pin, task::{Context, Poll}, time::Duration};
 
-use futures_util::Future;
+use futures_util::{Future, Stream};
 use linked_hash_map::LinkedHashMap;
 use crypto::hash::Hash;
 use mempool::{Transaction, Batch};
@@ -16,18 +16,24 @@ pub struct Txpool<Tx> {
     timer: Interval,
 }
 
-impl<Tx> Future for Txpool<Tx>
+impl<Tx> Stream for Txpool<Tx>
 where 
     Tx: Transaction,
 {
-    type Output = Batch<Tx>;
+    type Item = Batch<Tx>;
 
-    fn poll(
+    fn poll_next(
         mut self: Pin<&mut Self>, 
         cx: &mut Context<'_>
-    ) -> Poll<Self::Output> {
+    ) -> Poll<Option<Self::Item>> 
+    {
+        // Make batch if timed out
         if let Poll::Ready(_) = self.timer.poll_tick(cx) {
-            return Poll::Ready(self.as_mut().make_batch());
+            return Poll::Ready(Some(self.as_mut().make_batch()));
+        }
+        // Make batch if we can
+        if self.current_size > self.batch_size {
+            return Poll::Ready(Some(self.as_mut().make_batch()));
         }
         Poll::Pending
     }
@@ -76,6 +82,8 @@ where
                 payload.push(tx);
                 current_batch_size += tx_size;
                 self.current_size -= tx_size;
+            } else {
+                break;
             }
         }
         self.timer.reset();

@@ -1,25 +1,33 @@
-use super::ProtocolMsg;
 use async_trait::async_trait;
 use futures_util::SinkExt;
-use network::Acknowledgement;
+use mempool::Transaction;
+use network::{Acknowledgement, Identifier, Message};
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::types::ProtocolMsg;
+
 #[derive(Debug, Clone)]
-pub struct Handler {
-    consensus_tx: UnboundedSender<ProtocolMsg>,
+pub struct Handler<Id, Tx, Round> {
+    consensus_tx: UnboundedSender<ProtocolMsg<Id, Tx, Round>>,
 }
 
-impl Handler {
-    pub fn new(consensus_tx: UnboundedSender<ProtocolMsg>) -> Self {
+impl<Id, Tx, Round> Handler<Id, Tx, Round> 
+{
+    pub fn new(consensus_tx: UnboundedSender<ProtocolMsg<Id, Tx, Round>>) -> Self {
         Self { consensus_tx }
     }
 }
 
 #[async_trait]
-impl network::Handler<Acknowledgement, ProtocolMsg> for Handler {
+impl<Id, Tx, Round> network::Handler<Acknowledgement, ProtocolMsg<Id, Tx, Round>> for Handler<Id, Tx, Round> 
+where 
+    Id: Identifier,
+    Round: mempool::Round + Message,
+    Tx: Transaction,
+{
     async fn dispatch(
         &self,
-        msg: ProtocolMsg,
+        msg: ProtocolMsg<Id, Tx, Round>,
         writer: &mut network::Writer<Acknowledgement>,
     ) {
         // Forward the message

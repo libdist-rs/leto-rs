@@ -1,4 +1,5 @@
 use std::time::Duration;
+use futures_util::StreamExt;
 use mempool::{Transaction, Batch};
 use network::Identifier;
 use serde::{Serialize, Deserialize};
@@ -109,8 +110,9 @@ where
                     let (tx, tx_size) = tx.ok_or(anyhow!("Incoming transaction channel has closed for the batcher. Terminating."))?;
                     self.pool.add_tx(tx, tx_size);
                 },
-                batch = &mut self.pool, if self.my_id == self.current_leader => {
+                batch = &mut self.pool.next(), if self.my_id == self.current_leader => {
                     // Make a batch even if we have insufficient transactions
+                    let batch = batch.ok_or(anyhow!("Failed to make tx batch"))?;
                     self.propose(batch)?;
                 },
                 msg_from_consensus = self.rx_incoming_consensus.recv() => {

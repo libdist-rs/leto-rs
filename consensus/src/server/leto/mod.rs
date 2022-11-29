@@ -5,26 +5,31 @@ use network::{Message, plaintcp::{TcpReceiver, TcpReliableSender}, Acknowledgeme
 use storage::rocksdb::Storage;
 use tokio::sync::{oneshot, mpsc::{UnboundedReceiver, unbounded_channel, UnboundedSender}};
 use anyhow::{anyhow, Result};
-use super::{Handler, get_consensus_peers, Parameters, RRBatcher};
+use super::{Handler, get_consensus_peers, Parameters, RRBatcher, BatcherConsensusMsg};
 
-pub struct Leto<Data, Tx> {
+pub struct Leto<Tx> {
     my_id: Id,
     exit_rx: oneshot::Receiver<()>,
     rx_mem_to_consensus: UnboundedReceiver<BatchHash<Tx>>,
-    rx_net_to_consensus: UnboundedReceiver<ProtocolMsg<Id, Data, Round>>,
+    rx_net_to_consensus: UnboundedReceiver<ProtocolMsg<Id, Tx, Round>>,
     store: Storage,
+    tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
+    consensus_net: TcpReliableSender<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>,
+    tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Tx>>,
 }
 
-impl<Data, Tx> Leto<Data, Tx> 
+impl<Tx> Leto<Tx> 
 {
     pub const INITIAL_LEADER: Id = Id::START;
     pub const INITIAL_ROUND: Round = Round::START;
 }
 
-impl<Data, Tx> Leto<Data, Tx> 
+mod proposal;
+pub use proposal::*;
+
+impl<Tx> Leto<Tx> 
 where 
     Tx: Transaction,
-    Data: Message,
 {
     pub fn spawn(
         my_id: Id,
@@ -49,20 +54,20 @@ where
         let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
 
         // Start receiver for consensus messages
-        TcpReceiver::spawn(
+        TcpReceiver::<Id, Acknowledgement, ProtocolMsg<Id, Tx, Round>>::spawn(
             consensus_addr, 
-            Handler::new(tx_net_to_consensus)
+            Handler::<Id, Tx, Round>::new(tx_net_to_consensus)
         );
 
         // Start outgoing connections
         let consensus_peers = get_consensus_peers(my_id, &settings)?;
-        let consensus_net = TcpReliableSender::<Id, ProtocolMsg<Id, Data, Round>, Acknowledgement>::with_peers(consensus_peers);
+        let consensus_net = TcpReliableSender::<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>::with_peers(consensus_peers);
 
         // Start the batcher
         let (tx_consensus_to_batcher, rx_consensus_to_batcher) = unbounded_channel();
         let batching_params = Parameters::new(
             my_id.clone(), 
-            Leto::<Data, Tx>::INITIAL_LEADER, 
+            Leto::<Tx>::INITIAL_LEADER, 
             settings.bench_config.batch_size, 
             settings.bench_config.batch_timeout
         );
@@ -74,12 +79,15 @@ where
         )?;
 
         tokio::spawn(async move {
-            let res = Leto { 
+            let res = Leto::<Tx> { 
                 my_id,
                 exit_rx,
                 rx_mem_to_consensus,
                 rx_net_to_consensus,
                 store,
+                tx_consensus_to_mem,
+                consensus_net,
+                tx_consensus_to_batcher,
             }.run().await;
             if let Err(e) = res {
                 error!("Consensus error: {}", e);
@@ -104,8 +112,9 @@ where
                     let batch_hash = batch_hash.ok_or(
                         anyhow!("Mempool processor has shut down")
                     )?;
-                    info!("Got a batch hash: {}", batch_hash);
-                    // TODO: Further processing
+                    debug!("Got a batch hash: {}", batch_hash);
+                    // Further processing (propose)
+                    self.handle_new_batch(batch_hash)?;
                 }
                 // Receive consensus messages from others
                 msg = self.rx_net_to_consensus.recv() => {
