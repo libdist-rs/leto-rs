@@ -23,35 +23,35 @@ pub use proposal::*;
 mod round_context;
 pub use round_context::*;
 
-pub struct Leto<Transaction> {
+pub struct Leto<Tx> {
     my_id: Id,
     /// Crypto Keys
     crypto_system: KeyConfig, 
     broadcast_peers: Vec<Id>, // cache
     exit_rx: oneshot::Receiver<()>,
-    rx_mem_to_consensus: UnboundedReceiver<BatchHash<Transaction>>,
-    rx_net_to_consensus: UnboundedReceiver<ProtocolMsg<Id, Transaction, Round>>,
+    rx_mem_to_consensus: UnboundedReceiver<BatchHash<Tx>>,
+    rx_net_to_consensus: UnboundedReceiver<ProtocolMsg<Id, Tx, Round>>,
     store: Storage,
     consensus_net: TcpReliableSender<
         Id, 
-        ProtocolMsg<Id, Transaction, Round>, 
+        ProtocolMsg<Id, Tx, Round>, 
         Acknowledgement
     >,
-    tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Transaction>>,
-    tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Transaction>>,
+    tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
+    tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Tx>>,
     round_context: RoundContext,
-    tx_msg_loopback: UnboundedSender<ProtocolMsg<Id, Transaction, Round>>,
-    rx_msg_loopback: UnboundedReceiver<ProtocolMsg<Id, Transaction, Round>>,
+    tx_msg_loopback: UnboundedSender<ProtocolMsg<Id, Tx, Round>>,
+    rx_msg_loopback: UnboundedReceiver<ProtocolMsg<Id, Tx, Round>>,
 }
 
-impl<Transaction> Leto<Transaction> {
+impl<Tx> Leto<Tx> {
     pub const INITIAL_LEADER: Id = Id::START;
     pub const INITIAL_ROUND: Round = Round::START;
 }
 
-impl<Transaction> Leto<Transaction>
+impl<Tx> Leto<Tx>
 where
-    Transaction: types::Transaction,
+    Tx: types::Transaction,
 {
     pub fn spawn(
         my_id: Id,
@@ -60,10 +60,10 @@ where
         settings: super::Settings,
         store: Storage,
         exit_rx: oneshot::Receiver<()>,
-        rx_mem_to_consensus: UnboundedReceiver<BatchHash<Transaction>>,
-        rx_mem_to_batcher: UnboundedReceiver<(Transaction, usize)>,
-        tx_processor: UnboundedSender<Batch<Transaction>>,
-        tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Transaction>>,
+        rx_mem_to_consensus: UnboundedReceiver<BatchHash<Tx>>,
+        rx_mem_to_batcher: UnboundedReceiver<(Tx, usize)>,
+        tx_processor: UnboundedSender<Batch<Tx>>,
+        tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
     ) -> Result<()> {
         let me = settings
             .consensus_config
@@ -79,14 +79,14 @@ where
         // Start receiver for consensus messages
         TcpReceiver::spawn(
             consensus_addr, 
-            Handler::<Id, Transaction, Round>::new(tx_net_to_consensus)
+            Handler::<Id, Tx, Round>::new(tx_net_to_consensus)
         );
 
         // Start outgoing connections
         let consensus_peers = get_consensus_peers(my_id, &settings)?;
         let consensus_net = TcpReliableSender::<
             Id,
-            ProtocolMsg<Id, Transaction, Round>,
+            ProtocolMsg<Id, Tx, Round>,
             Acknowledgement,
         >::with_peers(consensus_peers);
 
@@ -94,11 +94,11 @@ where
         let (tx_consensus_to_batcher, rx_consensus_to_batcher) = unbounded_channel();
         let batching_params = Parameters::new(
             my_id.clone(),
-            Leto::<Transaction>::INITIAL_LEADER,
+            Leto::<Tx>::INITIAL_LEADER,
             settings.bench_config.batch_size,
             settings.bench_config.batch_timeout,
         );
-        RRBatcher::<Id, Transaction>::spawn(
+        RRBatcher::<Id, Tx>::spawn(
             batching_params,
             rx_mem_to_batcher,
             rx_consensus_to_batcher,
@@ -112,7 +112,7 @@ where
 
         let (tx_msg_loopback, rx_msg_loopback) = unbounded_channel();
         tokio::spawn(async move {
-            let res = Leto::<Transaction> {
+            let res = Leto::<Tx> {
                 my_id,
                 crypto_system,
                 broadcast_peers: all_peers_except_me,
@@ -160,6 +160,7 @@ where
                     let msg = msg.ok_or(
                         anyhow!("Loopback layer has closed")
                     )?;
+                    info!("Got a consensus message from loopback: {:?}", msg);
                     self.handle_msg(msg).await
                 }
                 // Receive consensus messages from others
@@ -167,6 +168,7 @@ where
                     let msg = msg.ok_or(
                         anyhow!("Networking layer has closed")
                     )?;
+                    info!("Got a consensus message from the network: {:?}", msg);
                     let res = self.handle_msg(msg).await;
                     res
                 }
@@ -181,10 +183,9 @@ where
 
     async fn handle_msg(
         &mut self,
-        msg: ProtocolMsg<Id, Transaction, Round>,
+        msg: ProtocolMsg<Id, Tx, Round>,
     ) -> Result<()>
     {
-        info!("Got a consensus message: {:?}", msg);
         match msg {
             ProtocolMsg::Propose { proposal, auth } => self.handle_proposal(proposal, auth),
             ProtocolMsg::Relay { proposal, auth } => self.handle_proposal(proposal, auth),

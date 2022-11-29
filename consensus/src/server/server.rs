@@ -55,7 +55,7 @@ pub fn get_consensus_peers(
 
 impl<Transaction> Server<Transaction>
 where
-    Transaction: types::Transaction,
+    Transaction: crate::types::Transaction,
 {
     pub fn spawn(
         my_id: Id,

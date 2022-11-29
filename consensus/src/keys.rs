@@ -1,7 +1,6 @@
 use crypto::{ed25519, secp256k1, Algorithm, Keypair, PublicKey, SecretKey};
 use fnv::FnvHashMap;
 use serde::{Deserialize, Serialize};
-
 use crate::Id;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

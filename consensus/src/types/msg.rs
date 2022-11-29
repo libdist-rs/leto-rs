@@ -4,14 +4,14 @@ use network::Identifier;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum ProtocolMsg<Id, Transaction, Round> {
+pub enum ProtocolMsg<Id, Tx, Round> {
     Propose {
-        proposal: Proposal<Transaction, Round>,
-        auth: Signature<Id, Proposal<Transaction, Round>>,
+        proposal: Proposal<Tx, Round>,
+        auth: Signature<Id, Proposal<Tx, Round>>,
     },
     Relay {
-        proposal: Proposal<Transaction, Round>,
-        auth: Signature<Id, Proposal<Transaction, Round>>,
+        proposal: Proposal<Tx, Round>,
+        auth: Signature<Id, Proposal<Tx, Round>>,
     },
     Blame {
         round: Round,
@@ -19,13 +19,12 @@ pub enum ProtocolMsg<Id, Transaction, Round> {
     },
 }
 
-impl<Id, Transaction, Round> network::Message for ProtocolMsg<Id, Transaction, Round>
+impl<Id, Tx, Round> network::Message for ProtocolMsg<Id, Tx, Round>
 where
     Id: Identifier,
-    Transaction: super::Transaction,
+    Tx: super::Transaction,
     Round: network::Message,
-{
-}
+{}
 
 /// `ClientMsg` are messages sent between the client and the servers
 #[derive(Debug, Serialize, Deserialize, Clone)]

@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use crate::{
     server::{BenchConfig, Party, Server, Settings, StorageConfig},
-    types::{SimpleData, SimpleTx},
-    Id, KeyConfig, Round,
+    Id, KeyConfig, Round, SimpleTx, SimpleData,
 };
 use anyhow::{anyhow, Result};
 use crypto::Algorithm;

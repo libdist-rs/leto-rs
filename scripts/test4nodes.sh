@@ -16,7 +16,7 @@ for((i=0;i<$N;i++)); do
     # Start the server
     cargo r -p node \
         -- \
-        -vvvv \
+        -vvvvv \
         server \
         --id "${i}" \
         --key-file examples/keys-${i}.json &> test-log${i}.log &

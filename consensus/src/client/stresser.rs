@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 use std::time::Duration;
 
 use super::Settings;
-use crate::types::{self, ClientMsg, Data, SimpleData, SimpleTx};
+use crate::types::{self};
 use crate::{to_socket_address, Id};
 use anyhow::anyhow;
 use anyhow::Result;
@@ -10,58 +10,38 @@ use async_trait::async_trait;
 use fnv::FnvHashMap;
 use futures_util::SinkExt;
 use log::*;
+use network::NetSender;
 use network::{
     plaintcp::{TcpReceiver, TcpSimpleSender},
-    Acknowledgement, NetSender,
+    Acknowledgement,
 };
-use serde::Deserialize;
-use serde::Serialize;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
     oneshot,
 };
 
 /// This is a client implementation that stresses the BFT-system
-pub struct Stressor<Transaction> {
-    pub id: Id,
-    _x: PhantomData<Transaction>,
+pub struct Stressor<Tx> {
+    id: Id,
+    exit_rx: oneshot::Receiver<()>,
+    settings: Settings,
+    consensus_sender: TcpSimpleSender<Id, Tx, Acknowledgement>,
+    consensus_rx: UnboundedReceiver<Tx>,
+    _x: PhantomData<Tx>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ExtraData {
-    pub tag: usize,
-    pub source: Id,
-}
 
-impl ExtraData {
-    pub fn new(
-        tag: usize,
-        source: Id,
-    ) -> Self {
-        Self { tag, source }
-    }
-}
-
-// Generates a mock transaction with this Id
-fn mock_transaction(
-    tx_id: usize,
-    client_id: Id,
-    data_len: usize,
-) -> SimpleTx<SimpleData> {
-    let data = SimpleData::with_payload(&vec![0 as u8; data_len]);
-    let extra_data = ExtraData::new(tx_id, client_id);
-    SimpleTx {
-        data,
-        extra: bincode::serialize(&extra_data).unwrap(),
-    }
-}
-
-impl Stressor<SimpleTx<SimpleData>> {
+impl<Tx> Stressor<Tx> 
+where
+    Tx: super::MockTx,
+{
     pub fn spawn(
         my_id: Id,
         settings: Settings,
     ) -> Result<oneshot::Sender<()>> {
-        type Tx = SimpleTx<SimpleData>;
+        let (exit_tx, exit_rx) = oneshot::channel();
+
         let mut peer_map = FnvHashMap::default();
         // These are all server Ids
         let all_ids = settings.consensus_config.get_all_ids();
@@ -74,73 +54,93 @@ impl Stressor<SimpleTx<SimpleData>> {
             peer_map.insert(id.clone(), consensus_addr);
         }
         debug!("Using servers: {:?}", peer_map);
-
-        // Get stress settings
-        let burst_tx = settings.bench_config.txs_per_burst;
-        let tx_size = settings.bench_config.tx_size;
+        let consensus_sender = TcpSimpleSender::<Id, Tx, Acknowledgement>::with_peers(peer_map);
 
         // Networking setup
-        let (consensus_tx, mut consensus_rx) = unbounded_channel();
-        let my_addr = to_socket_address("0.0.0.0", settings.port)?;
-        TcpReceiver::spawn(my_addr, Handler::<Tx>::new(consensus_tx));
-        let mut consensus_sender = TcpSimpleSender::<Id, Tx, Acknowledgement>::with_peers(peer_map);
+        let (consensus_tx, consensus_rx) = unbounded_channel();
+        let my_addr = to_socket_address(
+            "0.0.0.0", 
+            settings.port
+        )?;
+        TcpReceiver::spawn(
+            my_addr, 
+            Handler::<Tx>::new(consensus_tx)
+        );
 
         // Start the client
-        let (exit_tx, mut exit_rx) = oneshot::channel();
         tokio::spawn(async move {
-            let mut tx_id: usize = 0;
-            // Burst timer
-            let mut burst_timer = tokio::time::interval(Duration::from_millis(
-                settings.bench_config.burst_interval_ms,
-            ));
-            loop {
-                tokio::select! {
-                    _ = &mut exit_rx => {
-                        info!("Shutting down the client");
-                        break;
-                    }
-                    _ = burst_timer.tick() => {
-                        // Time to send a burst of transactions
-                        // Send `burst_tx` transactions every interval
-                        for _i in 0..burst_tx {
-                            let tx = mock_transaction(tx_id, my_id, tx_size);
-                            tx_id = tx_id + 1;
-                            consensus_sender.broadcast(
-                                tx,
-                                &all_ids, // SendAll
-                            ).await;
-                        }
-                    }
-                    confirmation = consensus_rx.recv() => {
-                        info!("Received a confirmation message: {:?}", confirmation);
-                        // TODO: Handle tx confirmation
-                    }
-                }
-            }
+            Self {
+                id: my_id,
+                exit_rx,
+                settings,
+                consensus_sender,
+                consensus_rx,
+                _x: PhantomData,
+            }.run().await
         });
         Ok(exit_tx)
+    }
+
+    async fn run(&mut self)-> Result<()>
+    {
+        // Get stress settings
+        let burst_tx = self.settings.bench_config.txs_per_burst;
+        let tx_size = self.settings.bench_config.tx_size;
+        let all_ids = self.settings.consensus_config.get_all_ids();
+
+        // Start the client
+        let mut tx_id: usize = 0;
+        // Burst timer
+        let mut burst_timer = tokio::time::interval(Duration::from_millis(
+            self.settings.bench_config.burst_interval_ms,
+        ));
+        loop {
+            tokio::select! {
+                _ = &mut self.exit_rx => {
+                    info!("Shutting down the client");
+                    break;
+                }
+                _ = burst_timer.tick() => {
+                    // Time to send a burst of transactions
+                    // Send `burst_tx` transactions every interval
+                    for _i in 0..burst_tx {
+                        let tx = Tx::mock_transaction(tx_id, self.id, tx_size);
+                        tx_id = tx_id + 1;
+                        self.consensus_sender.broadcast(
+                            tx,
+                            &all_ids, // SendAll
+                        ).await;
+                    }
+                }
+                confirmation = self.consensus_rx.recv() => {
+                    info!("Received a confirmation message: {:?}", confirmation);
+                    // TODO: Handle tx confirmation
+                }
+            }
+        };
+        Ok(())
     }
 }
 
 #[derive(Debug, Clone)]
-struct Handler<Transaction> {
-    tx: UnboundedSender<ClientMsg<Transaction>>,
+struct Handler<Tx> {
+    tx: UnboundedSender<Tx>,
 }
 
-impl<Transaction> Handler<Transaction> {
-    pub fn new(tx: UnboundedSender<ClientMsg<Transaction>>) -> Self {
+impl<Tx> Handler<Tx> {
+    pub fn new(tx: UnboundedSender<Tx>) -> Self {
         Self { tx }
     }
 }
 
 #[async_trait]
-impl<Transaction> network::Handler<Acknowledgement, ClientMsg<Transaction>> for Handler<Transaction>
+impl<Tx> network::Handler<Acknowledgement, Tx> for Handler<Tx>
 where
-    Transaction: types::Transaction,
+    Tx: types::Transaction,
 {
     async fn dispatch(
         &self,
-        msg: ClientMsg<Transaction>,
+        msg: Tx,
         writer: &mut network::Writer<Acknowledgement>,
     ) {
         // Forward the message

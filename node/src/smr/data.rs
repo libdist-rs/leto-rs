@@ -1,5 +1,4 @@
 use std::fmt::{self, Debug, Display};
-
 use network::Message;
 use serde::{Deserialize, Serialize};
 

@@ -10,7 +10,7 @@ use std::{
 use tokio::time::Interval;
 
 /// Txpool holds the transactions and releases them when it is time
-/// TODO: Implement propose once for a round strategy
+/// DONE (in RRBatcher) Implement propose once for a round strategy
 #[derive(Debug)]
 pub struct Txpool<Tx> {
     linked_hash_map: LinkedHashMap<Hash<Tx>, (Tx, /* Size of the Tx */ usize)>,

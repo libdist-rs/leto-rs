@@ -1,9 +1,7 @@
-use crate::types;
+use consensus::types::{self, Transaction};
 use network::Message;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug, Display};
-
-pub trait Transaction: mempool::Transaction {}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SimpleTx<Data> {
@@ -36,6 +34,6 @@ where
     }
 }
 
-impl<Data> Message for SimpleTx<Data> where Data: types::Data {}
-impl<Data> mempool::Transaction for SimpleTx<Data> where Data: types::Data {}
-impl<Data> Transaction for SimpleTx<Data> where Data: types::Data {}
+impl<Data> Message for SimpleTx<Data> where Data: crate::Data {}
+impl<Data> mempool::Transaction for SimpleTx<Data> where Data: crate::Data {}
+impl<Data> Transaction for SimpleTx<Data> where Data: crate::Data {}

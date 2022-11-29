@@ -16,7 +16,10 @@ pub fn to_socket_address(
     ip_str: &str,
     port: u16,
 ) -> Result<SocketAddr> {
-    let addr = SocketAddrV4::new(ip_str.parse()?, port);
+    let addr = SocketAddrV4::new(
+        ip_str.parse()?, 
+        port
+    );
     Ok(addr.into())
 }
 

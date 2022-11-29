@@ -101,7 +101,8 @@ where
         );
         loop {
             tokio::select! {
-                batch = &mut self.pool.next(), if self.my_id == self.current_leader && !self.proposed => {
+                batch = &mut self.pool.next(), if self.my_id == self.current_leader && 
+                    !self.proposed => {
                     // Make a batch even if we have insufficient transactions
                     debug!("Proposing a batch");
                     let batch = batch.ok_or(

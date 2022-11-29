@@ -4,7 +4,6 @@ use consensus::{
     client::{self, Stressor},
     server,
     server::{BenchConfig, Server, StorageConfig},
-    types::{SimpleData, SimpleTx},
     Id, KeyConfig, Round,
 };
 use fnv::FnvHashMap;
@@ -29,8 +28,14 @@ const DEFAULT_LOG_LEVEL: Level = Level::Info;
  * TODO: Test RSA
  */
 
+#[cfg(test)]
+mod test;
+
 mod cli;
 pub use cli::*;
+
+mod smr;
+pub use smr::*;
 
 // generate a default stdout logger
 fn default_logger(
