@@ -1,7 +1,7 @@
 use crate::{Id, Round, types::ProtocolMsg, to_socket_address};
 use log::*;
 use mempool::{BatchHash, Transaction, Batch, ConsensusMempoolMsg};
-use network::{Message, plaintcp::{TcpReceiver, TcpReliableSender}, Acknowledgement};
+use network::{plaintcp::{TcpReceiver, TcpReliableSender}, Acknowledgement};
 use storage::rocksdb::Storage;
 use tokio::sync::{oneshot, mpsc::{UnboundedReceiver, unbounded_channel, UnboundedSender}};
 use anyhow::{anyhow, Result};
@@ -16,6 +16,9 @@ pub struct Leto<Tx> {
     tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
     consensus_net: TcpReliableSender<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>,
     tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Tx>>,
+
+    /// State
+    round_ctx: RoundContext,
 }
 
 impl<Tx> Leto<Tx> 
@@ -26,6 +29,9 @@ impl<Tx> Leto<Tx>
 
 mod proposal;
 pub use proposal::*;
+
+mod round_context;
+pub use round_context::*;
 
 impl<Tx> Leto<Tx> 
 where 
@@ -54,7 +60,7 @@ where
         let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
 
         // Start receiver for consensus messages
-        TcpReceiver::<Id, Acknowledgement, ProtocolMsg<Id, Tx, Round>>::spawn(
+        TcpReceiver::<Acknowledgement, ProtocolMsg<Id, Tx, Round>, _>::spawn(
             consensus_addr, 
             Handler::<Id, Tx, Round>::new(tx_net_to_consensus)
         );
@@ -88,6 +94,7 @@ where
                 tx_consensus_to_mem,
                 consensus_net,
                 tx_consensus_to_batcher,
+                round_ctx: RoundContext::default(),
             }.run().await;
             if let Err(e) = res {
                 error!("Consensus error: {}", e);

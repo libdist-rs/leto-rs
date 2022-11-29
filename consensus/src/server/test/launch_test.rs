@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::server::{Id, Party, Round, Server, Settings, StorageConfig, BenchConfig};
+use crate::{server::{Id, Party, Round, Server, Settings, StorageConfig, BenchConfig}, Transaction};
 use anyhow::{anyhow, Result};
 use fnv::FnvHashMap;
 
@@ -43,13 +43,13 @@ fn dummy_settings(num_nodes: usize) -> Settings {
     }
 }
 
-const DEFAULT_CONFIG_FILE_LOCATION: &'static str = "./src/server/test/Default";
+const DEFAULT_CONFIG_FILE_LOCATION: &'static str = "../examples/server";
 
 #[tokio::test]
 async fn test_one() -> Result<()> {
     let settings = Settings::new(DEFAULT_CONFIG_FILE_LOCATION.to_string())?;
     let ids = dummy_ids(settings.consensus_config.num_nodes());
-    let exit_tx = Server::spawn(ids[0], ids, settings)?;
+    let exit_tx = Server::<Transaction>::spawn(ids[0], ids, settings)?;
     tokio::time::sleep(Duration::from_millis(3_000)).await;
     let res = exit_tx.send(());
     res.map_err(|_| anyhow!("Server did not successfully terminate"))

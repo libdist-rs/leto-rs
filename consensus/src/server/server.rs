@@ -1,20 +1,22 @@
 use super::{Settings, Leto};
-use crate::{to_socket_address, Id, Transaction, types::Data};
+use crate::{to_socket_address, Id};
 use anyhow::{anyhow, Result};
 use fnv::FnvHashMap;
 use mempool::{
-    MempoolMsg,
+    MempoolMsg, Transaction,
 };
 use network::{
     plaintcp::TcpSimpleSender,
     Acknowledgement,
 };
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, marker::PhantomData};
 use storage::rocksdb::Storage;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 
 /// This is the server that runs the protocol
-pub struct Server {}
+pub struct Server<Tx> {
+    _x: PhantomData<Tx>,
+}
 
 pub fn get_mempool_peers(
     my_id: Id,
@@ -56,7 +58,10 @@ pub fn get_consensus_peers(
     Ok(map)
 }
 
-impl Server {
+impl<Tx> Server<Tx> 
+where
+    Tx: Transaction,
+{
     pub fn spawn(
         my_id: Id,
         all_ids: Vec<Id>,
@@ -83,7 +88,7 @@ impl Server {
             .ok_or(anyhow!("My Id is not present in the config"))?;
         let mempool_peers = get_mempool_peers(my_id, &settings)?;
         let mempool_net =
-            TcpSimpleSender::<Id, MempoolMsg<Id, Transaction>, Acknowledgement>::with_peers(
+            TcpSimpleSender::<Id, MempoolMsg<Id, Tx>, Acknowledgement>::with_peers(
                 mempool_peers,
             );
         let mempool_addr = to_socket_address(
@@ -124,7 +129,7 @@ impl Server {
 
         // Start the Leto consensus protocol
         let (exit_tx, exit_rx) = oneshot::channel();
-        Leto::<Data, Transaction>::spawn(
+        Leto::<Tx>::spawn(
             my_id,
             settings,
             store, 

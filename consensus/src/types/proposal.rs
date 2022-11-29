@@ -1,18 +1,21 @@
-use super::{Block, Signature};
-use network::{Identifier, Message};
+use super::Block;
+use mempool::Transaction;
+use network::Message;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Proposal<Id, Tx, Round> {
+pub struct Proposal<Tx, Round> {
     block: Block<Tx>,
     round: Round,
-    sig: Signature<Id, Block<Tx>>,
 }
 
-impl<Id, Data, Round> Message for Proposal<Id, Data, Round>
+impl<Tx, Round> Proposal<Tx, Round> {
+    pub fn new(block: Block<Tx>, round: Round) -> Self { Self { block, round } }
+}
+
+impl<Tx, Round> Message for Proposal<Tx, Round>
 where
-    Id: Identifier,
-    Data: Message,
+    Tx: Transaction,
     Round: Message,
 {
 }

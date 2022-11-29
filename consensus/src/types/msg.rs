@@ -7,12 +7,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ProtocolMsg<Id, Tx, Round> {
     Propose { 
-        prop: Proposal<Id, Tx, Round>,
-        auth: Signature<Id, Proposal<Id, Tx, Round>>,
+        prop: Proposal<Tx, Round>,
+        auth: Signature<Id, Proposal<Tx, Round>>,
     },
     Relay {
-        prop: Proposal<Id, Tx, Round>,
-        auth: Signature<Id, Proposal<Id, Tx, Round>>,
+        prop: Proposal<Tx, Round>,
+        auth: Signature<Id, Proposal<Tx, Round>>,
     },
     Blame {},
 }
@@ -22,8 +22,7 @@ where
     Id: Identifier,
     Tx: Transaction,
     Round: network::Message,
-{
-}
+{}
 
 /// `ClientMsg` are messages sent between the client and the servers
 #[derive(Debug, Serialize, Deserialize, Clone)]

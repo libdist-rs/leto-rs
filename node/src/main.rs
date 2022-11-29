@@ -4,7 +4,7 @@ use consensus::{
     client::{self, Stressor},
     server,
     server::{BenchConfig, Server, StorageConfig},
-    Id, KeyConfig, Round,
+    Id, KeyConfig, Round, Transaction,
 };
 use fnv::FnvHashMap;
 use log::*;
@@ -292,7 +292,7 @@ async fn main() -> Result<()> {
             let all_ids = settings.consensus_config.get_all_ids();
 
             // Start the Server
-            let _exit_tx = Server::spawn(server_id, all_ids, settings)?;
+            let _exit_tx = Server::<Transaction>::spawn(server_id, all_ids, settings)?;
 
             // Implement a waiting strategy
             let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
