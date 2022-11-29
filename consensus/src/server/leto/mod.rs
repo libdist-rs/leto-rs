@@ -77,7 +77,7 @@ where
         let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
 
         // Start receiver for consensus messages
-        TcpReceiver::spawn(
+        TcpReceiver::<Acknowledgement, ProtocolMsg<Id, Tx, Round>, _>::spawn(
             consensus_addr, 
             Handler::<Id, Tx, Round>::new(tx_net_to_consensus)
         );

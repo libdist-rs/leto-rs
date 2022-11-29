@@ -5,13 +5,13 @@ use network::{Acknowledgement, Identifier, Message};
 use tokio::sync::mpsc::UnboundedSender;
 
 #[derive(Debug, Clone)]
-pub struct Handler<Id, Transaction, Round> {
-    consensus_tx: UnboundedSender<ProtocolMsg<Id, Transaction, Round>>,
+pub struct Handler<Id, Tx, Round> {
+    consensus_tx: UnboundedSender<ProtocolMsg<Id, Tx, Round>>,
 }
 
-impl<Id, Transaction, Round> Handler<Id, Transaction, Round> {
+impl<Id, Tx, Round> Handler<Id, Tx, Round> {
     pub fn new(
-        consensus_tx: UnboundedSender<ProtocolMsg<Id, Transaction, Round>>
+        consensus_tx: UnboundedSender<ProtocolMsg<Id, Tx, Round>>
     ) -> Self 
     {
         Self { consensus_tx }
@@ -19,16 +19,16 @@ impl<Id, Transaction, Round> Handler<Id, Transaction, Round> {
 }
 
 #[async_trait]
-impl<Id, Transaction, Round> network::Handler<Acknowledgement, ProtocolMsg<Id, Transaction, Round>>
-    for Handler<Id, Transaction, Round>
+impl<Id, Tx, Round> network::Handler<Acknowledgement, ProtocolMsg<Id, Tx, Round>>
+    for Handler<Id, Tx, Round>
 where
     Id: Identifier,
-    Transaction: types::Transaction,
+    Tx: types::Transaction,
     Round: mempool::Round + Message,
 {
     async fn dispatch(
         &self,
-        msg: ProtocolMsg<Id, Transaction, Round>,
+        msg: ProtocolMsg<Id, Tx, Round>,
         writer: &mut network::Writer<Acknowledgement>,
     ) {
         // Forward the message
