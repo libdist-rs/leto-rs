@@ -8,12 +8,27 @@ pub struct Proposal<Tx, Round> {
     round: Round,
 }
 
+impl<Tx, Round> Proposal<Tx, Round> {}
+
+impl<Tx, Round> Proposal<Tx, Round>
+where
+    Round: Clone,
+{
+    pub fn round(&self) -> Round {
+        self.round.clone()
+    }
+}
+
 impl<Tx, Round> Proposal<Tx, Round> {
     pub fn new(
         block: Block<Tx>,
         round: Round,
     ) -> Self {
         Self { block, round }
+    }
+
+    pub fn block(&self) -> &Block<Tx> {
+        &self.block
     }
 }
 

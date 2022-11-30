@@ -12,7 +12,7 @@ impl<Tx> Leto<Tx>
 where
     Tx: types::Transaction,
 {
-    pub fn handle_proposal(
+    pub async fn handle_proposal(
         &mut self,
         prop: Proposal<Tx, Round>,
         auth: Signature<Id, Proposal<Tx, Round>>,
@@ -21,12 +21,42 @@ where
         Tx: types::Transaction,
     {
         debug!("Got a proposal: {:?}", prop);
-        // TODO: Check correct leader
         // TODO: Check if the parent is known
-        if auth.id != self.my_id {
-            // Check signature
-            let proposal_hash = Hash::ser_and_hash(&prop);
-            let leader = self.round_context.leader();
+        let parent_hash = prop.block().parent_hash();
+        trace!("Querying parent hash: {:?}", parent_hash);
+        let parent = self.chain_state.parent(parent_hash).await?;
+        if let None = parent {
+            warn!("Parent not found for prop: {:?}", prop);
+            // TODO: Handle unknown parent
+            // self._tx_consensus_to_mem.send(ConsensusMempoolMsg::UnknownBatch(, ));
+            return Ok(());
+            // TODO: For now, return
+        }
+        debug!("Parent identified for the current proposal");
+        // TODO: Check if this proposal is for the correct round
+        if prop.round() < self.round_context.round() {
+            // Ignore
+            warn!(
+                "Got an old proposal for round {} in {}",
+                prop.round(),
+                self.round_context.round()
+            );
+            return Ok(());
+        } else if prop.round() > self.round_context.round() {
+            // Handle future proposals
+            warn!(
+                "Got a future proposal for round {} in {}",
+                prop.round(),
+                self.round_context.round()
+            );
+            self.round_context.queue_proposal(prop);
+            return Ok(());
+        }
+        // Check signature
+        let proposal_hash = Hash::ser_and_hash(&prop);
+        // Check correct leader
+        let leader = self.round_context.leader();
+        if leader != self.my_id {
             auth.verify(
                 &proposal_hash,
                 &leader,
@@ -61,7 +91,8 @@ where
         debug!("Got a batch hash: {}", batch_hash);
 
         // Create proposal
-        let block = Block::new(batch_hash.clone());
+        let prev_hash = self.chain_state.highest_block_hash();
+        let block = Block::new(batch_hash.clone(), prev_hash);
         let round = self.round_context.round();
         let proposal = Proposal::new(block, round);
 

@@ -1,12 +1,14 @@
 use crate::server::{
     get_consensus_peers, BatcherConsensusMsg, Handler, Parameters, RRBatcher, Settings,
 };
+use crate::types::Block;
 use crate::{
     to_socket_address,
     types::{self, ProtocolMsg},
     Id, KeyConfig, Round,
 };
 use anyhow::{anyhow, Result};
+use crypto::hash::Hash;
 use log::*;
 use mempool::{Batch, BatchHash, ConsensusMempoolMsg};
 use network::{
@@ -19,34 +21,44 @@ use tokio::sync::{
     oneshot,
 };
 
-use super::{QuorumWaiter, RoundContext};
+use super::{ChainState, QuorumWaiter, RoundContext};
 
 pub struct Leto<Tx> {
+    // Static state
     pub(crate) my_id: Id,
     /// Crypto Keys
     pub(crate) crypto_system: KeyConfig,
-    pub(crate) broadcast_peers: Vec<Id>, // cache
+    /// A collection of all peers except `my_id` for use during broadcast
+    pub(crate) broadcast_peers: Vec<Id>,
+    /// Settings
+    pub(crate) _settings: Settings,
+
+    // Channel handlers
     pub(crate) exit_rx: oneshot::Receiver<()>,
     pub(crate) rx_mem_to_consensus: UnboundedReceiver<BatchHash<Tx>>,
     pub(crate) rx_net_to_consensus: UnboundedReceiver<ProtocolMsg<Id, Tx, Round>>,
-    pub(crate) _store: Storage,
     pub(crate) consensus_net: TcpReliableSender<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>,
     pub(crate) _tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
     pub(crate) _tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Tx>>,
-    pub(crate) round_context: RoundContext,
     pub(crate) tx_msg_loopback: UnboundedSender<ProtocolMsg<Id, Tx, Round>>,
     pub(crate) rx_msg_loopback: UnboundedReceiver<ProtocolMsg<Id, Tx, Round>>,
 
-    // This object is used to wait for n-f messages to be delivered
+    /* Helpers */
+    /// This object is used to wait for n-f messages to be delivered
     pub(crate) quorum_waiter: QuorumWaiter,
 
-    // Settings
-    pub(crate) _settings: Settings,
+    /* Variable State */
+    /// Round state
+    pub(crate) round_context: RoundContext<Tx>,
+    /// Chain state
+    pub(crate) chain_state: ChainState<Tx>,
 }
 
 impl<Tx> Leto<Tx> {
     pub const INITIAL_LEADER: Id = Id::START;
     pub const INITIAL_ROUND: Round = Round::START;
+    pub const GENESIS_BLOCK: Block<Tx> =
+        Block::<Tx>::new(BatchHash::<Tx>::EMPTY_HASH, Hash::<Block<Tx>>::EMPTY_HASH);
 }
 
 impl<Tx> Leto<Tx>
@@ -112,7 +124,6 @@ where
                 exit_rx,
                 rx_mem_to_consensus,
                 rx_net_to_consensus,
-                _store: store,
                 consensus_net,
                 _tx_consensus_to_mem: tx_consensus_to_mem,
                 _tx_consensus_to_batcher: tx_consensus_to_batcher,
@@ -127,6 +138,7 @@ where
                         - settings.consensus_config.num_faults
                         - 1,
                 ),
+                chain_state: ChainState::new(store),
                 _settings: settings,
             }
             .run()
@@ -140,6 +152,11 @@ where
 
     async fn run(&mut self) -> Result<()> {
         info!("Starting the server");
+
+        // Setup genesis context
+        self.chain_state.genesis_setup().await?;
+
+        // Start the protocol loop
         loop {
             let res = tokio::select! {
                 exit_val = &mut self.exit_rx => {
@@ -185,8 +202,8 @@ where
         msg: ProtocolMsg<Id, Tx, Round>,
     ) -> Result<()> {
         match msg {
-            ProtocolMsg::Propose { proposal, auth } => self.handle_proposal(proposal, auth),
-            ProtocolMsg::Relay { proposal, auth } => self.handle_proposal(proposal, auth),
+            ProtocolMsg::Propose { proposal, auth } => self.handle_proposal(proposal, auth).await,
+            ProtocolMsg::Relay { proposal, auth } => self.handle_proposal(proposal, auth).await,
             ProtocolMsg::Blame { round, auth } => self.handle_blame(round, auth),
         }
     }
