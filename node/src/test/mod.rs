@@ -1,2 +1,2 @@
-mod server;
 mod client;
+mod server;

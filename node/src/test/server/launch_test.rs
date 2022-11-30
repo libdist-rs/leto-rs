@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::{
     server::{BenchConfig, Party, Server, Settings, StorageConfig},
-    Id, KeyConfig, Round, SimpleTx, SimpleData,
+    Id, KeyConfig, Round, SimpleData, SimpleTx,
 };
 use anyhow::{anyhow, Result};
 use crypto::Algorithm;
@@ -16,7 +16,10 @@ fn dummy_ids(num_nodes: usize) -> Vec<Id> {
     ids
 }
 
-fn dummy_settings(num_nodes: usize, num_faults: usize) -> Settings {
+fn _dummy_settings(
+    num_nodes: usize,
+    num_faults: usize,
+) -> Settings {
     // Returns dummy settings
     let ids = dummy_ids(num_nodes);
     let mempool_config = mempool::Config::<Round>::default();
@@ -41,7 +44,10 @@ fn dummy_settings(num_nodes: usize, num_faults: usize) -> Settings {
     }
     Settings {
         mempool_config,
-        consensus_config: crate::server::Config { parties, num_faults },
+        consensus_config: crate::server::Config {
+            parties,
+            num_faults,
+        },
         storage: storage_config,
         bench_config: BenchConfig::default(),
     }

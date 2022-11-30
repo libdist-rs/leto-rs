@@ -1,4 +1,4 @@
-use consensus::types::{self, Transaction};
+use consensus::types::Transaction;
 use network::Message;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug, Display};

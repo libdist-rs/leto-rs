@@ -31,8 +31,7 @@ pub struct Stressor<Tx> {
     _x: PhantomData<Tx>,
 }
 
-
-impl<Tx> Stressor<Tx> 
+impl<Tx> Stressor<Tx>
 where
     Tx: super::MockTx,
 {
@@ -58,14 +57,8 @@ where
 
         // Networking setup
         let (consensus_tx, consensus_rx) = unbounded_channel();
-        let my_addr = to_socket_address(
-            "0.0.0.0", 
-            settings.port
-        )?;
-        TcpReceiver::spawn(
-            my_addr, 
-            Handler::<Tx>::new(consensus_tx)
-        );
+        let my_addr = to_socket_address("0.0.0.0", settings.port)?;
+        TcpReceiver::spawn(my_addr, Handler::<Tx>::new(consensus_tx));
 
         // Start the client
         tokio::spawn(async move {
@@ -76,13 +69,14 @@ where
                 consensus_sender,
                 consensus_rx,
                 _x: PhantomData,
-            }.run().await
+            }
+            .run()
+            .await
         });
         Ok(exit_tx)
     }
 
-    async fn run(&mut self)-> Result<()>
-    {
+    async fn run(&mut self) -> Result<()> {
         // Get stress settings
         let burst_tx = self.settings.bench_config.txs_per_burst;
         let tx_size = self.settings.bench_config.tx_size;
@@ -117,7 +111,7 @@ where
                     // TODO: Handle tx confirmation
                 }
             }
-        };
+        }
         Ok(())
     }
 }

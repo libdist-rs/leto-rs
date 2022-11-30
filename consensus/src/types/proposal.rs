@@ -21,4 +21,5 @@ impl<Tx, Round> Message for Proposal<Tx, Round>
 where
     Tx: super::Transaction,
     Round: Message,
-{}
+{
+}

@@ -1,13 +1,12 @@
+use super::Leto;
 use crate::{
     types::{self, Block, Proposal, ProtocolMsg, Signature},
-    Id, Round, server::QuorumWaiter,
+    Id, Round,
 };
 use anyhow::{anyhow, Result};
 use crypto::hash::Hash;
-use futures_util::{stream::FuturesUnordered, StreamExt};
 use log::*;
-use mempool::{BatchHash, wait};
-use super::Leto;
+use mempool::BatchHash;
 
 impl<Tx> Leto<Tx>
 where
@@ -48,10 +47,7 @@ where
     where
         Tx: types::Transaction,
     {
-        debug!("Got a blame for round {} from {}", 
-            blame_round, 
-            auth.id
-        );
+        debug!("Got a blame for round {} from {}", blame_round, auth.id);
         todo!();
     }
 
@@ -72,36 +68,21 @@ where
         // Create sig
         let prop_hash = Hash::ser_and_hash(&proposal);
         let auth = Signature::new(prop_hash, self.my_id, &self.crypto_system.secret)?;
-        
+
         // Create protocol msg
-        let msg = ProtocolMsg
-            ::<Id, Tx, Round>
-            ::Propose { 
-                proposal, 
-                auth,
-        };
+        let msg = ProtocolMsg::<Id, Tx, Round>::Propose { proposal, auth };
 
         // Broadcast message
         let handlers = self
             .consensus_net
             .broadcast(&self.broadcast_peers, msg.clone())
             .await;
-        
-        let quorum_waiter = QuorumWaiter::new(
-            self.settings.consensus_config.num_nodes()-self.settings.consensus_config.num_faults
-        );
-        quorum_waiter.wait(handlers).await?;
-        // let mut wait_stream = FuturesUnordered::new();
-        // for handler in handlers {
-        //     // wait_stream.push(handler);
-        //     // TODO: Use Quorum waiter
-        //     let _ack = handler.await?;
-        // }
-        
+
+        // Wait for n-f servers to get the message before proceeding
+        self.quorum_waiter.wait(handlers).await?;
+
         // Send to loopback
-        self.tx_msg_loopback
-            .send(msg)
-            .map_err(anyhow::Error::new)
+        self.tx_msg_loopback.send(msg).map_err(anyhow::Error::new)
         // Ok(())
     }
 }

@@ -1,4 +1,6 @@
-use crate::server::{get_consensus_peers, BatcherConsensusMsg, Handler, Parameters, RRBatcher, Settings};
+use crate::server::{
+    get_consensus_peers, BatcherConsensusMsg, Handler, Parameters, RRBatcher, Settings,
+};
 use crate::{
     to_socket_address,
     types::{self, ProtocolMsg},
@@ -17,29 +19,29 @@ use tokio::sync::{
     oneshot,
 };
 
-use super::RoundContext;
+use super::{QuorumWaiter, RoundContext};
 
 pub struct Leto<Tx> {
     pub(crate) my_id: Id,
     /// Crypto Keys
-    pub(crate) crypto_system: KeyConfig, 
+    pub(crate) crypto_system: KeyConfig,
     pub(crate) broadcast_peers: Vec<Id>, // cache
     pub(crate) exit_rx: oneshot::Receiver<()>,
     pub(crate) rx_mem_to_consensus: UnboundedReceiver<BatchHash<Tx>>,
     pub(crate) rx_net_to_consensus: UnboundedReceiver<ProtocolMsg<Id, Tx, Round>>,
-    pub(crate) store: Storage,
-    pub(crate) consensus_net: TcpReliableSender<
-        Id, 
-        ProtocolMsg<Id, Tx, Round>, 
-        Acknowledgement
-    >,
-    pub(crate) tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
-    pub(crate) tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Tx>>,
+    pub(crate) _store: Storage,
+    pub(crate) consensus_net: TcpReliableSender<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>,
+    pub(crate) _tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
+    pub(crate) _tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Tx>>,
     pub(crate) round_context: RoundContext,
     pub(crate) tx_msg_loopback: UnboundedSender<ProtocolMsg<Id, Tx, Round>>,
     pub(crate) rx_msg_loopback: UnboundedReceiver<ProtocolMsg<Id, Tx, Round>>,
+
+    // This object is used to wait for n-f messages to be delivered
+    pub(crate) quorum_waiter: QuorumWaiter,
+
     // Settings
-    pub(crate) settings: Settings,
+    pub(crate) _settings: Settings,
 }
 
 impl<Tx> Leto<Tx> {
@@ -67,26 +69,22 @@ where
             .consensus_config
             .get(&my_id)
             .ok_or(anyhow!("My Id is not present in the config"))?;
-        let consensus_addr = to_socket_address(
-            "0.0.0.0", 
-            me.consensus_port
-        )?;
+        let consensus_addr = to_socket_address("0.0.0.0", me.consensus_port)?;
 
         let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
 
         // Start receiver for consensus messages
         TcpReceiver::<Acknowledgement, ProtocolMsg<Id, Tx, Round>, _>::spawn(
-            consensus_addr, 
-            Handler::<Id, Tx, Round>::new(tx_net_to_consensus)
+            consensus_addr,
+            Handler::<Id, Tx, Round>::new(tx_net_to_consensus),
         );
 
         // Start outgoing connections
         let consensus_peers = get_consensus_peers(my_id, &settings)?;
-        let consensus_net = TcpReliableSender::<
-            Id,
-            ProtocolMsg<Id, Tx, Round>,
-            Acknowledgement,
-        >::with_peers(consensus_peers);
+        let consensus_net =
+            TcpReliableSender::<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>::with_peers(
+                consensus_peers,
+            );
 
         // Start the batcher
         let (tx_consensus_to_batcher, rx_consensus_to_batcher) = unbounded_channel();
@@ -103,10 +101,7 @@ where
             tx_processor,
         )?;
 
-        let all_peers_except_me = all_peers
-            .into_iter()
-            .filter(|x| x != &my_id)
-            .collect();
+        let all_peers_except_me = all_peers.into_iter().filter(|x| x != &my_id).collect();
 
         let (tx_msg_loopback, rx_msg_loopback) = unbounded_channel();
         tokio::spawn(async move {
@@ -117,17 +112,22 @@ where
                 exit_rx,
                 rx_mem_to_consensus,
                 rx_net_to_consensus,
-                store,
+                _store: store,
                 consensus_net,
-                tx_consensus_to_mem,
-                tx_consensus_to_batcher,
-                round_context: RoundContext::new(
-                    Round::START, 
-                    Id::START
-                ),
+                _tx_consensus_to_mem: tx_consensus_to_mem,
+                _tx_consensus_to_batcher: tx_consensus_to_batcher,
+                round_context: RoundContext::new(Round::START, Id::START),
                 tx_msg_loopback,
                 rx_msg_loopback,
-                settings,
+                // num_nodes - num_faults - 1
+                // Here, -1 is because we always deliver messages to ourselves using the loopback
+                // channel
+                quorum_waiter: QuorumWaiter::new(
+                    settings.consensus_config.num_nodes()
+                        - settings.consensus_config.num_faults
+                        - 1,
+                ),
+                _settings: settings,
             }
             .run()
             .await;
@@ -152,7 +152,7 @@ where
                     let batch_hash = batch_hash.ok_or(
                         anyhow!("Mempool processor has shut down")
                     )?;
-                    self.handle_new_batch(batch_hash).await                
+                    self.handle_new_batch(batch_hash).await
                 }
                 // Receive consensus messages from loopback
                 msg = self.rx_msg_loopback.recv() => {
@@ -183,8 +183,7 @@ where
     async fn handle_msg(
         &mut self,
         msg: ProtocolMsg<Id, Tx, Round>,
-    ) -> Result<()>
-    {
+    ) -> Result<()> {
         match msg {
             ProtocolMsg::Propose { proposal, auth } => self.handle_proposal(proposal, auth),
             ProtocolMsg::Relay { proposal, auth } => self.handle_proposal(proposal, auth),

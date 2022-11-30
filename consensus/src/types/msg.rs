@@ -24,7 +24,8 @@ where
     Id: Identifier,
     Tx: super::Transaction,
     Round: network::Message + mempool::Round,
-{}
+{
+}
 
 /// `ClientMsg` are messages sent between the client and the servers
 #[derive(Debug, Serialize, Deserialize, Clone)]

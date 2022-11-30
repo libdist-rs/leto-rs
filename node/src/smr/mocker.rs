@@ -1,6 +1,6 @@
-use consensus::{Id, client::MockTx};
-use serde::{Serialize, Deserialize};
 use crate::SimpleTx;
+use consensus::{client::MockTx, Id};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ExtraData {
@@ -18,16 +18,15 @@ impl ExtraData {
 }
 
 // Generates a mock transaction with this Id
-impl<Data> MockTx for SimpleTx<Data> 
+impl<Data> MockTx for SimpleTx<Data>
 where
     Data: crate::Data,
 {
     fn mock_transaction(
-        tx_id: usize, 
+        tx_id: usize,
         client_id: Id,
         tx_size: usize,
-    ) -> Self 
-    {
+    ) -> Self {
         let data = Data::with_payload(&vec![0 as u8; tx_size]);
         let extra_data = ExtraData::new(tx_id, client_id);
         SimpleTx {

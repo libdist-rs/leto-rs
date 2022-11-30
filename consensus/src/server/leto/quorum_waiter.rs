@@ -1,7 +1,6 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use network::plaintcp::CancelHandler;
-use mempool::quorum_waiter;
 
 pub struct QuorumWaiter {
     threshold: usize,
@@ -12,7 +11,10 @@ impl QuorumWaiter {
         Self { threshold }
     }
 
-    pub async fn wait(&self, handlers: Vec<CancelHandler>) -> Result<()> {
+    pub async fn wait(
+        &self,
+        handlers: Vec<CancelHandler>,
+    ) -> Result<()> {
         let mut wait_stream = FuturesUnordered::new();
         for handler in handlers {
             wait_stream.push(handler);
@@ -26,9 +28,13 @@ impl QuorumWaiter {
             }
         }
         if success == self.threshold {
-            return Ok(())
+            return Ok(());
         } else {
-            return Err(anyhow!("Did not return sufficient acks: Expected: {}, Got {}", self.threshold, success));
+            return Err(anyhow!(
+                "Did not return sufficient acks: Expected: {}, Got {}",
+                self.threshold,
+                success
+            ));
         }
     }
 }

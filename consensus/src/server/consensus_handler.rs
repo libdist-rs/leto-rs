@@ -10,10 +10,7 @@ pub struct Handler<Id, Tx, Round> {
 }
 
 impl<Id, Tx, Round> Handler<Id, Tx, Round> {
-    pub fn new(
-        consensus_tx: UnboundedSender<ProtocolMsg<Id, Tx, Round>>
-    ) -> Self 
-    {
+    pub fn new(consensus_tx: UnboundedSender<ProtocolMsg<Id, Tx, Round>>) -> Self {
         Self { consensus_tx }
     }
 }

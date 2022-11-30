@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::fmt::{self, Display, Debug};
+use std::fmt::{self, Debug, Display};
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash, Copy, Clone)]
 pub struct Round(usize);
@@ -21,8 +21,10 @@ impl From<usize> for Round {
 }
 
 impl Debug for Round {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result 
-    {
+    fn fmt(
+        &self,
+        f: &mut fmt::Formatter<'_>,
+    ) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }

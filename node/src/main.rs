@@ -160,17 +160,20 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
     }
 
     let num_faults = if let None = config.num_faults {
-        (config.num_servers-1)/3
+        (config.num_servers - 1) / 3
     } else {
         config.num_faults.unwrap()
     };
-    if num_faults*3 >= config.num_servers {
-        return Err(anyhow!("Number of faults is invalid: {} <= 3*{}", 
-            config.num_servers, num_faults));
+    if num_faults * 3 >= config.num_servers {
+        return Err(anyhow!(
+            "Number of faults is invalid: {} <= 3*{}",
+            config.num_servers,
+            num_faults
+        ));
     }
     let consensus_config = server::Config {
         parties: server_parties,
-        num_faults
+        num_faults,
     };
 
     // Create Storage config
