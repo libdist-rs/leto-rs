@@ -6,7 +6,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use crypto::hash::Hash;
 use log::*;
-use mempool::BatchHash;
+use mempool::{BatchHash, ConsensusMempoolMsg};
 
 impl<Tx> Leto<Tx>
 where
@@ -21,18 +21,36 @@ where
         Tx: types::Transaction,
     {
         debug!("Got a proposal: {:?}", prop);
-        // TODO: Check if the parent is known
-        let parent_hash = prop.block().parent_hash();
-        trace!("Querying parent hash: {:?}", parent_hash);
-        let parent = self.chain_state.parent(parent_hash).await?;
+
+        // Check if the parent is known
+        let parent_hash = prop
+            .block()
+            .parent_hash();
+        trace!(
+            "Querying parent hash: {:?}", 
+            parent_hash
+        );
+        let parent = self
+            .chain_state
+            .parent(parent_hash)
+            .await?;
         if let None = parent {
             warn!("Parent not found for prop: {:?}", prop);
             // TODO: Handle unknown parent
-            // self._tx_consensus_to_mem.send(ConsensusMempoolMsg::UnknownBatch(, ));
+            // self
+            //    .tx_consensus_to_mem
+            //    .send(
+            //         ConsensusMempoolMsg::UnknownBatch(
+            //             self.my_id, 
+            //             vec![parent_hash]
+            //         )
+            //     );
             return Ok(());
             // TODO: For now, return
         }
+
         debug!("Parent identified for the current proposal");
+
         // TODO: Check if this proposal is for the correct round
         if prop.round() < self.round_context.round() {
             // Ignore
@@ -52,6 +70,8 @@ where
             self.round_context.queue_proposal(prop);
             return Ok(());
         }
+        debug!("Got a proposal for the correct round");
+
         // Check signature
         let proposal_hash = Hash::ser_and_hash(&prop);
         // Check correct leader

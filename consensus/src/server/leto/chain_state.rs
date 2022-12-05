@@ -17,9 +17,9 @@ impl<Tx> ChainState<Tx> {
         self.highest_block_hash.clone()
     }
 
-    pub fn store(&mut self) -> &mut Storage {
-        &mut self.store
-    }
+    // pub fn store(&mut self) -> &mut Storage {
+    //     &mut self.store
+    // }
 }
 
 impl<Tx> ChainState<Tx>
