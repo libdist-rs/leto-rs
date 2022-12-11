@@ -3,9 +3,10 @@ use crate::{
     types::{Block, Proposal, Signature},
     Id, Round,
 };
-use anyhow::Result;
+use anyhow::{anyhow, Context, Result};
 use crypto::hash::Hash;
 use log::*;
+use mempool::{Batch, BatchHash};
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt;
 use storage::rocksdb::Storage;
@@ -45,6 +46,24 @@ pub struct ChainState<Tx> {
     highest_block_hash: Hash<Block<Tx>>,
 }
 
+impl<Tx> ChainState<Tx>
+where
+    Tx: DeserializeOwned,
+{
+    pub async fn get_batch(
+        &mut self,
+        batch_hash: BatchHash<Tx>,
+    ) -> Result<Option<Batch<Tx>>> {
+        match self.store.read(batch_hash.to_vec()).await? {
+            Some(serialized) => bincode::deserialize::<Batch<Tx>>(&serialized)
+                .map_err(anyhow::Error::new)
+                .map(Some)
+                .context("Failed to deserialize batch"),
+            None => Ok(None),
+        }
+    }
+}
+
 impl<Tx> ChainState<Tx> {
     pub fn highest_block_hash(&self) -> Hash<Block<Tx>> {
         self.highest_block_hash.clone()
@@ -76,6 +95,21 @@ where
 
         // Update highest state
         self.highest_block_hash = chain_element.key;
+
+        Ok(())
+    }
+
+    pub async fn write_batch(
+        &mut self,
+        batch: Batch<Tx>,
+    ) -> Result<()> {
+        let value = bincode::serialize(&batch)
+            .map_err(anyhow::Error::new)
+            .context("Failed to write batch")?;
+        let key = Hash::<Batch<Tx>>::do_hash(&value);
+
+        // Write to DB
+        self.store.write(key.to_vec(), value).await;
 
         Ok(())
     }

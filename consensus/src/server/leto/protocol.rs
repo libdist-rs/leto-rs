@@ -23,7 +23,10 @@ use tokio::sync::{
     oneshot,
 };
 
-use super::{ChainState, LeaderContext, QuorumWaiter, RoundContext};
+use super::{
+    ChainState, Helper, HelperRequest, LeaderContext, QuorumWaiter, RoundContext, Synchronizer,
+    SynchronizerOutMsg,
+};
 
 pub struct Leto<Tx> {
     // Static state
@@ -49,6 +52,9 @@ pub struct Leto<Tx> {
     /* Helpers */
     /// This object is used to wait for n-f messages to be delivered
     pub(crate) _quorum_waiter: QuorumWaiter,
+    pub(crate) synchronizer: Synchronizer<Tx>,
+    pub(crate) rx_synchronizer_to_consensus: UnboundedReceiver<SynchronizerOutMsg<Tx>>,
+    pub(crate) tx_helper: UnboundedSender<HelperRequest<Tx>>,
 
     /* Variable State */
     /// Round State
@@ -100,8 +106,17 @@ where
         let consensus_peers = get_consensus_peers(my_id, &settings)?;
         let consensus_net =
             TcpReliableSender::<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>::with_peers(
-                consensus_peers,
+                consensus_peers.clone(),
             );
+
+        // Start the helper
+        let (tx_helper, rx_helper) = unbounded_channel();
+        Helper::<Tx>::spawn(store.clone(), rx_helper, consensus_peers.clone());
+
+        // Start the synchronizer
+        let (tx_from_sync, rx_from_sync) = unbounded_channel();
+        let synchronizer =
+            Synchronizer::<Tx>::new(store.clone(), my_id, tx_from_sync, consensus_peers);
 
         // Start the batcher
         let (tx_consensus_to_batcher, rx_consensus_to_batcher) = unbounded_channel();
@@ -150,6 +165,9 @@ where
                 chain_state: ChainState::new(store),
                 _settings: settings,
                 cancel_handlers: FnvHashMap::default(),
+                rx_synchronizer_to_consensus: rx_from_sync,
+                synchronizer,
+                tx_helper,
             }
             .run()
             .await;
@@ -205,6 +223,16 @@ where
                         error!("Error handling consensus message: {}", e);
                     }
                 }
+                sync_help = self.rx_synchronizer_to_consensus.recv() => {
+                    let sync_msg = sync_help.ok_or(
+                        anyhow!("Synchronizer channel closed")
+                    )?;
+                    if let Err(e) = match sync_msg {
+                        SynchronizerOutMsg::ResponseBatch(resp_batch) => self.on_batch_ready(resp_batch).await,
+                    } {
+                        error!("Error handling a ready batch: {}", e);
+                    }
+                }
             };
         }
         info!("Server is shutting down!");
@@ -216,9 +244,26 @@ where
         msg: ProtocolMsg<Id, Tx, Round>,
     ) -> Result<()> {
         match msg {
-            ProtocolMsg::Propose { proposal, auth } => self.handle_proposal(proposal, auth).await,
-            ProtocolMsg::Relay { proposal, auth } => self.handle_proposal(proposal, auth).await,
+            ProtocolMsg::Propose {
+                proposal,
+                auth,
+                batch,
+            } => self.handle_proposal(proposal, auth, batch).await,
+            ProtocolMsg::Relay {
+                proposal,
+                auth,
+                batch_hash,
+                sender,
+            } => self.handle_relay(proposal, auth, batch_hash, sender).await,
             ProtocolMsg::Blame { round, auth } => self.handle_blame(round, auth),
+            // Use the helper
+            ProtocolMsg::BatchRequest { source, request } => {
+                self.on_batch_request(source, request).await
+            }
+            // Use the synchronizer
+            ProtocolMsg::BatchResponse { response } => {
+                self.synchronizer.on_batch_response(response).await
+            }
         }
     }
 }

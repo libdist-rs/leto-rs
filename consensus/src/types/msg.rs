@@ -1,5 +1,6 @@
-use super::{Proposal, Signature};
+use super::{Proposal, Request, Response, Signature};
 use crypto::hash::Hash;
+use mempool::{Batch, BatchHash};
 use network::Identifier;
 use serde::{Deserialize, Serialize};
 
@@ -8,14 +9,24 @@ pub enum ProtocolMsg<Id, Tx, Round> {
     Propose {
         proposal: Proposal<Tx, Round>,
         auth: Signature<Id, Proposal<Tx, Round>>,
+        batch: Batch<Tx>,
     },
     Relay {
         proposal: Proposal<Tx, Round>,
         auth: Signature<Id, Proposal<Tx, Round>>,
+        batch_hash: BatchHash<Tx>,
+        sender: Id,
     },
     Blame {
         round: Round,
         auth: Signature<Id, Round>,
+    },
+    BatchRequest {
+        source: Id,
+        request: Request<Batch<Tx>>,
+    },
+    BatchResponse {
+        response: Response<Batch<Tx>>,
     },
 }
 

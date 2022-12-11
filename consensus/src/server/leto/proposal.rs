@@ -1,12 +1,14 @@
 use super::Leto;
 use crate::{
     types::{self, Block, Proposal, ProtocolMsg, Signature},
-    Id, Round, server::BatcherConsensusMsg as BCM,
+    Id,
+    Round,
+    // server::BatcherConsensusMsg as BCM,
 };
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use crypto::hash::Hash;
 use log::*;
-use mempool::BatchHash;
+use mempool::{Batch, BatchHash};
 
 impl<Tx> Leto<Tx>
 where
@@ -17,6 +19,7 @@ where
         &mut self,
         proposal: Proposal<Tx, Round>,
         auth: Signature<Id, Proposal<Tx, Round>>,
+        batch: Batch<Tx>,
     ) -> Result<()>
     where
         Tx: types::Transaction,
@@ -40,7 +43,7 @@ where
                 proposal.round(),
                 self.round_context.round()
             );
-            self.round_context.queue_proposal(proposal, auth);
+            self.round_context.queue_proposal(proposal, auth, batch);
             return Ok(());
         }
         debug!("Got a proposal for the correct round");
@@ -82,16 +85,27 @@ where
         }
 
         /* WE NOW HAVE A CORRECT PROPOSAL */
-        self.on_correct_proposal(proposal, auth).await
+        self.on_correct_proposal(proposal, auth, batch).await
     }
 
     pub async fn on_correct_proposal(
         &mut self,
         proposal: Proposal<Tx, Round>,
         auth: Signature<Id, Proposal<Tx, Round>>,
+        batch: Batch<Tx>,
     ) -> Result<()> {
+        // Get batch hash
+        let batch_hash = Hash::ser_and_hash(&batch);
+
+        // Write batch to the DB
+        self.chain_state
+            .write_batch(batch)
+            .await
+            .context("Failed to write batching on handling a correct proposal")?;
+
         // Send the proposal to the next leader and wait for an ack from them
-        self.relay_proposal(proposal.clone(), auth.clone()).await?;
+        self.relay_proposal(proposal.clone(), auth.clone(), batch_hash)
+            .await?;
 
         debug!("Relaying finished");
 
@@ -135,13 +149,23 @@ where
         let auth = Signature::new(prop_hash, self.my_id, &self.crypto_system.secret)?;
 
         // Create protocol msg
+        let batch = self
+            .chain_state
+            .get_batch(batch_hash)
+            .await?
+            .ok_or(anyhow!(
+                "Implementation Bug: Expected proposer to have his batch in his own DB"
+            ))?;
+
         let msg = ProtocolMsg::<Id, Tx, Round>::Propose {
             proposal: proposal.clone(),
             auth: auth.clone(),
+            batch: batch.clone(),
         };
 
         // Broadcast message
-        let handlers = self.consensus_net
+        let handlers = self
+            .consensus_net
             .broadcast(&self.broadcast_peers, msg.clone())
             .await;
 
@@ -152,7 +176,7 @@ where
 
         // Send to loopback
         // self.tx_msg_loopback.send(msg).map_err(anyhow::Error::new)
-        if let Err(e) = self.handle_proposal(proposal, auth).await {
+        if let Err(e) = self.handle_proposal(proposal, auth, batch).await {
             error!("Error handling my own proposal: {}", e);
         }
 
