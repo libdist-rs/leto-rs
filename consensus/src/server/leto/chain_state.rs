@@ -1,11 +1,44 @@
 use super::Leto;
-use crate::types::Block;
+use crate::{
+    types::{Block, Proposal, Signature},
+    Id, Round,
+};
 use anyhow::Result;
 use crypto::hash::Hash;
 use log::*;
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt;
 use storage::rocksdb::Storage;
+
+pub struct ChainElement<Tx> {
+    key: Hash<Block<Tx>>,
+    value: (Proposal<Tx, Round>, Signature<Id, Proposal<Tx, Round>>),
+}
+
+impl<Tx> ChainElement<Tx>
+where
+    Tx: Serialize,
+{
+    pub fn new(
+        prop: Proposal<Tx, Round>,
+        auth: Signature<Id, Proposal<Tx, Round>>,
+    ) -> Self {
+        let key = Hash::ser_and_hash(prop.block());
+        Self {
+            key,
+            value: (prop, auth),
+        }
+    }
+
+    pub async fn write(
+        &self,
+        store: &mut Storage,
+    ) -> Result<()> {
+        let key_vec = self.key.to_vec();
+        let value_vec = bincode::serialize(&self.value)?;
+        Ok(store.write(key_vec, value_vec).await)
+    }
+}
 
 pub struct ChainState<Tx> {
     store: Storage,
@@ -16,10 +49,6 @@ impl<Tx> ChainState<Tx> {
     pub fn highest_block_hash(&self) -> Hash<Block<Tx>> {
         self.highest_block_hash.clone()
     }
-
-    // pub fn store(&mut self) -> &mut Storage {
-    //     &mut self.store
-    // }
 }
 
 impl<Tx> ChainState<Tx>
@@ -33,6 +62,22 @@ where
             highest_block_hash: genesis_hash,
             store,
         }
+    }
+
+    /// Update the highest known chain
+    pub async fn update_highest_chain(
+        &mut self,
+        prop: Proposal<Tx, Round>,
+        auth: Signature<Id, Proposal<Tx, Round>>,
+    ) -> Result<()> {
+        // Write proposal and signature to the disk
+        let chain_element = ChainElement::new(prop, auth);
+        chain_element.write(&mut self.store).await?;
+
+        // Update highest state
+        self.highest_block_hash = chain_element.key;
+
+        Ok(())
     }
 }
 

@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Result};
 use futures_util::{stream::FuturesUnordered, StreamExt};
-use network::plaintcp::CancelHandler;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver};
 use log::*;
+use network::plaintcp::CancelHandler;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 pub struct QuorumWaiter {
     threshold: usize,
@@ -14,42 +14,43 @@ impl QuorumWaiter {
         let (waiter_tx, waiter_rx) = unbounded_channel();
 
         // Start the waiter thread
-        tokio::spawn(async move {
-            Self::wait_remaining(waiter_rx)
-        });
+        tokio::spawn(async move { Self::wait_remaining(waiter_rx).await });
 
-        Self { 
+        Self {
             threshold,
             waiter_tx,
         }
     }
 
-    /// After receiving acks from `threshold` people, 
+    /// After receiving acks from `threshold` people,
     /// we drive the remaining send(s) to completion using this thread
-    async fn wait_remaining(
-        mut rx: UnboundedReceiver<Vec<CancelHandler>>
-    ) -> Result<()> 
-    {
+    async fn wait_remaining(mut rx: UnboundedReceiver<Vec<CancelHandler>>) -> Result<()> {
         let mut wait_stream = FuturesUnordered::new();
-        loop {
+        let _res = loop {
             tokio::select! {
-                handelrs_opt = rx.recv() => {
-                    if let None = handelrs_opt {
+                handlers_opt = rx.recv() => {
+                    if let None = handlers_opt {
+                        warn!("Quitting quorum waiter because we got nothing");
                         break;
                     }
-                    let handlers = handelrs_opt.unwrap();
+                    let handlers = handlers_opt.unwrap();
                     for handler in handlers {
                         wait_stream.push(handler);
                     }
                 },
-                Some(Ok(ack)) = wait_stream.next() => {
+                ack_res = wait_stream.next(), if !wait_stream.is_empty() => {
+                    if let None = ack_res {
+                        error!("Error waiting for ack from a node");
+                        continue;
+                    }
+                    let ack = ack_res.unwrap();
                     debug!(
-                        "Finished sending to another node with ack: {:?}", 
+                        "Finished sending to another node with ack: {:?}",
                         ack
                     );
                 }
             }
-        }
+        };
         Ok(())
     }
 
@@ -59,14 +60,14 @@ impl QuorumWaiter {
         handlers: Vec<CancelHandler>,
     ) -> Result<()> {
         assert!(
-            handlers.len() >= self.threshold, 
+            handlers.len() >= self.threshold,
             "Error: Cannot wait for {} acks with {} handlers",
             self.threshold,
             handlers.len(),
         );
 
         let mut wait_stream = FuturesUnordered::new();
-        
+
         // Add all the handlers to the wait list
         for handler in handlers {
             wait_stream.push(handler);
@@ -77,10 +78,11 @@ impl QuorumWaiter {
         while success < self.threshold && !wait_stream.is_empty() {
             if let Some(Ok(_)) = wait_stream.next().await {
                 success += 1;
-            } 
+            }
         }
 
-        // If we exited because we drove all the futures to completion, and we did not get self.threshold acks
+        // If we exited because we drove all the futures to completion, and we did not
+        // get self.threshold acks
         if wait_stream.is_empty() && success < self.threshold {
             return Err(anyhow!(
                 "Did not return sufficient acks after driving all the senders: Expected: {}, Got {}",
@@ -95,15 +97,19 @@ impl QuorumWaiter {
         }
 
         // Collect all the remaining unfinished receives
-        let remaining: Vec<_> = wait_stream
-            .into_iter()
-            .collect();
-        
+        let remaining: Vec<_> = wait_stream.into_iter().collect();
+
         // Dispatch remaining receives to the waiter thread
-        self.waiter_tx
-            .send(remaining)?;
-        
+        self.waiter_tx.send(remaining)?;
+
         // Notify the caller
         return Ok(());
+    }
+
+    pub fn wait_non_threshold(
+        &mut self,
+        handlers: Vec<CancelHandler>,
+    ) -> Result<()> {
+        self.waiter_tx.send(handlers).map_err(anyhow::Error::new)
     }
 }

@@ -8,6 +8,7 @@ impl network::Message for Id {}
 impl network::Identifier for Id {}
 
 impl Id {
+    /// The earliest ID
     pub const START: Self = Self(0);
 }
 

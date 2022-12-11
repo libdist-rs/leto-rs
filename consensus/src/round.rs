@@ -60,6 +60,14 @@ impl std::ops::Add for Round {
     }
 }
 
+impl std::ops::Mul for Round {
+    type Output = Round;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        Self(self.0 * rhs.0)
+    }
+}
+
 impl std::ops::AddAssign for Round {
     fn add_assign(
         &mut self,
