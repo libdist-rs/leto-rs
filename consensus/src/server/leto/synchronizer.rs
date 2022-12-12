@@ -195,6 +195,12 @@ impl<Tx> Synchronizer<Tx> {
         self.store.write(batch_hash.to_vec(), serialized).await;
         Ok(())
     }
+
+    /// Advance the round of the synchronizer
+    pub fn advance_round(&mut self) {
+        self.relay_waiting
+            .clear();
+    }
 }
 
 impl<Tx> Leto<Tx> {

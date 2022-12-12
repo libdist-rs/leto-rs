@@ -3,7 +3,7 @@ use crate::{
     types::{self, Block, Proposal, ProtocolMsg, Signature},
     Id,
     Round,
-    // server::BatcherConsensusMsg as BCM,
+    server::BatcherConsensusMsg as BCM,
 };
 use anyhow::{anyhow, Context, Result};
 use crypto::hash::Hash;
@@ -55,6 +55,7 @@ where
         if let None = parent {
             warn!("Parent not found for prop: {:?}", proposal);
             // TODO: Handle unknown parent
+            // NOTE: This should never trigger in our experimental settings
             // self
             //    .tx_consensus_to_mem
             //    .send(
@@ -64,7 +65,7 @@ where
             //         )
             //     );
             // TODO: For now, return
-            return Ok(());
+            unreachable!("This case should never occur in our experiments");
         }
 
         debug!("Parent identified for the current proposal");
@@ -99,7 +100,7 @@ where
 
         // Write batch to the DB
         self.chain_state
-            .write_batch(batch)
+            .write_batch(batch.clone())
             .await
             .context("Failed to write batching on handling a correct proposal")?;
 
@@ -114,9 +115,11 @@ where
             .update_highest_chain(proposal, auth)
             .await?;
 
-        // TODO: Let the mempool know that we can clear these transactions
-        // self.tx_consensus_to_batcher
-        //     .send(BCM::OptimisticClear { batch: () });
+        // Let the mempool know that we can clear these transactions
+        self.tx_consensus_to_batcher
+            .send(BCM::OptimisticClear { batch })
+            .map_err(anyhow::Error::new)
+            .context("Error while sending optimistic clear")?;
 
         // Advance the round
         self.advance_round()

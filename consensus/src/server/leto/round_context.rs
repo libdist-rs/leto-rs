@@ -64,10 +64,16 @@ where
 {
     pub fn advance_round(&mut self) -> Result<()> {
         // Update the leaders
-        self.leader_context.advance_round();
+        self.leader_context
+            .advance_round();
+
+        // Clear the waiting_hashes for the relay messages
+        self.synchronizer
+            .advance_round();
 
         // Update the round
-        self.round_context.advance_round();
+        self.round_context
+            .advance_round();
 
         // Let the batcher know that we are in a new round
         let batcher_msg = BCM::NewRound {
