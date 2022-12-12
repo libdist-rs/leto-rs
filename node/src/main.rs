@@ -3,7 +3,7 @@ use clap::Parser;
 use consensus::{
     client::{self, Stressor},
     server,
-    server::{BenchConfig, Server, StorageConfig},
+    server::{BenchConfig, DummyCommitSink, Server, StorageConfig},
     Id, KeyConfig, Round,
 };
 use fnv::FnvHashMap;
@@ -20,6 +20,7 @@ use signal_hook::{
 };
 use std::io::BufReader;
 use std::{fs::File, io::BufRead, path::PathBuf, time::Duration};
+use tokio::sync::mpsc::unbounded_channel;
 const APP_NAME: &'static str = "LETO_NODE";
 const DEFAULT_LOG_LEVEL: Level = Level::Info;
 
@@ -319,9 +320,18 @@ async fn main() -> Result<()> {
             let key_reader = File::open(key_file)?;
             let crypto_system = serde_json::from_reader(key_reader)?;
 
+            // Start the SMR
+            let (tx_commit, rx_commit) = unbounded_channel();
+            DummyCommitSink::spawn(rx_commit);
+
             // Start the Server
-            let exit_tx =
-                Server::<SimpleTx<SimpleData>>::spawn(server_id, all_ids, crypto_system, settings)?;
+            let exit_tx = Server::<SimpleTx<SimpleData>>::spawn(
+                server_id,
+                all_ids,
+                crypto_system,
+                settings,
+                tx_commit,
+            )?;
 
             // Implement a waiting strategy
             let mut signals = Signals::new(&[SIGINT, SIGTERM])?;

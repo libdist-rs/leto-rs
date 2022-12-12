@@ -7,6 +7,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use crypto::Algorithm;
 use fnv::FnvHashMap;
+use tokio::sync::mpsc::unbounded_channel;
 
 fn dummy_ids(num_nodes: usize) -> Vec<Id> {
     let mut ids = Vec::with_capacity(num_nodes);
@@ -60,8 +61,14 @@ async fn test_one() -> Result<()> {
     let settings = Settings::new(DEFAULT_CONFIG_FILE_LOCATION.to_string())?;
     let ids = dummy_ids(settings.consensus_config.num_nodes());
     let crypto_system = KeyConfig::generate(Algorithm::ED25519, 4)?;
-    let exit_tx =
-        Server::<SimpleTx<SimpleData>>::spawn(ids[0], ids, crypto_system[0].clone(), settings)?;
+    let (commit_tx, commit_rx) = unbounded_channel();
+    let exit_tx = Server::<SimpleTx<SimpleData>>::spawn(
+        ids[0],
+        ids,
+        crypto_system[0].clone(),
+        settings,
+        commit_tx,
+    )?;
     tokio::time::sleep(Duration::from_millis(3_000)).await;
     let res = exit_tx.send(());
     res.map_err(|_| anyhow!("Server did not successfully terminate"))

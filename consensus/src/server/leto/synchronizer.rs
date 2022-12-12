@@ -198,8 +198,7 @@ impl<Tx> Synchronizer<Tx> {
 
     /// Advance the round of the synchronizer
     pub fn advance_round(&mut self) {
-        self.relay_waiting
-            .clear();
+        self.relay_waiting.clear();
     }
 }
 

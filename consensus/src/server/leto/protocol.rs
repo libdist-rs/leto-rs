@@ -24,8 +24,8 @@ use tokio::sync::{
 };
 
 use super::{
-    ChainState, Helper, HelperRequest, LeaderContext, QuorumWaiter, RoundContext, Synchronizer,
-    SynchronizerOutMsg,
+    ChainState, CommitContext, Helper, HelperRequest, LeaderContext, QuorumWaiter, RoundContext,
+    Synchronizer, SynchronizerOutMsg,
 };
 
 pub struct Leto<Tx> {
@@ -36,25 +36,44 @@ pub struct Leto<Tx> {
     /// A collection of all peers except `my_id` for use during broadcast
     pub(crate) broadcast_peers: Vec<Id>,
     /// Settings
-    pub(crate) _settings: Settings,
+    pub(crate) settings: Settings,
+    /// Network abstraction
+    pub(crate) consensus_net: TcpReliableSender<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>,
 
     // Channel handlers
+    /// A signal to exit the protocol
     pub(crate) exit_rx: oneshot::Receiver<()>,
+    /// We get messages from the mempool here
+    /// In particular, we get batch hashes when we are the leaders
     pub(crate) rx_mem_to_consensus: UnboundedReceiver<BatchHash<Tx>>,
+    /// We get messages from the network here
     pub(crate) rx_net_to_consensus: UnboundedReceiver<ProtocolMsg<Id, Tx, Round>>,
-    pub(crate) consensus_net: TcpReliableSender<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>,
-    pub(crate) _tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
-    pub(crate) tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Tx>>,
-    pub(crate) tx_msg_loopback: UnboundedSender<ProtocolMsg<Id, Tx, Round>>,
+    /// We get messages from ourselves (loopback) here
     pub(crate) rx_msg_loopback: UnboundedReceiver<ProtocolMsg<Id, Tx, Round>>,
-    pub(crate) cancel_handlers: FnvHashMap<Round, Vec<CancelHandler>>,
+    /// We get messages from the synchronizer here
+    /// The synchronizer tells us when we get responses for unknown batches,
+    /// blocks, etc.
+    pub(crate) rx_synchronizer_to_consensus: UnboundedReceiver<SynchronizerOutMsg<Tx>>,
+
+    /// We send messages to the batcher here
+    /// We tell the batcher to clear a batch when committing or receiving a
+    /// proposal, and notify it when we end a round
+    pub(crate) tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Tx>>,
+    /// A loopback channel to re-schedule suspended messages
+    pub(crate) tx_msg_loopback: UnboundedSender<ProtocolMsg<Id, Tx, Round>>,
+    /// We respond to other server's help requests for unknown hashes here
+    pub(crate) tx_helper: UnboundedSender<HelperRequest<Tx>>,
+
+    /// TODO: Use this (Currently, we do not need it)
+    pub(crate) _tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
 
     /* Helpers */
     /// This object is used to wait for n-f messages to be delivered
     pub(crate) _quorum_waiter: QuorumWaiter,
+    /// Helps get unknown batch hashes, blocks, etc
     pub(crate) synchronizer: Synchronizer<Tx>,
-    pub(crate) rx_synchronizer_to_consensus: UnboundedReceiver<SynchronizerOutMsg<Tx>>,
-    pub(crate) tx_helper: UnboundedSender<HelperRequest<Tx>>,
+    /// Helps us with committing
+    pub(crate) commit_ctx: CommitContext<Tx>,
 
     /* Variable State */
     /// Round State
@@ -87,6 +106,7 @@ where
         rx_mem_to_batcher: UnboundedReceiver<(Tx, usize)>,
         tx_processor: UnboundedSender<Batch<Tx>>,
         tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
+        tx_commit: UnboundedSender<Batch<Tx>>,
     ) -> Result<()> {
         let me = settings
             .consensus_config
@@ -133,6 +153,9 @@ where
             tx_processor,
         )?;
 
+        // Start the commit context
+        let commit_ctx = CommitContext::spawn(store.clone(), tx_commit);
+
         let all_peers_except_me = all_peers.into_iter().filter(|x| x != &my_id).collect();
 
         let (tx_msg_loopback, rx_msg_loopback) = unbounded_channel();
@@ -147,7 +170,7 @@ where
                 consensus_net,
                 _tx_consensus_to_mem: tx_consensus_to_mem,
                 tx_consensus_to_batcher,
-                round_context: RoundContext::new(Round::START),
+                round_context: RoundContext::new(settings.consensus_config.num_nodes()),
                 leader_context: LeaderContext::new(
                     settings.consensus_config.get_all_ids(),
                     settings.consensus_config.num_faults,
@@ -163,11 +186,11 @@ where
                         - 1,
                 ),
                 chain_state: ChainState::new(store),
-                _settings: settings,
-                cancel_handlers: FnvHashMap::default(),
+                settings,
                 rx_synchronizer_to_consensus: rx_from_sync,
                 synchronizer,
                 tx_helper,
+                commit_ctx,
             }
             .run()
             .await;

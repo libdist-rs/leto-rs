@@ -3,7 +3,7 @@ use crate::{
     types::{Block, Proposal, Signature},
     Id, Round,
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use crypto::hash::Hash;
 use log::*;
 use mempool::{Batch, BatchHash};

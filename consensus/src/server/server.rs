@@ -2,11 +2,14 @@ use super::{Leto, Settings};
 use crate::{to_socket_address, Id, KeyConfig};
 use anyhow::{anyhow, Result};
 use fnv::FnvHashMap;
-use mempool::MempoolMsg;
+use mempool::{Batch, MempoolMsg};
 use network::{plaintcp::TcpSimpleSender, Acknowledgement};
 use std::{marker::PhantomData, net::SocketAddr, path::PathBuf};
 use storage::rocksdb::Storage;
-use tokio::sync::{mpsc::unbounded_channel, oneshot};
+use tokio::sync::{
+    mpsc::{unbounded_channel, UnboundedSender},
+    oneshot,
+};
 
 /// This is the server that runs the protocol
 pub struct Server<Transaction> {
@@ -53,15 +56,16 @@ pub fn get_consensus_peers(
     Ok(map)
 }
 
-impl<Transaction> Server<Transaction>
+impl<Tx> Server<Tx>
 where
-    Transaction: crate::types::Transaction,
+    Tx: crate::types::Transaction,
 {
     pub fn spawn(
         my_id: Id,
         all_ids: Vec<Id>,
         crypto_system: KeyConfig,
         settings: Settings,
+        tx_commit: UnboundedSender<Batch<Tx>>,
     ) -> anyhow::Result<oneshot::Sender<()>> {
         // Create the DB
         let path = {
@@ -84,9 +88,7 @@ where
             .ok_or(anyhow!("My Id is not present in the config"))?;
         let mempool_peers = get_mempool_peers(my_id, &settings)?;
         let mempool_net =
-            TcpSimpleSender::<Id, MempoolMsg<Id, Transaction>, Acknowledgement>::with_peers(
-                mempool_peers,
-            );
+            TcpSimpleSender::<Id, MempoolMsg<Id, Tx>, Acknowledgement>::with_peers(mempool_peers);
         let mempool_addr = to_socket_address("0.0.0.0", me.mempool_port)?;
         let client_addr = to_socket_address("0.0.0.0", me.client_port)?;
 
@@ -119,7 +121,7 @@ where
 
         // Start the Leto consensus protocol
         let (exit_tx, exit_rx) = oneshot::channel();
-        Leto::<Transaction>::spawn(
+        Leto::<Tx>::spawn(
             my_id,
             crypto_system,
             all_ids,
@@ -130,6 +132,7 @@ where
             rx_mem_to_batcher,
             tx_processor,
             tx_consensus_to_mem,
+            tx_commit,
         )?;
         Ok(exit_tx)
     }

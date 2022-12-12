@@ -8,6 +8,7 @@ use anyhow::Result;
 use fnv::FnvHashMap;
 use log::*;
 use mempool::{Batch, BatchHash, Transaction};
+use network::plaintcp::CancelHandler;
 
 type PropMsg<Id, Tx, Round> = (
     Proposal<Tx, Round>,
@@ -33,6 +34,13 @@ pub struct RoundContext<Tx> {
     /// Track the relay messages that are ready to be handled in the current
     /// round
     relay_ready: FnvHashMap<Round, Vec<RelayMsg<Id, Tx, Round>>>,
+
+    /// A collection of cancel handlers for messages which are undergoing
+    /// transmission
+    pub(crate) cancel_handlers: FnvHashMap<Round, Vec<CancelHandler>>,
+
+    // Cache
+    num_nodes: usize,
 }
 
 /// Determine whether or not to retain the cancel handler for some message that
@@ -62,18 +70,18 @@ impl<Tx> Leto<Tx>
 where
     Tx: Transaction,
 {
-    pub fn advance_round(&mut self) -> Result<()> {
+    pub async fn advance_round(&mut self) -> Result<()> {
         // Update the leaders
-        self.leader_context
-            .advance_round();
+        self.leader_context.advance_round();
 
         // Clear the waiting_hashes for the relay messages
-        self.synchronizer
-            .advance_round();
+        self.synchronizer.advance_round();
 
         // Update the round
-        self.round_context
-            .advance_round();
+        self.round_context.advance_round();
+
+        // Try committing
+        self.try_commit().await?;
 
         // Let the batcher know that we are in a new round
         let batcher_msg = BCM::NewRound {
@@ -106,15 +114,6 @@ where
             }
         }
 
-        // GC too old cancel handlers
-        self.cancel_handlers.retain(|round, _| {
-            gc_cancel_handlers(
-                *round,
-                self.round_context.round(),
-                self._settings.consensus_config.num_nodes(),
-            )
-        });
-
         debug!("Advancing to round {}", self.round_context.round());
         debug!("Using new leader: {}", self.leader_context.leader());
         Ok(())
@@ -133,11 +132,13 @@ where
      * elligible.add(oldest.pop_back())
      */
 
-    pub fn new(current_round: Round) -> Self {
+    pub fn new(num_nodes: usize) -> Self {
         Self {
-            current_round,
+            current_round: Round::START,
             proposals_ready: FnvHashMap::default(),
             relay_ready: FnvHashMap::default(),
+            cancel_handlers: FnvHashMap::default(),
+            num_nodes,
         }
     }
 
@@ -147,6 +148,10 @@ where
 
     pub fn advance_round(&mut self) {
         self.current_round += 1.into();
+
+        // GC too old cancel handlers
+        self.cancel_handlers
+            .retain(|round, _| gc_cancel_handlers(*round, self.current_round, self.num_nodes));
     }
 
     /// All propose messages for the current round

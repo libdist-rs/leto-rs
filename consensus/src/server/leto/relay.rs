@@ -39,7 +39,8 @@ where
 
         // If I am not the next leader, send real message
         let handler = self.consensus_net.send(next_leader, relay_msg).await;
-        self.cancel_handlers
+        self.round_context
+            .cancel_handlers
             .entry(self.round_context.round())
             .or_insert_with(Vec::new)
             .push(handler);
@@ -94,7 +95,8 @@ where
                 request: Request::new(batch_hash.clone()),
             };
             let handler = self.consensus_net.send(source, pmsg).await;
-            self.cancel_handlers
+            self.round_context
+                .cancel_handlers
                 .entry(self.round_context.round())
                 .or_insert_with(Vec::new)
                 .push(handler);

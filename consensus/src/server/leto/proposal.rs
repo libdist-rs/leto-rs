@@ -1,9 +1,8 @@
 use super::Leto;
 use crate::{
-    types::{self, Block, Proposal, ProtocolMsg, Signature},
-    Id,
-    Round,
     server::BatcherConsensusMsg as BCM,
+    types::{self, Block, Proposal, ProtocolMsg, Signature},
+    Id, Round,
 };
 use anyhow::{anyhow, Context, Result};
 use crypto::hash::Hash;
@@ -122,7 +121,7 @@ where
             .context("Error while sending optimistic clear")?;
 
         // Advance the round
-        self.advance_round()
+        self.advance_round().await
     }
 
     /// A function that will propose the new batch to all the servers
@@ -171,14 +170,13 @@ where
             .consensus_net
             .broadcast(&self.broadcast_peers, msg.clone())
             .await;
-
-        self.cancel_handlers
+        self.round_context
+            .cancel_handlers
             .entry(self.round_context.round())
             .or_insert_with(Vec::new)
             .extend(handlers);
 
-        // Send to loopback
-        // self.tx_msg_loopback.send(msg).map_err(anyhow::Error::new)
+        // Loopback
         if let Err(e) = self.handle_proposal(proposal, auth, batch).await {
             error!("Error handling my own proposal: {}", e);
         }
