@@ -175,6 +175,7 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
     let consensus_config = server::Config {
         parties: server_parties,
         num_faults,
+        delay_in_ms: config.delay_in_ms,
     };
 
     // Create Storage config

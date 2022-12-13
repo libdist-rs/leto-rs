@@ -148,8 +148,8 @@ impl<Tx> Synchronizer<Tx> {
     /// The protocol asks the synchronizer for help with an unknown batch
     pub async fn on_unknown_batch(
         &mut self,
-        proposal: Proposal<Tx, Round>,
-        auth: Signature<Id, Proposal<Tx, Round>>,
+        proposal: Proposal<Id, Tx, Round>,
+        auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch_hash: BatchHash<Tx>,
         source: Id, // Whoever sent this unknown hash
     ) -> Result<()>

@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use fnv::FnvHashMap;
 use mempool::{Batch, MempoolMsg};
 use network::{plaintcp::TcpSimpleSender, Acknowledgement};
-use std::{marker::PhantomData, net::SocketAddr, path::PathBuf};
+use std::{marker::PhantomData, net::SocketAddr, path::PathBuf, sync::Arc};
 use storage::rocksdb::Storage;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
@@ -65,7 +65,7 @@ where
         all_ids: Vec<Id>,
         crypto_system: KeyConfig,
         settings: Settings,
-        tx_commit: UnboundedSender<Batch<Tx>>,
+        tx_commit: UnboundedSender<Arc<Batch<Tx>>>,
     ) -> anyhow::Result<oneshot::Sender<()>> {
         // Create the DB
         let path = {

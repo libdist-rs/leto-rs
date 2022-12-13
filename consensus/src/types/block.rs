@@ -2,16 +2,18 @@ use crypto::hash::Hash;
 use mempool::BatchHash;
 use serde::{Deserialize, Serialize};
 
+use super::Element;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Block<Tx> {
+pub struct Block<Id, Tx, Round> {
     batch_hash: BatchHash<Tx>,
-    prev_hash: Hash<Block<Tx>>,
+    prev_hash: Hash<Element<Id, Tx, Round>>,
 }
 
-impl<Tx> Block<Tx> {
+impl<Id, Tx, Round> Block<Id, Tx, Round> {
     pub const fn new(
         batch_hash: BatchHash<Tx>,
-        prev_hash: Hash<Self>,
+        prev_hash: Hash<Element<Id, Tx, Round>>,
     ) -> Self {
         Self {
             batch_hash,
@@ -19,7 +21,7 @@ impl<Tx> Block<Tx> {
         }
     }
 
-    pub(crate) fn parent_hash(&self) -> Hash<Block<Tx>> {
+    pub(crate) fn parent_hash(&self) -> Hash<Element<Id, Tx, Round>> {
         self.prev_hash.clone()
     }
 }

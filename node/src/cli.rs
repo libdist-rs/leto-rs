@@ -85,6 +85,11 @@ pub struct CreateConfig {
     #[arg(short = 'f', long)]
     pub num_faults: Option<usize>,
 
+    /// The delay parameter (Delta)
+    #[arg(short = 'w', long = "delta")]
+    #[clap(default_value_t = 500)]
+    pub delay_in_ms: u64,
+
     /// The Garbage collection depth
     #[arg(short, long)]
     #[clap(default_value_t = 5)]

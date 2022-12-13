@@ -1,5 +1,6 @@
 mod block;
 mod cert;
+mod element;
 mod msg;
 mod proposal;
 mod request;
@@ -8,6 +9,7 @@ mod tx;
 
 pub use block::*;
 pub use cert::*;
+pub use element::*;
 pub use msg::*;
 pub use proposal::*;
 pub use request::*;

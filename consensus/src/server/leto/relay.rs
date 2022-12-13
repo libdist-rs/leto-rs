@@ -13,8 +13,8 @@ where
 {
     pub async fn relay_proposal(
         &mut self,
-        proposal: Proposal<Tx, Round>,
-        auth: Signature<Id, Proposal<Tx, Round>>,
+        proposal: Proposal<Id, Tx, Round>,
+        auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch_hash: BatchHash<Tx>,
     ) -> Result<()> {
         debug!("Relaying the proposal");
@@ -50,8 +50,8 @@ where
 
     pub async fn handle_relay(
         &mut self,
-        proposal: Proposal<Tx, Round>,
-        auth: Signature<Id, Proposal<Tx, Round>>,
+        proposal: Proposal<Id, Tx, Round>,
+        auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch_hash: BatchHash<Tx>,
         source: Id,
     ) -> Result<()> {

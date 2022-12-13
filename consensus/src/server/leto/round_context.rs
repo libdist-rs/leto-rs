@@ -1,24 +1,27 @@
+use std::time::Duration;
+
 use super::Leto;
 use crate::{
     server::BatcherConsensusMsg as BCM,
-    types::{Proposal, ProtocolMsg, Signature},
+    types::{Proposal, ProtocolMsg, Signature, Transaction},
     Id, Round,
 };
 use anyhow::Result;
 use fnv::FnvHashMap;
 use log::*;
-use mempool::{Batch, BatchHash, Transaction};
+use mempool::{Batch, BatchHash};
 use network::plaintcp::CancelHandler;
+use tokio::time::{interval, Interval};
 
 type PropMsg<Id, Tx, Round> = (
-    Proposal<Tx, Round>,
-    Signature<Id, Proposal<Tx, Round>>,
+    Proposal<Id, Tx, Round>,
+    Signature<Id, Proposal<Id, Tx, Round>>,
     Batch<Tx>,
 );
 
 pub type RelayMsg<Id, Tx, Round> = (
-    Proposal<Tx, Round>,
-    Signature<Id, Proposal<Tx, Round>>,
+    Proposal<Id, Tx, Round>,
+    Signature<Id, Proposal<Id, Tx, Round>>,
     BatchHash<Tx>,
     Id,
 );
@@ -38,6 +41,9 @@ pub struct RoundContext<Tx> {
     /// A collection of cancel handlers for messages which are undergoing
     /// transmission
     pub(crate) cancel_handlers: FnvHashMap<Round, Vec<CancelHandler>>,
+
+    /// The timeout for the current round
+    pub(crate) timer: Interval,
 
     // Cache
     num_nodes: usize,
@@ -132,13 +138,17 @@ where
      * elligible.add(oldest.pop_back())
      */
 
-    pub fn new(num_nodes: usize) -> Self {
+    pub fn new(
+        num_nodes: usize,
+        delay: Duration,
+    ) -> Self {
         Self {
             current_round: Round::START,
             proposals_ready: FnvHashMap::default(),
             relay_ready: FnvHashMap::default(),
             cancel_handlers: FnvHashMap::default(),
             num_nodes,
+            timer: interval(4 * delay),
         }
     }
 
@@ -152,6 +162,9 @@ where
         // GC too old cancel handlers
         self.cancel_handlers
             .retain(|round, _| gc_cancel_handlers(*round, self.current_round, self.num_nodes));
+
+        // Reset timers
+        self.timer.reset()
     }
 
     /// All propose messages for the current round
@@ -166,8 +179,8 @@ where
 
     pub fn queue_proposal(
         &mut self,
-        prop: Proposal<Tx, Round>,
-        auth: Signature<Id, Proposal<Tx, Round>>,
+        prop: Proposal<Id, Tx, Round>,
+        auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch: Batch<Tx>,
     ) -> () {
         self.proposals_ready
@@ -178,8 +191,8 @@ where
 
     pub fn queue_relay(
         &mut self,
-        prop: Proposal<Tx, Round>,
-        auth: Signature<Id, Proposal<Tx, Round>>,
+        prop: Proposal<Id, Tx, Round>,
+        auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch_hash: BatchHash<Tx>,
         sender: Id,
     ) -> () {

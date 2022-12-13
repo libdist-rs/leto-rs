@@ -1,40 +1,47 @@
-use super::Block;
+use super::{Block, Certificate};
 use network::Message;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Proposal<Tx, Round> {
-    block: Block<Tx>,
-    round: Round,
+pub struct Proposal<Id, Tx, Round> {
+    pub(super) block: Block<Id, Tx, Round>,
+    pub(super) qc: Option<Vec<Certificate<Id, Round>>>,
+    pub(super) round: Round,
 }
 
-impl<Tx, Round> Proposal<Tx, Round> {}
+impl<Id, Tx, Round> Proposal<Id, Tx, Round> {}
 
-impl<Tx, Round> Proposal<Tx, Round>
+impl<Id, Tx, Round> Proposal<Id, Tx, Round>
 where
     Round: Clone,
 {
     pub fn round(&self) -> Round {
         self.round.clone()
     }
+
+    pub fn qc(&self) -> &Option<Vec<Certificate<Id, Round>>> {
+        &self.qc
+    }
 }
 
-impl<Tx, Round> Proposal<Tx, Round> {
+impl<Id, Tx, Round> Proposal<Id, Tx, Round> {
     pub fn new(
-        block: Block<Tx>,
+        block: Block<Id, Tx, Round>,
         round: Round,
+        qc: Option<Vec<Certificate<Id, Round>>>,
     ) -> Self {
-        Self { block, round }
+        Self { block, round, qc }
     }
 
-    pub fn block(&self) -> &Block<Tx> {
+    pub fn block(&self) -> &Block<Id, Tx, Round> {
         &self.block
     }
 }
 
-impl<Tx, Round> Message for Proposal<Tx, Round>
+impl<Id, Tx, Round> Message for Proposal<Id, Tx, Round>
 where
     Tx: super::Transaction,
     Round: Message,
+    Id: network::Identifier,
 {
 }

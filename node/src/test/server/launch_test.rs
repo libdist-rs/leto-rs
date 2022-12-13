@@ -48,6 +48,7 @@ fn _dummy_settings(
         consensus_config: crate::server::Config {
             parties,
             num_faults,
+            delay_in_ms: 1_000,
         },
         storage: storage_config,
         bench_config: BenchConfig::default(),

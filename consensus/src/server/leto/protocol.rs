@@ -1,18 +1,17 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use crate::server::{
     get_consensus_peers, BatcherConsensusMsg, Handler, Parameters, RRBatcher, Settings,
 };
-use crate::types::Block;
 use crate::{
     to_socket_address,
     types::{self, ProtocolMsg},
     Id, KeyConfig, Round,
 };
 use anyhow::{anyhow, Result};
-use crypto::hash::Hash;
-use fnv::FnvHashMap;
 use log::*;
 use mempool::{Batch, BatchHash, ConsensusMempoolMsg};
-use network::plaintcp::CancelHandler;
 use network::{
     plaintcp::{TcpReceiver, TcpReliableSender},
     Acknowledgement,
@@ -87,8 +86,6 @@ pub struct Leto<Tx> {
 impl<Tx> Leto<Tx> {
     pub const INITIAL_LEADER: Id = Id::START;
     pub const INITIAL_ROUND: Round = Round::START;
-    pub const GENESIS_BLOCK: Block<Tx> =
-        Block::<Tx>::new(BatchHash::<Tx>::EMPTY_HASH, Hash::<Block<Tx>>::EMPTY_HASH);
 }
 
 impl<Tx> Leto<Tx>
@@ -106,7 +103,7 @@ where
         rx_mem_to_batcher: UnboundedReceiver<(Tx, usize)>,
         tx_processor: UnboundedSender<Batch<Tx>>,
         tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
-        tx_commit: UnboundedSender<Batch<Tx>>,
+        tx_commit: UnboundedSender<Arc<Batch<Tx>>>,
     ) -> Result<()> {
         let me = settings
             .consensus_config
@@ -154,7 +151,12 @@ where
         )?;
 
         // Start the commit context
-        let commit_ctx = CommitContext::spawn(store.clone(), tx_commit);
+        let commit_ctx = CommitContext::spawn(
+            store.clone(),
+            tx_commit,
+            settings.consensus_config.num_nodes(),
+            settings.consensus_config.num_faults,
+        );
 
         let all_peers_except_me = all_peers.into_iter().filter(|x| x != &my_id).collect();
 
@@ -170,7 +172,10 @@ where
                 consensus_net,
                 _tx_consensus_to_mem: tx_consensus_to_mem,
                 tx_consensus_to_batcher,
-                round_context: RoundContext::new(settings.consensus_config.num_nodes()),
+                round_context: RoundContext::new(
+                    settings.consensus_config.num_nodes(),
+                    Duration::from_millis(settings.consensus_config.delay_in_ms),
+                ),
                 leader_context: LeaderContext::new(
                     settings.consensus_config.get_all_ids(),
                     settings.consensus_config.num_faults,
@@ -210,6 +215,7 @@ where
         // Start the protocol loop
         loop {
             tokio::select! {
+                // Receive exit handlers
                 exit_val = &mut self.exit_rx => {
                     let _ = exit_val.map_err(anyhow::Error::new)?;
                     info!("Termination signal received by the server. Exiting.");
@@ -246,6 +252,7 @@ where
                         error!("Error handling consensus message: {}", e);
                     }
                 }
+                // Receive synchronized messages from others
                 sync_help = self.rx_synchronizer_to_consensus.recv() => {
                     let sync_msg = sync_help.ok_or(
                         anyhow!("Synchronizer channel closed")

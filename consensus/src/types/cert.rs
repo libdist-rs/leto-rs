@@ -5,7 +5,7 @@ use crypto::PublicKey;
 use fnv::{FnvHashMap, FnvHashSet};
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Certificate<Id, T> {
     raw_sigs: Vec<Signature<Id, T>>,
 }
@@ -40,6 +40,7 @@ impl<Id, T> Certificate<Id, T>
 where
     Id: Eq + std::hash::Hash,
 {
+    /// Returns the number of unique signatures on the message
     pub fn unique_len(&self) -> usize {
         let mut set = FnvHashSet::default();
         for sig in &self.raw_sigs {

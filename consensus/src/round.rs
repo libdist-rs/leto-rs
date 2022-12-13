@@ -5,7 +5,7 @@ use std::fmt::{self, Debug, Display};
 pub struct Round(usize);
 
 impl Round {
-    pub const START: Self = Self(0);
+    pub const START: Self = Self(1);
 }
 
 impl Default for Round {

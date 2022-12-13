@@ -8,9 +8,9 @@ use std::marker::PhantomData;
 #[derive(Serialize, Deserialize)]
 /// A Signature contains (source, raw signature bytes)
 pub struct Signature<Id, T> {
-    raw: Vec<u8>,
-    pub(crate) id: Id,
-    _x: PhantomData<T>,
+    pub(super) raw: Vec<u8>,
+    pub(super) id: Id,
+    pub(super) _x: PhantomData<T>,
 }
 
 impl<Id, T> Clone for Signature<Id, T>
@@ -38,6 +38,13 @@ impl<Id, T> Signature<Id, T> {
             id,
             _x: PhantomData,
         })
+    }
+
+    pub fn get_id(&self) -> Id
+    where
+        Id: Clone,
+    {
+        self.id.clone()
     }
 }
 

@@ -15,7 +15,11 @@ impl<Tx> Leto<Tx> {
     where
         Tx: types::Transaction,
     {
-        debug!("Got a blame for round {} from {}", blame_round, auth.id);
+        debug!(
+            "Got a blame for round {} from {}",
+            blame_round,
+            auth.get_id()
+        );
         todo!();
     }
 }

@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ProtocolMsg<Id, Tx, Round> {
     Propose {
-        proposal: Proposal<Tx, Round>,
-        auth: Signature<Id, Proposal<Tx, Round>>,
+        proposal: Proposal<Id, Tx, Round>,
+        auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch: Batch<Tx>,
     },
     Relay {
-        proposal: Proposal<Tx, Round>,
-        auth: Signature<Id, Proposal<Tx, Round>>,
+        proposal: Proposal<Id, Tx, Round>,
+        auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch_hash: BatchHash<Tx>,
         sender: Id,
     },

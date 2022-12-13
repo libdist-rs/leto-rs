@@ -16,8 +16,8 @@ where
     /// A function to handle incoming proposals
     pub async fn handle_proposal(
         &mut self,
-        proposal: Proposal<Tx, Round>,
-        auth: Signature<Id, Proposal<Tx, Round>>,
+        proposal: Proposal<Id, Tx, Round>,
+        auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch: Batch<Tx>,
     ) -> Result<()>
     where
@@ -50,7 +50,7 @@ where
         // Check if the parent is known
         let parent_hash = proposal.block().parent_hash();
         trace!("Querying parent hash: {:?}", parent_hash);
-        let parent = self.chain_state.parent(parent_hash).await?;
+        let parent = self.chain_state.get_element(parent_hash).await?;
         if let None = parent {
             warn!("Parent not found for prop: {:?}", proposal);
             // TODO: Handle unknown parent
@@ -65,6 +65,55 @@ where
             //     );
             // TODO: For now, return
             unreachable!("This case should never occur in our experiments");
+        }
+        let parent = parent.unwrap();
+        let is_proposal_valid = {
+            let mut start = parent.proposal.round() + 1.into();
+            let mut idx = 0usize;
+            let mut status = true;
+            let qc_len = (self.settings.consensus_config.num_nodes()
+                + self.settings.consensus_config.num_faults
+                + 1)
+                / 2;
+            while proposal.round() != start && status {
+                // Check QC for round#: start
+                if proposal.qc().is_none() {
+                    status = false;
+                    break;
+                }
+                let round_hash = Hash::ser_and_hash(&start);
+                let res = proposal
+                    .qc()
+                    .as_ref()
+                    .and_then(|qc_vec| {
+                        if qc_vec[idx].unique_len() != qc_len {
+                            return Some(false);
+                        }
+                        if !qc_vec[idx]
+                            .verify(&round_hash, &self.crypto_system.system)
+                            .is_ok()
+                        {
+                            return Some(false);
+                        }
+                        Some(true)
+                    })
+                    .expect("Invariant must hold; must be unwrappable");
+                if res == false {
+                    status = false;
+                    break;
+                }
+                if idx > self.settings.consensus_config.num_faults {
+                    status = false;
+                    break;
+                }
+                start += 1.into();
+                idx += 1;
+            }
+            status
+        };
+        if !is_proposal_valid {
+            warn!("Got an invalid chain after qc check");
+            error!("Unimplemented QC check");
         }
 
         debug!("Parent identified for the current proposal");
@@ -90,18 +139,12 @@ where
 
     pub async fn on_correct_proposal(
         &mut self,
-        proposal: Proposal<Tx, Round>,
-        auth: Signature<Id, Proposal<Tx, Round>>,
+        proposal: Proposal<Id, Tx, Round>,
+        auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch: Batch<Tx>,
     ) -> Result<()> {
         // Get batch hash
         let batch_hash = Hash::ser_and_hash(&batch);
-
-        // Write batch to the DB
-        self.chain_state
-            .write_batch(batch.clone())
-            .await
-            .context("Failed to write batching on handling a correct proposal")?;
 
         // Send the proposal to the next leader and wait for an ack from them
         self.relay_proposal(proposal.clone(), auth.clone(), batch_hash)
@@ -111,7 +154,7 @@ where
 
         // Update the chain state (Will write this proposal to the disk)
         self.chain_state
-            .update_highest_chain(proposal, auth)
+            .update_highest_chain(proposal, auth, batch.clone())
             .await?;
 
         // Let the mempool know that we can clear these transactions
@@ -141,10 +184,10 @@ where
         );
 
         // Create proposal
-        let prev_hash = self.chain_state.highest_block_hash();
+        let prev_hash = self.chain_state.highest_hash();
         let block = Block::new(batch_hash.clone(), prev_hash);
         let round = self.round_context.round();
-        let proposal = Proposal::new(block, round);
+        let proposal = Proposal::new(block, round, None);
 
         // Create sig
         let prop_hash = Hash::ser_and_hash(&proposal);
