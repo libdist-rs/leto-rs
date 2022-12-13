@@ -106,7 +106,7 @@ where
         tx_commit: UnboundedSender<Arc<Batch<Tx>>>,
     ) -> Result<()> {
         let me = settings
-            .consensus_config
+            .committee_config
             .get(&my_id)
             .ok_or(anyhow!("My Id is not present in the config"))?;
         let consensus_addr = to_socket_address("0.0.0.0", me.consensus_port)?;
@@ -154,8 +154,8 @@ where
         let commit_ctx = CommitContext::spawn(
             store.clone(),
             tx_commit,
-            settings.consensus_config.num_nodes(),
-            settings.consensus_config.num_faults,
+            settings.committee_config.num_nodes(),
+            settings.committee_config.num_faults(),
         );
 
         let all_peers_except_me = all_peers.into_iter().filter(|x| x != &my_id).collect();
@@ -173,12 +173,12 @@ where
                 _tx_consensus_to_mem: tx_consensus_to_mem,
                 tx_consensus_to_batcher,
                 round_context: RoundContext::new(
-                    settings.consensus_config.num_nodes(),
-                    Duration::from_millis(settings.consensus_config.delay_in_ms),
+                    settings.committee_config.num_nodes(),
+                    Duration::from_millis(settings.bench_config.delay_in_ms),
                 ),
                 leader_context: LeaderContext::new(
-                    settings.consensus_config.get_all_ids(),
-                    settings.consensus_config.num_faults,
+                    settings.committee_config.get_all_ids(),
+                    settings.committee_config.num_faults(),
                 ),
                 tx_msg_loopback,
                 rx_msg_loopback,
@@ -186,8 +186,8 @@ where
                 // Here, -1 is because we always deliver messages to ourselves using the loopback
                 // channel
                 _quorum_waiter: QuorumWaiter::new(
-                    settings.consensus_config.num_nodes()
-                        - settings.consensus_config.num_faults
+                    settings.committee_config.num_nodes()
+                        - settings.committee_config.num_faults()
                         - 1,
                 ),
                 chain_state: ChainState::new(store),
@@ -211,6 +211,9 @@ where
 
         // Setup genesis context
         self.chain_state.genesis_setup().await?;
+
+        // Reset the timer
+        self.round_context.timer.reset();
 
         // Start the protocol loop
         loop {
@@ -252,6 +255,13 @@ where
                         error!("Error handling consensus message: {}", e);
                     }
                 }
+                // On timeout for a round
+                _ = self.round_context.timer.tick(), if self.round_context.timer_enabled => {
+                    warn!("Round {} timing out", self.round_context.round());
+                    if let Err(e) = self.on_round_timeout().await {
+                        error!("Error handling round timeout: {}", e);
+                    }
+                }
                 // Receive synchronized messages from others
                 sync_help = self.rx_synchronizer_to_consensus.recv() => {
                     let sync_msg = sync_help.ok_or(
@@ -285,7 +295,14 @@ where
                 batch_hash,
                 sender,
             } => self.handle_relay(proposal, auth, batch_hash, sender).await,
-            ProtocolMsg::Blame { round, auth } => self.handle_blame(round, auth),
+            ProtocolMsg::Blame { 
+                round, 
+                auth 
+            } => self.handle_blame(round, auth).await,
+            ProtocolMsg::BlameQC { 
+                round, 
+                qc 
+            } => self.on_blame_qc(round, qc).await,
             // Use the helper
             ProtocolMsg::BatchRequest { source, request } => {
                 self.on_batch_request(source, request).await

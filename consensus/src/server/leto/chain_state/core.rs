@@ -1,9 +1,10 @@
 use crate::{
-    types::{Element, Proposal, Signature, Transaction},
+    types::{Element, Proposal, Signature, Transaction, Certificate},
     Id, Round,
 };
 use anyhow::{Context, Result};
 use crypto::hash::Hash;
+use fnv::FnvHashMap;
 use mempool::{Batch, BatchHash};
 use serde::{de::DeserializeOwned, Serialize};
 use std::{fmt, sync::Arc};
@@ -13,6 +14,7 @@ pub struct ChainState<Tx> {
     pub(super) store: Storage,
     pub(super) highest_chain_hash: Hash<Element<Id, Tx, Round>>,
     pub(super) highest_chain_element: Arc<Element<Id, Tx, Round>>,
+    pub(super) qc_map: FnvHashMap<Round, Certificate<Id, Round>>,
 }
 
 impl<Tx> ChainState<Tx>
@@ -45,6 +47,7 @@ where
             highest_chain_hash: genesis_hash,
             highest_chain_element: Arc::new(genesis_element),
             store,
+            qc_map: FnvHashMap::default(),
         }
     }
 
@@ -67,6 +70,31 @@ where
         self.highest_chain_element = chain_element;
 
         Ok(())
+    }
+
+    pub fn add_qc(
+        &mut self,
+        blame_round: Round,
+        qc: Certificate<Id, Round>,
+    ) 
+    where
+        Tx: Transaction,
+    {
+        self.qc_map
+            .insert(
+                blame_round,
+                qc
+            );
+    }
+
+    pub fn get_qc(
+        &mut self,
+        round: &Round,
+    ) -> Option<Certificate<Id, Round>>
+    {
+        self.qc_map
+            .get(round)
+            .cloned()
     }
 
     pub async fn write_element(

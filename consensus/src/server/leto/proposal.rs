@@ -14,6 +14,8 @@ where
     Tx: types::Transaction,
 {
     /// A function to handle incoming proposals
+    /// TODO: Handle proposals received right after the blame QC
+    /// TODO: Handle proposing by extending QCs
     pub async fn handle_proposal(
         &mut self,
         proposal: Proposal<Id, Tx, Round>,
@@ -71,8 +73,8 @@ where
             let mut start = parent.proposal.round() + 1.into();
             let mut idx = 0usize;
             let mut status = true;
-            let qc_len = (self.settings.consensus_config.num_nodes()
-                + self.settings.consensus_config.num_faults
+            let qc_len = (self.settings.committee_config.num_nodes()
+                + self.settings.committee_config.num_faults()
                 + 1)
                 / 2;
             while proposal.round() != start && status {
@@ -102,7 +104,7 @@ where
                     status = false;
                     break;
                 }
-                if idx > self.settings.consensus_config.num_faults {
+                if idx > self.settings.committee_config.num_faults() {
                     status = false;
                     break;
                 }
@@ -186,8 +188,30 @@ where
         // Create proposal
         let prev_hash = self.chain_state.highest_hash();
         let block = Block::new(batch_hash.clone(), prev_hash);
+        let qc = {
+            let end = self.chain_state
+                .highest_chain()
+                .proposal
+                .round();
+            let mut start = self.round_context
+                .round() - 1.into();
+            let mut qc_vec = Vec::new();
+            while start > end {
+                qc_vec.push(
+                    self.chain_state
+                        .get_qc(&start)
+                        .expect("Expected qc for this round")
+                );
+                start = start - 1.into();
+            }
+            if qc_vec.len() == 0 {
+                None
+            } else {
+                Some(qc_vec)
+            }
+        };
         let round = self.round_context.round();
-        let proposal = Proposal::new(block, round, None);
+        let proposal = Proposal::new(block, round, qc);
 
         // Create sig
         let prop_hash = Hash::ser_and_hash(&proposal);

@@ -172,10 +172,8 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
             num_faults
         ));
     }
-    let consensus_config = server::Config {
+    let committee_config = server::Config {
         parties: server_parties,
-        num_faults,
-        delay_in_ms: config.delay_in_ms,
     };
 
     // Create Storage config
@@ -188,12 +186,14 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
     let bench_config = BenchConfig {
         batch_size: config.sealer_size,
         batch_timeout: Duration::from_millis(config.timeout_ms),
+        num_faults: config.num_faults.unwrap_or((config.num_servers-1)/3),
+        delay_in_ms: config.delay_in_ms,
     };
 
     // Create server settings from this information
     let server_settings = server::Settings {
         mempool_config,
-        consensus_config,
+        committee_config,
         storage: storage_config,
         bench_config,
     };
@@ -308,14 +308,14 @@ async fn main() -> Result<()> {
             // Get the config file, or use a default config file
             let config_file = config
                 .to_str()
-                .ok_or(anyhow!(format!("Unknown file: {}", config.display())))?
+                .ok_or(anyhow!("Unknown file: {}", config.display()))?
                 .to_string();
             info!("Using config file: {}", config_file);
 
             let settings = server::Settings::new(config_file)?;
             info!("Using the settings: {:?}", settings);
 
-            let all_ids = settings.consensus_config.get_all_ids();
+            let all_ids = settings.committee_config.get_all_ids();
 
             // Load the keys
             let key_reader = File::open(key_file)?;

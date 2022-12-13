@@ -12,8 +12,8 @@ use tokio::sync::{
 };
 
 /// This is the server that runs the protocol
-pub struct Server<Transaction> {
-    _x: PhantomData<Transaction>,
+pub struct Server<Tx> {
+    _x: PhantomData<Tx>,
 }
 
 pub fn get_mempool_peers(
@@ -21,11 +21,11 @@ pub fn get_mempool_peers(
     settings: &Settings,
 ) -> Result<FnvHashMap<Id, SocketAddr>> {
     let mut map = FnvHashMap::default();
-    for i in 0..settings.consensus_config.num_nodes() {
+    for i in 0..settings.committee_config.num_nodes() {
         let id: Id = i.into();
         if id != my_id {
             let party = settings
-                .consensus_config
+                .committee_config
                 .get(&id)
                 .ok_or(anyhow!("Id not found"))?;
             let ip_str = &party.mempool_address;
@@ -41,11 +41,11 @@ pub fn get_consensus_peers(
     settings: &Settings,
 ) -> Result<FnvHashMap<Id, SocketAddr>> {
     let mut map = FnvHashMap::default();
-    for i in 0..settings.consensus_config.num_nodes() {
+    for i in 0..settings.committee_config.num_nodes() {
         let id: Id = i.into();
         if id != my_id {
             let party = settings
-                .consensus_config
+                .committee_config
                 .get(&id)
                 .ok_or(anyhow!("Id not found"))?;
             let ip_str = &party.consensus_address;
@@ -83,7 +83,7 @@ where
 
         // Create the mempool
         let me = settings
-            .consensus_config
+            .committee_config
             .get(&my_id)
             .ok_or(anyhow!("My Id is not present in the config"))?;
         let mempool_peers = get_mempool_peers(my_id, &settings)?;

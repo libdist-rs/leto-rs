@@ -6,8 +6,9 @@ all:
 format:
 	@cargo +nightly fmt --all
 
-update-examples:
-	exit 1 # TODO
+update-config:
+	@cargo r -p node -- config -n 4 -o examples
+	@cargo r -p node -- keys -n 4 -o examples
 
 logs-clean:
 	@sed -i '' '/Got a transaction/d' test-log*.log

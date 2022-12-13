@@ -56,14 +56,17 @@ pub struct Party {
 pub struct Config {
     /// All the parties in the system
     pub parties: HashMap<Id, Party>,
-    pub num_faults: usize,
-    pub delay_in_ms: u64,
 }
 
 impl Config {
     /// Returns the number of nodes in the consensus system
     pub fn num_nodes(&self) -> usize {
         self.parties.len()
+    }
+
+    /// Returns the maximum threshold of faults
+    pub fn num_faults(&self) -> usize {
+        (self.parties.len()-1)/3
     }
 
     /// Returns the party corresponding to Id
@@ -84,6 +87,8 @@ impl Config {
 pub struct BenchConfig {
     pub batch_size: usize,
     pub batch_timeout: Duration,
+    pub num_faults: usize,
+    pub delay_in_ms: u64,
 }
 
 impl Default for BenchConfig {
@@ -91,6 +96,8 @@ impl Default for BenchConfig {
         Self {
             batch_size: 1_000,
             batch_timeout: Duration::from_millis(1_000),
+            num_faults: 0,
+            delay_in_ms: 500,
         }
     }
 }
@@ -98,7 +105,7 @@ impl Default for BenchConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
     /// Contains information about contacting the parties
-    pub consensus_config: Config,
+    pub committee_config: Config,
     /// Contains information about the mempool settings
     pub mempool_config: mempool::Config<Round>,
     pub storage: StorageConfig,

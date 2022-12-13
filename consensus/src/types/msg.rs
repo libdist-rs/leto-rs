@@ -1,4 +1,4 @@
-use super::{Proposal, Request, Response, Signature};
+use super::{Proposal, Request, Response, Signature, Certificate};
 use crypto::hash::Hash;
 use mempool::{Batch, BatchHash};
 use network::Identifier;
@@ -20,6 +20,10 @@ pub enum ProtocolMsg<Id, Tx, Round> {
     Blame {
         round: Round,
         auth: Signature<Id, Round>,
+    },
+    BlameQC {
+        round: Round,
+        qc: Certificate<Id, Round>,
     },
     BatchRequest {
         source: Id,

@@ -34,6 +34,18 @@ impl<Id, T> Certificate<Id, T> {
     pub fn len(&self) -> usize {
         self.raw_sigs.len()
     }
+
+    /// Creates an empty certificate to add signatures to
+    pub fn empty() -> Self {
+        Self {
+            raw_sigs: Vec::new(),
+        }
+    }
+
+    /// Adds a signature into the certificate
+    pub fn add(&mut self, sig: Signature<Id, T>) {
+        self.raw_sigs.push(sig);
+    }
 }
 
 impl<Id, T> Certificate<Id, T>

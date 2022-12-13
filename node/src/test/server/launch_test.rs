@@ -19,7 +19,7 @@ fn dummy_ids(num_nodes: usize) -> Vec<Id> {
 
 fn _dummy_settings(
     num_nodes: usize,
-    num_faults: usize,
+    _num_faults: usize,
 ) -> Settings {
     // Returns dummy settings
     let ids = dummy_ids(num_nodes);
@@ -45,10 +45,8 @@ fn _dummy_settings(
     }
     Settings {
         mempool_config,
-        consensus_config: crate::server::Config {
+        committee_config: crate::server::Config {
             parties,
-            num_faults,
-            delay_in_ms: 1_000,
         },
         storage: storage_config,
         bench_config: BenchConfig::default(),
@@ -60,9 +58,9 @@ const DEFAULT_CONFIG_FILE_LOCATION: &'static str = "./src/server/test/Default";
 #[tokio::test]
 async fn test_one() -> Result<()> {
     let settings = Settings::new(DEFAULT_CONFIG_FILE_LOCATION.to_string())?;
-    let ids = dummy_ids(settings.consensus_config.num_nodes());
+    let ids = dummy_ids(settings.committee_config.num_nodes());
     let crypto_system = KeyConfig::generate(Algorithm::ED25519, 4)?;
-    let (commit_tx, commit_rx) = unbounded_channel();
+    let (commit_tx, _) = unbounded_channel();
     let exit_tx = Server::<SimpleTx<SimpleData>>::spawn(
         ids[0],
         ids,
