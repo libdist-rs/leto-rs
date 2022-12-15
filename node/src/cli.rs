@@ -80,11 +80,6 @@ pub struct CreateConfig {
     #[arg(short, long)]
     pub num_servers: usize,
 
-    /// Number of faults (f)
-    /// Default is (n-1)/3
-    #[arg(short = 'f', long)]
-    pub num_faults: Option<usize>,
-
     /// The delay parameter (Delta)
     #[arg(short = 'w', long = "delta")]
     #[clap(default_value_t = 500)]

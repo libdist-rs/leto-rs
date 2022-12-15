@@ -87,7 +87,6 @@ impl Config {
 pub struct BenchConfig {
     pub batch_size: usize,
     pub batch_timeout: Duration,
-    pub num_faults: usize,
     pub delay_in_ms: u64,
 }
 
@@ -96,7 +95,6 @@ impl Default for BenchConfig {
         Self {
             batch_size: 1_000,
             batch_timeout: Duration::from_millis(1_000),
-            num_faults: 0,
             delay_in_ms: 500,
         }
     }

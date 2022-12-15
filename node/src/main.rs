@@ -160,18 +160,6 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
         );
     }
 
-    let num_faults = if let None = config.num_faults {
-        (config.num_servers - 1) / 3
-    } else {
-        config.num_faults.unwrap()
-    };
-    if num_faults * 3 >= config.num_servers {
-        return Err(anyhow!(
-            "Number of faults is invalid: {} <= 3*{}",
-            config.num_servers,
-            num_faults
-        ));
-    }
     let committee_config = server::Config {
         parties: server_parties,
     };
@@ -186,7 +174,6 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
     let bench_config = BenchConfig {
         batch_size: config.sealer_size,
         batch_timeout: Duration::from_millis(config.timeout_ms),
-        num_faults: config.num_faults.unwrap_or((config.num_servers-1)/3),
         delay_in_ms: config.delay_in_ms,
     };
 
