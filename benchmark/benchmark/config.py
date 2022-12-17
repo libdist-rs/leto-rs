@@ -22,96 +22,54 @@ class Key:
 
 
 class Committee:
-    ''' The committee looks as follows:
-        "authorities: {
-            "name": {
-                "stake": 1,
-                "primary: {
-                    "primary_to_primary": x.x.x.x:x,
-                    "worker_to_primary": x.x.x.x:x,
-                },
-                "workers": {
-                    "0": {
-                        "primary_to_worker": x.x.x.x:x,
-                        "worker_to_worker": x.x.x.x:x,
-                        "transactions": x.x.x.x:x
-                    },
-                    ...
-                }
-            },
-            ...
-        }
-    '''
 
-    def __init__(self, addresses, base_port):
-        ''' The `addresses` field looks as follows:
-            { 
-                "name": ["host", "host", ...],
-                ...
-            }
-        '''
+    def __init__(self, addresses, consensus_base_port, mempool_base_port, client_base_port):
         assert isinstance(addresses, OrderedDict)
-        assert all(isinstance(x, str) for x in addresses.keys())
+        assert all(isinstance(x, int) for x in addresses.keys())
         assert all(
-            isinstance(x, list) and len(x) > 1 for x in addresses.values()
+            isinstance(x, str) for x in addresses.values()
         )
-        assert all(
-            isinstance(x, str) for y in addresses.values() for x in y
-        )
-        assert len({len(x) for x in addresses.values()}) == 1
-        assert isinstance(base_port, int) and base_port > 1024
+        assert isinstance(consensus_base_port, int) and consensus_base_port > 1024       
+        assert isinstance(mempool_base_port, int) and mempool_base_port > 1024
+        assert isinstance(client_base_port, int) and client_base_port > 1024
 
-        port = base_port
-        self.json = {'authorities': OrderedDict()}
-        for name, hosts in addresses.items():
-            host = hosts.pop(0)
+        consensus_port = consensus_base_port
+        mempool_port = mempool_base_port
+        client_port = client_base_port
+        self.node_names = OrderedDict()
+        for name, host in addresses.items():
             primary_addr = {
-                'primary_to_primary': f'{host}:{port}',
-                'worker_to_primary': f'{host}:{port + 1}'
+                'consensus_port': f'{host}:{consensus_port}',
+                'mempool_port': f'{host}:{mempool_port}',
+                'client_port': f'{host}:{client_port}'
             }
-            port += 2
-
-            workers_addr = OrderedDict()
-            for j, host in enumerate(hosts):
-                workers_addr[j] = {
-                    'primary_to_worker': f'{host}:{port}',
-                    'transactions': f'{host}:{port + 1}',
-                    'worker_to_worker': f'{host}:{port + 2}',
-                }
-                port += 3
-
-            self.json['authorities'][name] = {
-                'stake': 1,
-                'primary': primary_addr,
-                'workers': workers_addr
-            }
+            consensus_port += 1
+            mempool_port += 1
+            client_port += 1
+            self.node_names[name] = primary_addr
 
     def primary_addresses(self, faults=0):
         ''' Returns an ordered list of primaries' addresses. '''
         assert faults < self.size()
         addresses = []
         good_nodes = self.size() - faults
-        for authority in list(self.json['authorities'].values())[:good_nodes]:
-            addresses += [authority['primary']['primary_to_primary']]
+        for name in list(self.node_names.keys())[:good_nodes]:
+            addresses += [self.node_names[name]]
         return addresses
 
     def ips(self, name=None):
         ''' Returns all the ips associated with an authority (in any order). '''
         if name is None:
-            names = list(self.json['authorities'].keys())
+            names = list(self.node_names.keys())
         else:
             names = [name]
 
         ips = set()
         for name in names:
-            addresses = self.json['authorities'][name]['primary']
-            ips.add(self.ip(addresses['primary_to_primary']))
-            ips.add(self.ip(addresses['worker_to_primary']))
-
-            for worker in self.json['authorities'][name]['workers'].values():
-                ips.add(self.ip(worker['primary_to_worker']))
-                ips.add(self.ip(worker['worker_to_worker']))
-                ips.add(self.ip(worker['transactions']))
+            addresses = self.node_names[name]
+            ips.add(self.ip(addresses['consensus_port']))
+            ips.add(self.ip(addresses['mempool_port']))
+            ips.add(self.ip(addresses['client_port']))
 
         return list(ips)
 
@@ -119,11 +77,11 @@ class Committee:
         ''' remove the `nodes` last nodes from the committee. '''
         assert nodes < self.size()
         for _ in range(nodes):
-            self.json['authorities'].popitem()
+            self.node_names.popitem()
 
     def size(self):
         ''' Returns the number of authorities. '''
-        return len(self.json['authorities'])
+        return len(self.node_names)
 
     @staticmethod
     def ip(address):
@@ -132,27 +90,38 @@ class Committee:
 
 
 class LocalCommittee(Committee):
-    def __init__(self, names, port):
-        assert isinstance(names, list)
-        assert all(isinstance(x, str) for x in names)
-        assert isinstance(port, int)
-        addresses = OrderedDict((x, ['127.0.0.1']) for x in names)
-        super().__init__(addresses, port)
+    def __init__(self, nodes, consensus_base_port = 7001, mempool_base_port = 8001, client_base_port = 9001):
+        assert isinstance(nodes, int)
+        assert nodes > 3
+        assert isinstance(consensus_base_port, int)
+        assert isinstance(mempool_base_port, int)
+        assert isinstance(client_base_port, int)
+        addresses = OrderedDict()
+        for x in range(nodes):
+            addresses[x] = '127.0.0.1'
+        super().__init__(
+            addresses, 
+            consensus_base_port=consensus_base_port, 
+            mempool_base_port=mempool_base_port, 
+            client_base_port=client_base_port
+        )
 
 
 class NodeParameters:
     def __init__(self, json):
         inputs = []
         try:
-            inputs += [json['header_size']]
-            inputs += [json['max_header_delay']]
-            inputs += [json['gc_depth']]
-            inputs += [json['sync_retry_delay']]
-            inputs += [json['sync_retry_nodes']]
+            inputs += [json['servers']]
+            if 'network_delay' in json:
+                inputs += [json['network_delay']]
+            if 'gc_depth' in json:
+                inputs += [json['gc_depth']]
+            if 'sync_retry_nodes' in json:
+                inputs += [json['sync_retry_nodes']]
+            if 'sync_retry_delay' in json:
+                inputs += [json['sync_retry_delay']]
             inputs += [json['batch_size']]
             inputs += [json['max_batch_delay']]
-            if 'timeout' in json:
-                inputs += [json['timeout']]
 
         except KeyError as e:
             raise ConfigError(f'Malformed parameters: missing key {e}')
@@ -162,22 +131,10 @@ class NodeParameters:
 
         self.json = json
 
-    def print(self, filename):
-        assert isinstance(filename, str)
-        with open(filename, 'w') as f:
-            dump(self.json, f, indent=4, sort_keys=True)
-
-
 class BenchParameters:
     def __init__(self, json):
         try:
             self.faults = int(json['faults'])
-
-            nodes = json['nodes']
-            nodes = nodes if isinstance(nodes, list) else [nodes]
-            if not nodes or any(x <= 1 for x in nodes):
-                raise ConfigError('Missing or invalid number of nodes')
-            self.nodes = [int(x) for x in nodes]
 
             rate = json['rate']
             rate = rate if isinstance(rate, list) else [rate]
@@ -185,7 +142,11 @@ class BenchParameters:
                 raise ConfigError('Missing input rate')
             self.rate = [int(x) for x in rate]
 
-            self.tx_size = int(json['tx_size'])
+            local = json['local']
+            if not local:
+                local = True
+            assert isinstance(local, bool)
+            self.local = local
 
             self.duration = int(json['duration'])
 
@@ -196,9 +157,6 @@ class BenchParameters:
 
         except ValueError:
             raise ConfigError('Invalid parameters type')
-
-        if min(self.nodes) <= self.faults:
-            raise ConfigError('There should be more nodes than faults')
 
 
 class PlotParameters:

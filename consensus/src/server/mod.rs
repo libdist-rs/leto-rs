@@ -1,5 +1,5 @@
-mod server;
-pub use server::*;
+mod core;
+pub use self::core::*;
 
 mod settings;
 pub use settings::*;

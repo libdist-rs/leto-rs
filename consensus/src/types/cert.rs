@@ -1,5 +1,7 @@
+use std::fmt::Debug;
+
 use super::Signature;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use crypto::hash::Hash;
 use crypto::PublicKey;
 use fnv::{FnvHashMap, FnvHashSet};
@@ -12,7 +14,7 @@ pub struct Certificate<Id, T> {
 
 impl<Id, T> Certificate<Id, T>
 where
-    Id: Eq + std::hash::Hash,
+    Id: Eq + std::hash::Hash + Debug,
 {
     pub fn verify(
         &self,
@@ -23,7 +25,7 @@ where
         for sig in &self.raw_sigs {
             let pk = pk_map
                 .get(&sig.id)
-                .ok_or(anyhow::Error::msg("Unknown Id"))?;
+                .ok_or_else(|| anyhow!("Unknown Id {:?}", sig.id))?;
             sig.verify_without_id_check(msg_hash, pk)?;
         }
         Ok(())
@@ -31,8 +33,13 @@ where
 }
 
 impl<Id, T> Certificate<Id, T> {
+    /// Returns the length of this [`Certificate<Id, T>`].
     pub fn len(&self) -> usize {
         self.raw_sigs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.raw_sigs.is_empty()
     }
 
     /// Creates an empty certificate to add signatures to
@@ -43,7 +50,10 @@ impl<Id, T> Certificate<Id, T> {
     }
 
     /// Adds a signature into the certificate
-    pub fn add(&mut self, sig: Signature<Id, T>) {
+    pub fn add(
+        &mut self,
+        sig: Signature<Id, T>,
+    ) {
         self.raw_sigs.push(sig);
     }
 }

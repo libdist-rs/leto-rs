@@ -63,7 +63,7 @@ impl<Tx> Helper<Tx> {
                                 .read(key)
                                 .await
                                 .and_then(|res| {
-                                    res.ok_or(anyhow!(
+                                    res.ok_or_else(|| anyhow!(
                                         "Unknown batch",
                                     ))
                                 })

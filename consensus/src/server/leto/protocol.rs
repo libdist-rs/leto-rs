@@ -23,8 +23,8 @@ use tokio::sync::{
 };
 
 use super::{
-    ChainState, CommitContext, Helper, HelperRequest, LeaderContext, QuorumWaiter, RoundContext,
-    Synchronizer, SynchronizerOutMsg,
+    ChainState, CommitContext, Helper, HelperRequest, LeaderContext, RoundContext, Synchronizer,
+    SynchronizerOutMsg,
 };
 
 pub struct Leto<Tx> {
@@ -67,8 +67,6 @@ pub struct Leto<Tx> {
     pub(crate) _tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
 
     /* Helpers */
-    /// This object is used to wait for n-f messages to be delivered
-    pub(crate) _quorum_waiter: QuorumWaiter,
     /// Helps get unknown batch hashes, blocks, etc
     pub(crate) synchronizer: Synchronizer<Tx>,
     /// Helps us with committing
@@ -92,6 +90,7 @@ impl<Tx> Leto<Tx>
 where
     Tx: types::Transaction,
 {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         my_id: Id,
         crypto_system: KeyConfig,
@@ -108,7 +107,7 @@ where
         let me = settings
             .committee_config
             .get(&my_id)
-            .ok_or(anyhow!("My Id is not present in the config"))?;
+            .ok_or_else(|| anyhow!("My Id {} is not present in the config", my_id))?;
         let consensus_addr = to_socket_address("0.0.0.0", me.consensus_port)?;
 
         let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
@@ -138,7 +137,7 @@ where
         // Start the batcher
         let (tx_consensus_to_batcher, rx_consensus_to_batcher) = unbounded_channel();
         let batching_params = Parameters::new(
-            my_id.clone(),
+            my_id,
             Leto::<Tx>::INITIAL_LEADER,
             settings.bench_config.batch_size,
             settings.bench_config.batch_timeout,
@@ -182,14 +181,6 @@ where
                 ),
                 tx_msg_loopback,
                 rx_msg_loopback,
-                // num_nodes - num_faults - 1
-                // Here, -1 is because we always deliver messages to ourselves using the loopback
-                // channel
-                _quorum_waiter: QuorumWaiter::new(
-                    settings.committee_config.num_nodes()
-                        - settings.committee_config.num_faults()
-                        - 1,
-                ),
                 chain_state: ChainState::new(store),
                 settings,
                 rx_synchronizer_to_consensus: rx_from_sync,
@@ -220,7 +211,7 @@ where
             tokio::select! {
                 // Receive exit handlers
                 exit_val = &mut self.exit_rx => {
-                    let _ = exit_val.map_err(anyhow::Error::new)?;
+                    exit_val.map_err(anyhow::Error::new)?;
                     info!("Termination signal received by the server. Exiting.");
                     break
                 }
@@ -228,7 +219,7 @@ where
                 batch_hash = self.rx_mem_to_consensus.recv(), if
                     self.leader_context.leader() == self.my_id
                 => {
-                    let batch_hash = batch_hash.ok_or(
+                    let batch_hash = batch_hash.ok_or_else(||
                         anyhow!("Mempool processor has shut down")
                     )?;
                     if let Err(e) = self.handle_new_batch(batch_hash).await {
@@ -237,7 +228,7 @@ where
                 }
                 // Receive consensus messages from loopback
                 msg = self.rx_msg_loopback.recv() => {
-                    let msg = msg.ok_or(
+                    let msg = msg.ok_or_else(||
                         anyhow!("Loopback layer has closed")
                     )?;
                     info!("Got a consensus message from loopback: {:?}", msg);
@@ -247,7 +238,7 @@ where
                 }
                 // Receive consensus messages from others
                 msg = self.rx_net_to_consensus.recv() => {
-                    let msg = msg.ok_or(
+                    let msg = msg.ok_or_else(||
                         anyhow!("Networking layer has closed")
                     )?;
                     info!("Got a consensus message from the network: {:?}", msg);
@@ -264,7 +255,7 @@ where
                 }
                 // Receive synchronized messages from others
                 sync_help = self.rx_synchronizer_to_consensus.recv() => {
-                    let sync_msg = sync_help.ok_or(
+                    let sync_msg = sync_help.ok_or_else(||
                         anyhow!("Synchronizer channel closed")
                     )?;
                     if let Err(e) = match sync_msg {
@@ -295,14 +286,8 @@ where
                 batch_hash,
                 sender,
             } => self.handle_relay(proposal, auth, batch_hash, sender).await,
-            ProtocolMsg::Blame { 
-                round, 
-                auth 
-            } => self.handle_blame(round, auth).await,
-            ProtocolMsg::BlameQC { 
-                round, 
-                qc 
-            } => self.on_blame_qc(round, qc).await,
+            ProtocolMsg::Blame { round, auth } => self.handle_blame(round, auth).await,
+            ProtocolMsg::BlameQC { round, qc } => self.on_blame_qc(round, qc).await,
             // Use the helper
             ProtocolMsg::BatchRequest { source, request } => {
                 self.on_batch_request(source, request).await

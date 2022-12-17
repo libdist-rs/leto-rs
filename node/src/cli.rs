@@ -77,13 +77,13 @@ pub enum SubCommand {
 #[derive(Debug, Parser)]
 pub struct CreateConfig {
     /// Number of servers (n)
-    #[arg(short, long)]
-    pub num_servers: usize,
+    #[arg(short = 'n', long)]
+    pub servers: usize,
 
-    /// The delay parameter (Delta)
+    /// The delay parameter in ms (Delta)
     #[arg(short = 'w', long = "delta")]
     #[clap(default_value_t = 500)]
-    pub delay_in_ms: u64,
+    pub network_delay: u64,
 
     /// The Garbage collection depth
     #[arg(short, long)]
@@ -131,23 +131,15 @@ pub struct CreateConfig {
 
     /// Client port for the servers (or base client port for local testing)
     #[arg(long)]
-    #[arg(short = 'P')]
-    #[clap(default_value_t = 9001)]
-    #[arg(value_parser = clap::value_parser!(u16).range(1023..))]
-    pub server_client_port: u16,
-
-    /// Client port for the servers (or base client port for local testing)
-    #[arg(long)]
     #[arg(short = 'j')]
     #[clap(default_value_t = 10_001)]
     #[arg(value_parser = clap::value_parser!(u16).range(1023..))]
     pub client_port: u16,
 
-    /// Number of clients
-    #[arg(short = 'c', long)]
-    #[clap(default_value_t = 1)]
-    pub num_client: usize,
-
+    // /// Number of clients
+    // #[arg(short = 'c', long)]
+    // #[clap(default_value_t = 1)]
+    // pub num_client: usize,
     /// The base directory to put the databases
     #[arg(short = 'b', long)]
     #[clap(default_value_t = format!("."))]
@@ -161,12 +153,12 @@ pub struct CreateConfig {
     /// Sized Sealer size in bytes
     #[arg(short = 'S', long)]
     #[clap(default_value_t = 1_024)]
-    pub sealer_size: usize,
+    pub batch_size: usize,
 
     /// Timed Sealer time (in ms)
     #[arg(short = 't', long)]
     #[clap(default_value_t = 1_000)]
-    pub timeout_ms: u64,
+    pub max_batch_delay: u64,
 
     /// Optional ouptut directory for the Config
     #[arg(short, long, value_name = "FILE")]
@@ -215,11 +207,11 @@ impl From<Algorithm> for KeyType {
     }
 }
 
-impl Into<Algorithm> for KeyType {
-    fn into(self) -> Algorithm {
-        match self {
-            Self::ED25519 => Algorithm::ED25519,
-            Self::SECP256K1 => Algorithm::SECP256K1,
+impl From<KeyType> for Algorithm {
+    fn from(kt: KeyType) -> Algorithm {
+        match kt {
+            KeyType::ED25519 => Algorithm::ED25519,
+            KeyType::SECP256K1 => Algorithm::SECP256K1,
         }
     }
 }

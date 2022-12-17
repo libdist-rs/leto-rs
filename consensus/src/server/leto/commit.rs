@@ -83,7 +83,7 @@ impl<Tx> CommitContext<Tx> {
         loop {
             tokio::select! {
                 msg = rx_inner.recv() => {
-                    let msg = msg.ok_or(
+                    let msg = msg.ok_or_else(||
                         anyhow!("Shutting down commit helper")
                     )?;
                     match msg {
@@ -191,7 +191,7 @@ impl<Tx> Leto<Tx> {
         // Let the commit context know
         let commit_helper_msg = CommitMsg::EndRound {
             round_element_hash: self.chain_state.highest_hash(),
-            round_element: self.chain_state.highest_chain().clone(),
+            round_element: self.chain_state.highest_chain(),
         };
         self.commit_ctx
             .tx_inner

@@ -13,7 +13,7 @@ from benchmark.utils import Print, BenchError, PathMaker
 class LocalBench:
     BASE_PORT = 3000
 
-    def __init__(self, bench_parameters_dict, node_parameters_dict):
+    def __init__(self, node_parameters_dict, bench_parameters_dict):
         try:
             self.bench_parameters = BenchParameters(bench_parameters_dict)
             self.node_parameters = NodeParameters(node_parameters_dict)
@@ -44,7 +44,8 @@ class LocalBench:
 
         try:
             Print.info('Setting up testbed...')
-            nodes, rate = self.nodes[0], self.rate[0]
+            nodes, rate = self.node_parameters.json['servers'], self.rate[0]
+            clients = nodes
 
             # Cleanup all files.
             cmd = f'{CommandMaker.clean_logs()} ; {CommandMaker.cleanup()}'
@@ -61,22 +62,24 @@ class LocalBench:
             cmd = CommandMaker.alias_binaries(PathMaker.binary_path())
             subprocess.run([cmd], shell=True)
 
-            # Generate configuration files.
-            keys = []
+            # Generate keys
             key_files = [PathMaker.key_file(i) for i in range(nodes)]
-            cmd = CommandMaker.generate_key(".").split()
+            cmd = CommandMaker.generate_keys(nodes, ".").split()
             subprocess.run(cmd, check=True)
-            keys = [Key.from_file(filename) for filename in key_files]
+            # keys = [Key.from_file(filename) for filename in key_files]
 
-            names = [x.name for x in keys]
-            committee = LocalCommittee(names, self.BASE_PORT)
-            committee.print(PathMaker.committee_file())
-
-            self.node_parameters.print(PathMaker.parameters_file())
+            # Generate server config
+            committee = LocalCommittee(nodes, self.BASE_PORT)
+            cmd = CommandMaker.generate_server_config(
+                committee, 
+                self.node_parameters, 
+                self.bench_parameters
+            )
+            # TODO: Generate client config
+            exit(0)
 
             # Run the clients (they will wait for the nodes to be ready).
-            workers_addresses = committee.workers_addresses(self.faults)
-            rate_share = ceil(rate / committee.workers())
+            rate_share = ceil(rate / clients)
             for i, addresses in enumerate(workers_addresses):
                 for (id, address) in addresses:
                     cmd = CommandMaker.run_client(

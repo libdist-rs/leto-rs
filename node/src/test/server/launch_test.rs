@@ -45,9 +45,7 @@ fn _dummy_settings(
     }
     Settings {
         mempool_config,
-        committee_config: crate::server::Config {
-            parties,
-        },
+        committee_config: crate::server::Config { parties },
         storage: storage_config,
         bench_config: BenchConfig::default(),
     }

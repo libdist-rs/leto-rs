@@ -62,7 +62,7 @@ impl Serialize for KeyConfig {
         S: serde::Serializer,
     {
         let mut new_system = FnvHashMap::default();
-        for (k, v) in &self.system {
+        for (id, v) in &self.system {
             let pub_key_bytes = match v {
                 PublicKey::Ed25519(pk) => bincode::serialize(&pk).unwrap(),
                 PublicKey::Secp256k1(pk) => pk.encode().to_vec(),
@@ -71,7 +71,7 @@ impl Serialize for KeyConfig {
                     todo!();
                 }
             };
-            new_system.insert(k.clone(), pub_key_bytes);
+            new_system.insert(*id, pub_key_bytes);
         }
         let sk_bytes = match &self.secret {
             SecretKey::Ed25519(sk) => bincode::serialize(sk).unwrap(),

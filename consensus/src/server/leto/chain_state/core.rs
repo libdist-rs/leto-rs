@@ -1,5 +1,5 @@
 use crate::{
-    types::{Element, Proposal, Signature, Transaction, Certificate},
+    types::{Certificate, Element, Proposal, Signature, Transaction},
     Id, Round,
 };
 use anyhow::{Context, Result};
@@ -76,25 +76,17 @@ where
         &mut self,
         blame_round: Round,
         qc: Certificate<Id, Round>,
-    ) 
-    where
+    ) where
         Tx: Transaction,
     {
-        self.qc_map
-            .insert(
-                blame_round,
-                qc
-            );
+        self.qc_map.insert(blame_round, qc);
     }
 
     pub fn get_qc(
         &mut self,
         round: &Round,
-    ) -> Option<Certificate<Id, Round>>
-    {
-        self.qc_map
-            .get(round)
-            .cloned()
+    ) -> Option<Certificate<Id, Round>> {
+        self.qc_map.get(round).cloned()
     }
 
     pub async fn write_element(

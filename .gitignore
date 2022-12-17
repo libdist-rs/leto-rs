@@ -13,3 +13,4 @@ db-*
 keys-*.json
 server.json
 client-*.json
+benchmark/benchmark-ref/

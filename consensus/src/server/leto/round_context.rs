@@ -3,7 +3,7 @@ use std::time::Duration;
 use super::Leto;
 use crate::{
     server::BatcherConsensusMsg as BCM,
-    types::{Proposal, ProtocolMsg, Signature, Transaction, Certificate},
+    types::{Certificate, Proposal, ProtocolMsg, Signature, Transaction},
     Id, Round,
 };
 use anyhow::Result;
@@ -26,16 +26,9 @@ pub type RelayMsg<Id, Tx, Round> = (
     Id,
 );
 
-pub type BlameMsg<Id, Round> = (
-    Round, 
-    Signature<Id, Round>,
-);
+pub type BlameMsg<Id, Round> = (Round, Signature<Id, Round>);
 
-pub type BlameQCMsg<Id, Round> = (
-    Round, 
-    Certificate<Id, Round>,
-);
-
+pub type BlameQCMsg<Id, Round> = (Round, Certificate<Id, Round>);
 
 #[derive(Debug)]
 pub struct RoundContext<Tx> {
@@ -148,24 +141,16 @@ where
         // Process the relay messages from the new current round first
         if let Some(msgs) = self.round_context.blame_qc_msgs() {
             for (round, qc) in msgs {
-                let pmsg = ProtocolMsg::<Id, Tx, Round>::BlameQC { 
-                    round, 
-                    qc, 
-                };
-                self.tx_msg_loopback
-                    .send(pmsg)?;
+                let pmsg = ProtocolMsg::<Id, Tx, Round>::BlameQC { round, qc };
+                self.tx_msg_loopback.send(pmsg)?;
             }
         }
 
         // Process the blame messages from the new current round second
         if let Some(msgs) = self.round_context.blame_msgs() {
             for (round, auth) in msgs {
-                let pmsg = ProtocolMsg::<Id, Tx, Round>::Blame { 
-                    round, 
-                    auth, 
-                };
-                self.tx_msg_loopback
-                    .send(pmsg)?;
+                let pmsg = ProtocolMsg::<Id, Tx, Round>::Blame { round, auth };
+                self.tx_msg_loopback.send(pmsg)?;
             }
         }
 
@@ -251,7 +236,7 @@ where
         prop: Proposal<Id, Tx, Round>,
         auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch: Batch<Tx>,
-    ) -> () {
+    ) {
         self.proposals_ready
             .entry(prop.round())
             .or_insert(Vec::new())
@@ -264,7 +249,7 @@ where
         auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch_hash: BatchHash<Tx>,
         sender: Id,
-    ) -> () {
+    ) {
         self.relay_ready
             .entry(prop.round())
             .or_insert(Vec::new())

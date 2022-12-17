@@ -54,7 +54,6 @@ impl Config {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
-    pub port: u16,
     pub consensus_config: Config,
     pub bench_config: Bench,
 }
@@ -68,7 +67,7 @@ impl Settings {
             // Add in the current environment file (Testing, Dev or Prod)
             // Default to 'development' env
             // Note that this file is _optional_
-            .add_source(config::File::with_name(&format!("{}", run_mode)).required(false))
+            .add_source(config::File::with_name(&run_mode).required(false))
             // ENV variables override the file settings
             // For example LETO_LOG
             .add_source(
@@ -78,6 +77,6 @@ impl Settings {
                     .list_separator(" "),
             )
             .build()?;
-        conf.try_deserialize().map_err(|e| anyhow::Error::new(e))
+        conf.try_deserialize().map_err(anyhow::Error::new)
     }
 }

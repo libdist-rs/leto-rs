@@ -1,4 +1,4 @@
-use super::{Proposal, Request, Response, Signature, Certificate};
+use super::{Certificate, Proposal, Request, Response, Signature};
 use crypto::hash::Hash;
 use mempool::{Batch, BatchHash};
 use network::Identifier;

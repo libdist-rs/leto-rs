@@ -27,10 +27,10 @@ pub fn get_mempool_peers(
             let party = settings
                 .committee_config
                 .get(&id)
-                .ok_or(anyhow!("Id not found"))?;
+                .ok_or_else(|| anyhow!("Id {} not found", id))?;
             let ip_str = &party.mempool_address;
             let addr = to_socket_address(ip_str, party.mempool_port)?;
-            map.insert(id, addr.into());
+            map.insert(id, addr);
         }
     }
     Ok(map)
@@ -47,10 +47,10 @@ pub fn get_consensus_peers(
             let party = settings
                 .committee_config
                 .get(&id)
-                .ok_or(anyhow!("Id not found"))?;
+                .ok_or_else(|| anyhow!("Id {} not found", id))?;
             let ip_str = &party.consensus_address;
             let addr = to_socket_address(ip_str, party.consensus_port)?;
-            map.insert(id, addr.into());
+            map.insert(id, addr);
         }
     }
     Ok(map)
@@ -78,14 +78,14 @@ where
         };
         let store = Storage::new(
             path.to_str()
-                .ok_or(anyhow::anyhow!("Invalid path for storage"))?,
+                .ok_or_else(|| anyhow!("Invalid path [{}] for storage", path.display()))?,
         )?;
 
         // Create the mempool
         let me = settings
             .committee_config
             .get(&my_id)
-            .ok_or(anyhow!("My Id is not present in the config"))?;
+            .ok_or_else(|| anyhow!("My Id {} is not present in the config", my_id))?;
         let mempool_peers = get_mempool_peers(my_id, &settings)?;
         let mempool_net =
             TcpSimpleSender::<Id, MempoolMsg<Id, Tx>, Acknowledgement>::with_peers(mempool_peers);

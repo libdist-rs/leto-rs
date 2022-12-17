@@ -61,25 +61,29 @@ where
         debug!("Relayed proposal has sig: {:?}", auth);
 
         // Check if this proposal is for the correct round
-        if proposal.round() < self.round_context.round() {
-            // Ignore
-            warn!(
-                "Got an old proposal for round {} in {}",
-                proposal.round(),
-                self.round_context.round()
-            );
-            return Ok(());
-        } else if proposal.round() > self.round_context.round() {
-            // Handle future proposals
-            warn!(
-                "Got a future proposal for round {} in {}",
-                proposal.round(),
-                self.round_context.round()
-            );
-            self.round_context
-                .queue_relay(proposal, auth, batch_hash, source);
-            return Ok(());
-        }
+        match proposal.round().cmp(&self.round_context.round()) {
+            std::cmp::Ordering::Less => {
+                // Ignore
+                warn!(
+                    "Got an old proposal for round {} in {}",
+                    proposal.round(),
+                    self.round_context.round()
+                );
+                return Ok(());
+            }
+            std::cmp::Ordering::Greater => {
+                // Handle future proposals
+                warn!(
+                    "Got a future proposal for round {} in {}",
+                    proposal.round(),
+                    self.round_context.round()
+                );
+                self.round_context
+                    .queue_relay(proposal, auth, batch_hash, source);
+                return Ok(());
+            }
+            _ => (),
+        };
         debug!("Got a relay for the correct round");
 
         // Check whether batch is known
@@ -88,7 +92,7 @@ where
             .get_batch(batch_hash.clone())
             .await
             .context("Error getting batch hash when processing a relay")?;
-        if let None = batch_opt {
+        if batch_opt.is_none() {
             // Ask sender for the batch corresponding to this
             let pmsg = ProtocolMsg::BatchRequest {
                 source: self.my_id,

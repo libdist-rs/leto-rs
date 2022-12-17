@@ -30,13 +30,15 @@ where
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         // If timer has expired, make a batch
-        if let Poll::Ready(_) = self.timer.poll_tick(cx) {
+        if self.timer.poll_tick(cx).is_ready() {
             return Poll::Ready(Some(self.as_mut().make_batch()));
         }
+
         // If we have enough, make a transaction
         if self.current_size > self.batch_size {
             return Poll::Ready(Some(self.as_mut().make_batch()));
         }
+
         Poll::Pending
     }
 }

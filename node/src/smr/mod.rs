@@ -4,8 +4,8 @@ pub use data::*;
 mod tx;
 pub use tx::*;
 
-mod smr;
-pub use smr::*;
+mod core;
+pub use self::core::*;
 
 mod mocker;
 pub use mocker::*;

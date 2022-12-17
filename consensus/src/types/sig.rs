@@ -32,7 +32,7 @@ impl<Id, T> Signature<Id, T> {
         id: Id,
         sk: &SecretKey,
     ) -> Result<Self> {
-        let raw = sk.sign(&msg_hash.as_ref())?;
+        let raw = sk.sign(msg_hash.as_ref())?;
         Ok(Self {
             raw,
             id,
@@ -74,7 +74,7 @@ where
         msg_hash: &Hash<T>,
         pk: &PublicKey,
     ) -> Result<()> {
-        if !pk.verify(&msg_hash.as_ref(), &self.raw) {
+        if !pk.verify(msg_hash.as_ref(), &self.raw) {
             return Err(anyhow::Error::msg("Signature Verification Failed"));
         }
         Ok(())

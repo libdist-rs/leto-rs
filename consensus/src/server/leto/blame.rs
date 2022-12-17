@@ -1,16 +1,15 @@
 use super::Leto;
 use crate::{
-    types::{Signature, Transaction, ProtocolMsg, Certificate},
+    types::{Certificate, ProtocolMsg, Signature, Transaction},
     Id, Round,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use crypto::hash::Hash;
 use log::*;
 
 impl<Tx> Leto<Tx> {
-
     pub async fn on_round_timeout(&mut self) -> Result<()>
-    where 
+    where
         Tx: Transaction,
     {
         // Disable more timeouts for the same round until we advance
@@ -19,18 +18,15 @@ impl<Tx> Leto<Tx> {
         // Construct blame message
         let blame_msg = self.round_context.round();
         let blame_msg_hash = Hash::ser_and_hash(&blame_msg);
-        let auth = Signature::new(
-            blame_msg_hash,
-            self.my_id,
-            &self.crypto_system.secret,
-        )?;
-        let pmsg = ProtocolMsg::<Id, Tx, Round>::Blame { 
-            round: blame_msg, 
-            auth, 
+        let auth = Signature::new(blame_msg_hash, self.my_id, &self.crypto_system.secret)?;
+        let pmsg = ProtocolMsg::<Id, Tx, Round>::Blame {
+            round: blame_msg,
+            auth,
         };
 
         // Broadcast to all the servers
-        let handlers = self.consensus_net
+        let handlers = self
+            .consensus_net
             .broadcast(&self.broadcast_peers, pmsg.clone())
             .await;
         self.round_context
@@ -42,13 +38,14 @@ impl<Tx> Leto<Tx> {
         self.tx_msg_loopback
             .send(pmsg)
             .map_err(anyhow::Error::new)?;
-        
+
         Ok(())
     }
 
     /// Handle blame is called on receiving a blame message
     /// Cases to be careful about:
-    /// - A blame can be called after handling a proposal for the current round (occurs due to the future scheduling)
+    /// - A blame can be called after handling a proposal for the current round
+    ///   (occurs due to the future scheduling)
     /// - A blame can be called for the future round
     /// - Normal blame message
     pub async fn handle_blame(
@@ -67,21 +64,23 @@ impl<Tx> Leto<Tx> {
             return Ok(());
         }
         if blame_round > self.round_context.round() {
-            self.round_context
-                .queue_blame(blame_round, auth)?;
+            self.round_context.queue_blame(blame_round, auth)?;
             return Ok(());
         }
         debug!("Got a blame for the correct round");
 
-        // Handle the case where we received a proposal for the current round and a blame 
-        // We will prefer the proposal over the blame
+        // Handle the case where we received a proposal for the current round and a
+        // blame We will prefer the proposal over the blame
         if self.chain_state.highest_chain().proposal.round() == blame_round {
             warn!("Got a blame and a proposal for round: {}", blame_round);
             return Ok(());
         }
 
         // Handle the case where we already received a QC
-        let qc_len = (self.settings.committee_config.num_nodes()+self.settings.committee_config.num_faults()+1)/2;
+        let qc_len = (self.settings.committee_config.num_nodes()
+            + self.settings.committee_config.num_faults()
+            + 1)
+            / 2;
         if self.round_context.got_qc {
             return Ok(());
         }
@@ -89,18 +88,15 @@ impl<Tx> Leto<Tx> {
         // Check the signature
         let origin = auth.get_id();
         let blame_msg_hash = Hash::ser_and_hash(&blame_round);
-        let pk = self.crypto_system.system
+        let pk = self
+            .crypto_system
+            .system
             .get(&origin)
-            .ok_or(anyhow!("Got blame from unknown id: {}", origin))?;
+            .ok_or_else(|| anyhow!("Got blame from unknown id: {}", origin))?;
         auth.verify_without_id_check(&blame_msg_hash, pk)?;
 
         // Add signature to the set
-        self.round_context
-            .blame_map
-            .insert(
-                auth.get_id(), 
-                auth,
-            );
+        self.round_context.blame_map.insert(auth.get_id(), auth);
 
         // Only if we have qc_len # of signatures, move to the next step
         if self.round_context.blame_map.len() != qc_len {
@@ -128,8 +124,8 @@ impl<Tx> Leto<Tx> {
         &mut self,
         blame_round: Round,
         qc: Certificate<Id, Round>,
-    ) -> Result<()> 
-    where 
+    ) -> Result<()>
+    where
         Tx: Transaction,
     {
         debug!("Got a blame QC message for round {}: {:?}", blame_round, qc);
@@ -141,8 +137,7 @@ impl<Tx> Leto<Tx> {
         }
         // Re-schedule for future rounds
         if blame_round > self.round_context.round() {
-            self.round_context
-                .queue_blame_qc(blame_round, qc)?;
+            self.round_context.queue_blame_qc(blame_round, qc)?;
             return Ok(());
         }
         debug!("Got a blame QC for the correct round");
@@ -166,7 +161,7 @@ impl<Tx> Leto<Tx> {
         blame_round: Round,
         qc: Certificate<Id, Round>,
     ) -> Result<()>
-    where 
+    where
         Tx: Transaction,
     {
         // Prevent re-entry
@@ -175,13 +170,14 @@ impl<Tx> Leto<Tx> {
         debug!("Got a correct blame QC");
 
         // Construct BlameQC msg
-        let pmsg = ProtocolMsg::<Id, Tx, Round>::BlameQC { 
-            round: blame_round, 
+        let pmsg = ProtocolMsg::<Id, Tx, Round>::BlameQC {
+            round: blame_round,
             qc: qc.clone(),
         };
 
         // Broadcast the certificate
-        let cancel_handlers = self.consensus_net
+        let cancel_handlers = self
+            .consensus_net
             .broadcast(&self.broadcast_peers, pmsg)
             .await;
         self.round_context
@@ -189,13 +185,11 @@ impl<Tx> Leto<Tx> {
             .entry(blame_round)
             .or_default()
             .extend(cancel_handlers);
-        
+
         // Update chain state
-        self.chain_state
-            .add_qc(blame_round, qc);
+        self.chain_state.add_qc(blame_round, qc);
 
         // Advance round
         self.advance_round().await
     }
-
 }

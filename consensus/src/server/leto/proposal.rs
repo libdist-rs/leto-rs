@@ -29,31 +29,35 @@ where
         debug!("Proposal has sig: {:?}", auth);
 
         // Check if this proposal is for the correct round
-        if proposal.round() < self.round_context.round() {
-            // Ignore
-            warn!(
-                "Got an old proposal for round {} in {}",
-                proposal.round(),
-                self.round_context.round()
-            );
-            return Ok(());
-        } else if proposal.round() > self.round_context.round() {
-            // Handle future proposals
-            warn!(
-                "Got a future proposal for round {} in {}",
-                proposal.round(),
-                self.round_context.round()
-            );
-            self.round_context.queue_proposal(proposal, auth, batch);
-            return Ok(());
-        }
+        match proposal.round().cmp(&self.round_context.round()) {
+            std::cmp::Ordering::Less => {
+                // Ignore
+                warn!(
+                    "Got an old proposal for round {} in {}",
+                    proposal.round(),
+                    self.round_context.round()
+                );
+                return Ok(());
+            }
+            std::cmp::Ordering::Greater => {
+                // Handle future proposals
+                warn!(
+                    "Got a future proposal for round {} in {}",
+                    proposal.round(),
+                    self.round_context.round()
+                );
+                self.round_context.queue_proposal(proposal, auth, batch);
+                return Ok(());
+            }
+            _ => (),
+        };
         debug!("Got a proposal for the correct round");
 
         // Check if the parent is known
         let parent_hash = proposal.block().parent_hash();
         trace!("Querying parent hash: {:?}", parent_hash);
         let parent = self.chain_state.get_element(parent_hash).await?;
-        if let None = parent {
+        if parent.is_none() {
             warn!("Parent not found for prop: {:?}", proposal);
             // TODO: Handle unknown parent
             // NOTE: This should never trigger in our experimental settings
@@ -87,20 +91,20 @@ where
                 let res = proposal
                     .qc()
                     .as_ref()
-                    .and_then(|qc_vec| {
+                    .map(|qc_vec| {
                         if qc_vec[idx].unique_len() != qc_len {
-                            return Some(false);
+                            return false;
                         }
-                        if !qc_vec[idx]
+                        if qc_vec[idx]
                             .verify(&round_hash, &self.crypto_system.system)
-                            .is_ok()
+                            .is_err()
                         {
-                            return Some(false);
+                            return false;
                         }
-                        Some(true)
+                        true
                     })
-                    .expect("Invariant must hold; must be unwrappable");
-                if res == false {
+                    .unwrap_or(false);
+                if !res {
                     status = false;
                     break;
                 }
@@ -131,7 +135,7 @@ where
                 self.crypto_system
                     .system
                     .get(&leader)
-                    .ok_or(anyhow!("Unknown signer for proposal"))?,
+                    .ok_or_else(|| anyhow!("Unknown signer for proposal"))?,
             )?;
         }
 
@@ -189,22 +193,18 @@ where
         let prev_hash = self.chain_state.highest_hash();
         let block = Block::new(batch_hash.clone(), prev_hash);
         let qc = {
-            let end = self.chain_state
-                .highest_chain()
-                .proposal
-                .round();
-            let mut start = self.round_context
-                .round() - 1.into();
+            let end = self.chain_state.highest_chain().proposal.round();
+            let mut start = self.round_context.round() - 1.into();
             let mut qc_vec = Vec::new();
             while start > end {
                 qc_vec.push(
                     self.chain_state
                         .get_qc(&start)
-                        .expect("Expected qc for this round")
+                        .expect("Expected qc for this round"),
                 );
                 start = start - 1.into();
             }
-            if qc_vec.len() == 0 {
+            if qc_vec.is_empty() {
                 None
             } else {
                 Some(qc_vec)
@@ -222,9 +222,9 @@ where
             .chain_state
             .get_batch(batch_hash)
             .await?
-            .ok_or(anyhow!(
-                "Implementation Bug: Expected proposer to have his batch in his own DB"
-            ))?;
+            .ok_or_else(|| {
+                anyhow!("Implementation Bug: Expected proposer to have his batch in his own DB")
+            })?;
 
         let msg = ProtocolMsg::<Id, Tx, Round>::Propose {
             proposal: proposal.clone(),

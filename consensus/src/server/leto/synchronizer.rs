@@ -165,7 +165,7 @@ impl<Tx> Synchronizer<Tx> {
             warn!("Duplicate relay received from the same sender: {}", source);
             return Ok(());
         }
-        retry_map.insert(source.clone(), (proposal, auth, batch_hash.clone(), source));
+        retry_map.insert(source, (proposal, auth, batch_hash.clone(), source));
         // Send request for help
         self.inner_channel
             .send(SInMsg::RequestBatch(batch_hash, source))

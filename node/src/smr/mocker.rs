@@ -27,7 +27,7 @@ where
         client_id: Id,
         tx_size: usize,
     ) -> Self {
-        let data = Data::with_payload(&vec![0 as u8; tx_size]);
+        let data = Data::with_payload(&vec![0; tx_size]);
         let extra_data = ExtraData::new(tx_id, client_id);
         SimpleTx {
             data,

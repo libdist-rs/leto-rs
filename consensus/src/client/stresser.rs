@@ -1,6 +1,3 @@
-use std::marker::PhantomData;
-use std::time::Duration;
-
 use super::Settings;
 use crate::types::{self};
 use crate::{to_socket_address, Id};
@@ -15,6 +12,8 @@ use network::{
     plaintcp::{TcpReceiver, TcpSimpleSender},
     Acknowledgement,
 };
+use std::marker::PhantomData;
+use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
@@ -48,16 +47,16 @@ where
             let party = settings
                 .consensus_config
                 .get(id)
-                .ok_or(anyhow!("Unknown party [Possibly corrupt settings]"))?;
+                .ok_or_else(|| anyhow!("Unknown party [{}]", id))?;
             let consensus_addr = to_socket_address(&party.address, party.port)?;
-            peer_map.insert(id.clone(), consensus_addr);
+            peer_map.insert(*id, consensus_addr);
         }
         debug!("Using servers: {:?}", peer_map);
         let consensus_sender = TcpSimpleSender::<Id, Tx, Acknowledgement>::with_peers(peer_map);
 
         // Networking setup
         let (consensus_tx, consensus_rx) = unbounded_channel();
-        let my_addr = to_socket_address("0.0.0.0", settings.port)?;
+        let my_addr = to_socket_address("0.0.0.0", 0)?; // Random available port
         TcpReceiver::spawn(my_addr, Handler::<Tx>::new(consensus_tx));
 
         // Start the client
@@ -99,7 +98,7 @@ where
                     // Send `burst_tx` transactions every interval
                     for _i in 0..burst_tx {
                         let tx = Tx::mock_transaction(tx_id, self.id, tx_size);
-                        tx_id = tx_id + 1;
+                        tx_id += 1;
                         self.consensus_sender.broadcast(
                             tx,
                             &all_ids, // SendAll

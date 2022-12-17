@@ -12,26 +12,25 @@ from benchmark.remote import Bench, BenchError
 @task
 def local(ctx, debug=True):
     ''' Run benchmarks on localhost '''
+    node_params = {
+        'servers': 4,
+        'network_delay': 500, # in milliseconds (Optional)
+        'gc_depth': 50,  # rounds (Optional)
+        'sync_retry_nodes': 3,  # number of nodes (Optional)
+        'sync_retry_delay': 10_000,  # ms (Optional)
+        'batch_size': 500_000,  # bytes
+        'max_batch_delay': 200,  # ms
+        'tx_size': 512,
+    }
     bench_params = {
         'faults': 0,
-        'nodes': 4,
         'rate': 50_000,
-        'tx_size': 512,
+        'local': True, # (Optional)
         'duration': 20,
-        'protocol': 'dolphin'
-    }
-    node_params = {
-        'timeout': 1_000,  # ms
-        'header_size': 1_000,  # bytes
-        'max_header_delay': 200,  # ms
-        'gc_depth': 50,  # rounds
-        'sync_retry_delay': 10_000,  # ms
-        'sync_retry_nodes': 3,  # number of nodes
-        'batch_size': 500_000,  # bytes
-        'max_batch_delay': 200  # ms
+        'runs': 1, # (Optional)
     }
     try:
-        ret = LocalBench(bench_params, node_params).run(debug)
+        ret = LocalBench(node_params, bench_params).run(debug)
         print(ret.result())
     except BenchError as e:
         Print.error(e)

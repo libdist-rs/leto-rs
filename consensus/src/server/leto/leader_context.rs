@@ -23,9 +23,7 @@ impl LeaderContext {
 pub fn hash_to_seed<T>(hash: &Hash<T>) -> [u8; 32] {
     let seed_hash = hash.to_vec();
     let mut seed: [u8; 32] = [0u8; 32];
-    for i in 0..32 {
-        seed[i] = seed_hash[i];
-    }
+    seed[..32].copy_from_slice(&seed_hash);
     seed
 }
 
@@ -56,10 +54,10 @@ impl LeaderContext {
         self.elligible.remove(&self.current_leader);
 
         // Add current leader to the front of the history
-        self.history.push_front(self.current_leader.clone());
+        self.history.push_front(self.current_leader);
 
         // Update the next leader using randomness
-        self.next_leader = self.elligible.iter().choose(&mut self.rng).unwrap().clone();
+        self.next_leader = *self.elligible.iter().choose(&mut self.rng).unwrap();
     }
 }
 
@@ -79,7 +77,7 @@ impl LeaderContext {
             history.push_front(leader);
         }
 
-        let elligible = all_ids.into_iter().map(|id| id).collect();
+        let elligible = all_ids.into_iter().collect();
 
         let mut ctx = Self {
             rng: StdRng::from_seed(seed),

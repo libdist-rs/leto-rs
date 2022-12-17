@@ -1,0 +1,31 @@
+{
+  "consensus_config": {
+    "parties": {
+      "1": {
+        "id": 1,
+        "address": "127.0.0.1",
+        "port": 10003
+      },
+      "0": {
+        "id": 0,
+        "address": "127.0.0.1",
+        "port": 10001
+      },
+      "3": {
+        "id": 3,
+        "address": "127.0.0.1",
+        "port": 10007
+      },
+      "2": {
+        "id": 2,
+        "address": "127.0.0.1",
+        "port": 10005
+      }
+    }
+  },
+  "bench_config": {
+    "tx_size": 1024,
+    "burst_interval_ms": 50,
+    "txs_per_burst": 100
+  }
+}

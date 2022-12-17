@@ -105,21 +105,25 @@ where
                     !self.proposed => {
                     // Make a batch even if we have insufficient transactions
                     debug!("Proposing a batch");
-                    let batch = batch.ok_or(
+                    let batch = batch.ok_or_else(||
                         anyhow!("Failed to get a batch")
                     )?;
                     self.propose(batch)?;
                 },
                 tx = self.rx_incoming_tx.recv() => {
-                    let (tx, tx_size) = tx.ok_or(anyhow!(
-                        "Incoming transaction channel has closed for the batcher. Terminating."
-                    ))?;
+                    let (tx, tx_size) = tx.ok_or_else(||
+                        anyhow!(
+                            "Incoming transaction channel has closed for the batcher. Terminating."
+                        )
+                    )?;
                     trace!("Got a transaction: {:?}", tx);
                     self.pool.add_tx(tx, tx_size);
                 },
                 msg_from_consensus = self.rx_incoming_consensus.recv() => {
-                    let msg_from_consensus = msg_from_consensus.ok_or(
-                        anyhow!("Incoming msg channel has closed for the batcher. Terminating.")
+                    let msg_from_consensus = msg_from_consensus.ok_or_else(||
+                        anyhow!(
+                            "Incoming msg channel has closed for the batcher. Terminating."
+                        )
                     )?;
                     match msg_from_consensus {
                         BatcherConsensusMsg::NewRound { leader } => {

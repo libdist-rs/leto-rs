@@ -21,7 +21,7 @@ use signal_hook::{
 use std::io::BufReader;
 use std::{fs::File, io::BufRead, path::PathBuf, time::Duration};
 use tokio::sync::mpsc::unbounded_channel;
-const APP_NAME: &'static str = "LETO_NODE";
+const APP_NAME: &str = "LETO_NODE";
 const DEFAULT_LOG_LEVEL: Level = Level::Info;
 
 /*
@@ -61,9 +61,8 @@ fn default_logger(
 
 fn write_config_files(
     output_dir: PathBuf,
-    config: &CreateConfig,
     server_settings: &server::Settings,
-    client_settings: &Vec<client::Settings>,
+    client_settings: &client::Settings,
 ) -> Result<()> {
     let mut server_file = output_dir.clone();
     server_file.push("server.json");
@@ -75,39 +74,38 @@ fn write_config_files(
     );
 
     // Output client settings
-    for i in 0..config.num_client {
-        let mut client_file = output_dir.clone();
-        client_file.push(format!("client-{}.json", config.num_servers + i));
-        let client_file_name = client_file.display().to_string();
-        json_write(client_file, &client_settings[i])?;
-        info!(
-            "Wrote the client config file successfully to {}",
-            client_file_name
-        );
-    }
+    let mut client_file = output_dir;
+    client_file.push("client.json");
+    let client_file_name = client_file.display().to_string();
+    json_write(client_file, &client_settings)?;
+    info!(
+        "Wrote the client config file successfully to {}",
+        client_file_name
+    );
     Ok(())
 }
 
-fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<client::Settings>)> {
+fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::Settings)> {
     // Create mempool config
-    let mut mempool_config = mempool::Config::<Round>::default();
-    mempool_config.sync_retry_nodes = config.sync_retry_nodes;
-    mempool_config.gc_depth = config.gc_depth.into();
-    mempool_config.sync_retry_delay = Duration::from_millis(config.sync_retry_delay_ms);
+    let mempool_config = mempool::Config::<Round> {
+        sync_retry_nodes: config.sync_retry_nodes,
+        gc_depth: config.gc_depth.into(),
+        sync_retry_delay: Duration::from_millis(config.sync_retry_delay_ms),
+    };
 
     // Create consensus config
     let mut ips = config.ip.clone();
-    let mut ids = Vec::<Id>::with_capacity(config.num_servers);
+    let mut ids = Vec::<Id>::with_capacity(config.servers);
     let mut server_parties = FnvHashMap::default();
     let mut client_parties = FnvHashMap::default();
-    for i in 0..config.num_servers {
+    for i in 0..config.servers {
         ids.push(i.into());
     }
     if config.local {
-        while ips.len() < config.num_servers {
-            ips.push(format!("127.0.0.1"));
+        while ips.len() < config.servers {
+            ips.push("127.0.0.1".to_string());
         }
-    } else if ips.len() != config.num_servers {
+    } else if ips.len() != config.servers {
         if config.ip_file.is_none() {
             return Err(anyhow!("local: false, but ip file is not provided"));
         }
@@ -116,14 +114,14 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
         let buf_reader = BufReader::new(f);
         let mut reader = buf_reader.lines();
         while let Some(Ok(line)) = reader.next() {
-            let line = line.replace(" ", "");
+            let line = line.replace(' ', "");
             ips.push(line);
-            if ips.len() == config.num_servers {
+            if ips.len() == config.servers {
                 break;
             }
         }
     }
-    for i in 0..config.num_servers {
+    for i in 0..config.servers {
         let consensus_port = if config.local {
             config.consensus_port + i as u16
         } else {
@@ -134,10 +132,10 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
         } else {
             config.mempool_port
         };
-        let server_client_port = if config.local {
-            config.server_client_port + i as u16
+        let client_port = if config.local {
+            config.client_port + i as u16
         } else {
-            config.server_client_port
+            config.client_port
         };
         server_parties.insert(
             ids[i],
@@ -147,7 +145,7 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
                 consensus_port,
                 mempool_address: ips[i].clone(),
                 mempool_port,
-                client_port: server_client_port,
+                client_port: client_port + (i as u16),
             },
         );
         client_parties.insert(
@@ -155,7 +153,7 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
             client::Party {
                 id: ids[i],
                 address: ips[i].clone(),
-                port: server_client_port,
+                port: client_port + (i as u16),
             },
         );
     }
@@ -172,9 +170,9 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
 
     // Create Bench config
     let bench_config = BenchConfig {
-        batch_size: config.sealer_size,
-        batch_timeout: Duration::from_millis(config.timeout_ms),
-        delay_in_ms: config.delay_in_ms,
+        batch_size: config.batch_size,
+        batch_timeout: Duration::from_millis(config.max_batch_delay),
+        delay_in_ms: config.network_delay,
     };
 
     // Create server settings from this information
@@ -186,25 +184,16 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, Vec<clien
     };
 
     // Create client settings from this information
-    let mut client_settings = Vec::with_capacity(config.num_client);
-    for i in 0..config.num_client {
-        let client_port = if config.local {
-            config.client_port + i as u16
-        } else {
-            config.client_port
-        };
-        client_settings.push(client::Settings {
-            port: client_port,
-            bench_config: client::Bench {
-                burst_interval_ms: config.burst_interval_ms,
-                tx_size: config.tx_size,
-                txs_per_burst: config.txs_per_burst,
-            },
-            consensus_config: client::Config {
-                parties: client_parties.clone(),
-            },
-        });
-    }
+    let client_settings = client::Settings {
+        bench_config: client::Bench {
+            burst_interval_ms: config.burst_interval_ms,
+            tx_size: config.tx_size,
+            txs_per_burst: config.txs_per_burst,
+        },
+        consensus_config: client::Config {
+            parties: client_parties.clone(),
+        },
+    };
     Ok((server_settings, client_settings))
 }
 
@@ -223,12 +212,12 @@ fn create_keys(
     output: PathBuf,
 ) -> Result<()> {
     let key_configs = KeyConfig::generate(key_type.into(), num_servers)?;
-    for i in 0..num_servers {
+    for (i, key) in key_configs.iter().enumerate() {
         // Write the keys
         let mut file_name = output.clone();
         file_name.push(format!("keys-{}.json", i));
         let file_name_string = file_name.display().to_string();
-        json_write(file_name, &key_configs[i])?;
+        json_write(file_name, key)?;
         info!(
             "Successfully wrote key for node {} in {}",
             i, file_name_string
@@ -270,7 +259,7 @@ async fn main() -> Result<()> {
     let id_str = match &args.mode {
         SubCommand::Server { id, .. } => id.to_string(),
         SubCommand::Client { id, .. } => id.to_string(),
-        _ => format!("Other"),
+        _ => "Other".to_string(),
     };
 
     // Setup logging
@@ -295,7 +284,7 @@ async fn main() -> Result<()> {
             // Get the config file, or use a default config file
             let config_file = config
                 .to_str()
-                .ok_or(anyhow!("Unknown file: {}", config.display()))?
+                .ok_or_else(|| anyhow!("Unknown file: {}", config.display()))?
                 .to_string();
             info!("Using config file: {}", config_file);
 
@@ -336,7 +325,7 @@ async fn main() -> Result<()> {
             // Get the config file, or use a default config file
             let config_file = config
                 .to_str()
-                .ok_or(anyhow!(format!("Unknown file: {}", config.display())))?
+                .ok_or_else(|| anyhow!("Unknown file: {}", config.display()))?
                 .to_string();
             info!("Using config file: {}", config_file);
 
@@ -363,9 +352,9 @@ async fn main() -> Result<()> {
         }
         SubCommand::Config(config) => {
             let (server_settings, client_settings) = create_settings(&config)?;
-            if let Some(output_dir) = config.output.clone() {
+            if let Some(output_dir) = config.output {
                 // Output to files
-                write_config_files(output_dir, &config, &server_settings, &client_settings)?;
+                write_config_files(output_dir, &server_settings, &client_settings)?;
             } else {
                 // Print the settings
                 // Can be used as a dry-run to verify before writing the configs
