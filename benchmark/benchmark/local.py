@@ -25,7 +25,7 @@ class LocalBench:
 
     def _background_run(self, command, log_file):
         name = splitext(basename(log_file))[0]
-        cmd = f'{command} 2> {log_file}'
+        cmd = f'{command} &> {log_file}'
         subprocess.run(['tmux', 'new', '-d', '-s', name, cmd], check=True)
 
     def _kill_nodes(self):
@@ -44,7 +44,7 @@ class LocalBench:
 
         try:
             Print.info('Setting up testbed...')
-            nodes, rate = self.node_parameters.json['servers'], self.rate[0]
+            nodes, rate = self.node_parameters.servers, self.rate[0]
             clients = nodes
 
             # Cleanup all files.
@@ -71,51 +71,32 @@ class LocalBench:
             # Generate server config
             committee = LocalCommittee(nodes, self.BASE_PORT)
             cmd = CommandMaker.generate_server_config(
-                committee, 
                 self.node_parameters, 
                 self.bench_parameters
-            )
-            # TODO: Generate client config
-            exit(0)
-
-            # Run the clients (they will wait for the nodes to be ready).
-            rate_share = ceil(rate / clients)
-            for i, addresses in enumerate(workers_addresses):
-                for (id, address) in addresses:
-                    cmd = CommandMaker.run_client(
-                        address,
-                        self.tx_size,
-                        rate_share,
-                        [x for y in workers_addresses for _, x in y]
-                    )
-                    log_file = PathMaker.client_log_file(i, id)
-                    self._background_run(cmd, log_file)
+            ).split()
+            subprocess.run(cmd, check=True)
 
             # Run the primaries (except the faulty ones).
-            for i, address in enumerate(committee.primary_addresses(self.faults)):
-                cmd = CommandMaker.run_primary(
+            assert 3*self.bench_parameters.faults < self.node_parameters.servers
+            to_launch = self.node_parameters.servers - self.bench_parameters.faults
+            for i in range(to_launch):
+                cmd = CommandMaker.run_server(
                     PathMaker.key_file(i),
-                    PathMaker.committee_file(),
-                    PathMaker.db_path(i),
-                    PathMaker.parameters_file(),
+                    i,
+                    PathMaker.server_config_file(),
                     debug=debug
                 )
-                log_file = PathMaker.primary_log_file(i)
+                log_file = PathMaker.server_log_file(i)
                 self._background_run(cmd, log_file)
 
-            # Run the workers (except the faulty ones).
-            for i, addresses in enumerate(workers_addresses):
-                for (id, address) in addresses:
-                    cmd = CommandMaker.run_worker(
-                        PathMaker.key_file(i),
-                        PathMaker.committee_file(),
-                        PathMaker.db_path(i, id),
-                        PathMaker.parameters_file(),
-                        id,  # The worker's id.
-                        debug=debug
-                    )
-                    log_file = PathMaker.worker_log_file(i, id)
-                    self._background_run(cmd, log_file)
+            # Run the clients (they will wait for the nodes to be ready).
+            for i in range(to_launch):
+                cmd = CommandMaker.run_client(
+                    nodes + i,
+                    PathMaker.client_config_file(),
+                )
+                log_file = PathMaker.client_log_file(i)
+                self._background_run(cmd, log_file)
 
             # Wait for all transactions to be processed.
             Print.info(f'Running benchmark ({self.duration} sec)...')
@@ -124,7 +105,7 @@ class LocalBench:
 
             # Parse logs and return the parser.
             Print.info('Parsing logs...')
-            return LogParser.process(PathMaker.logs_path(), faults=self.faults)
+            # return LogParser.process(PathMaker.logs_path(), faults=self.faults)
 
         except (subprocess.SubprocessError, ParseError) as e:
             self._kill_nodes()

@@ -20,8 +20,12 @@ class PathMaker:
         return join('..', 'node')
 
     @staticmethod
-    def committee_file():
+    def server_config_file():
         return 'server.json'
+
+    @staticmethod
+    def client_config_file():
+        return 'client.json'
 
     @staticmethod
     def key_file(i):
@@ -38,15 +42,14 @@ class PathMaker:
         return 'logs'
 
     @staticmethod
-    def primary_log_file(i):
+    def server_log_file(i):
         assert isinstance(i, int) and i >= 0
-        return join(PathMaker.logs_path(), f'primary-{i}.log')
+        return join(PathMaker.logs_path(), f'server-{i}.log')
 
     @staticmethod
-    def client_log_file(i, j):
+    def client_log_file(i):
         assert isinstance(i, int) and i >= 0
-        assert isinstance(j, int) and i >= 0
-        return join(PathMaker.logs_path(), f'client-{i}-{j}.log')
+        return join(PathMaker.logs_path(), f'client-{i}.log')
 
     @staticmethod
     def results_path():

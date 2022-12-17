@@ -90,7 +90,7 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
     let mempool_config = mempool::Config::<Round> {
         sync_retry_nodes: config.sync_retry_nodes,
         gc_depth: config.gc_depth.into(),
-        sync_retry_delay: Duration::from_millis(config.sync_retry_delay_ms),
+        sync_retry_delay: Duration::from_millis(config.sync_retry_delay),
     };
 
     // Create consensus config
@@ -145,7 +145,7 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
                 consensus_port,
                 mempool_address: ips[i].clone(),
                 mempool_port,
-                client_port: client_port + (i as u16),
+                client_port,
             },
         );
         client_parties.insert(
@@ -153,7 +153,7 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
             client::Party {
                 id: ids[i],
                 address: ips[i].clone(),
-                port: client_port + (i as u16),
+                port: client_port,
             },
         );
     }
@@ -186,7 +186,7 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
     // Create client settings from this information
     let client_settings = client::Settings {
         bench_config: client::Bench {
-            burst_interval_ms: config.burst_interval_ms,
+            burst_interval_ms: config.burst_interval,
             tx_size: config.tx_size,
             txs_per_burst: config.txs_per_burst,
         },

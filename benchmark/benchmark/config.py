@@ -39,9 +39,9 @@ class Committee:
         self.node_names = OrderedDict()
         for name, host in addresses.items():
             primary_addr = {
-                'consensus_port': f'{host}:{consensus_port}',
-                'mempool_port': f'{host}:{mempool_port}',
-                'client_port': f'{host}:{client_port}'
+                'consensus': f'{host}:{consensus_port}',
+                'mempool': f'{host}:{mempool_port}',
+                'client': f'{host}:{client_port}'
             }
             consensus_port += 1
             mempool_port += 1
@@ -67,9 +67,9 @@ class Committee:
         ips = set()
         for name in names:
             addresses = self.node_names[name]
-            ips.add(self.ip(addresses['consensus_port']))
-            ips.add(self.ip(addresses['mempool_port']))
-            ips.add(self.ip(addresses['client_port']))
+            ips.add(self.ip(addresses['consensus']))
+            ips.add(self.ip(addresses['mempool']))
+            ips.add(self.ip(addresses['client']))
 
         return list(ips)
 
@@ -112,16 +112,26 @@ class NodeParameters:
         inputs = []
         try:
             inputs += [json['servers']]
-            if 'network_delay' in json:
-                inputs += [json['network_delay']]
-            if 'gc_depth' in json:
-                inputs += [json['gc_depth']]
-            if 'sync_retry_nodes' in json:
-                inputs += [json['sync_retry_nodes']]
-            if 'sync_retry_delay' in json:
-                inputs += [json['sync_retry_delay']]
+
+            if 'network_delay' not in json:
+                json['network_delay'] = 500
+            inputs += [json['network_delay']]
+
+            if 'gc_depth' not in json:
+                json['gc_depth'] = 50
+            inputs += [json['gc_depth']]
+
+            if 'sync_retry_nodes' not in json:
+                json['sync_retry_nodes'] = 3
+            inputs += [json['sync_retry_nodes']]
+
+            if 'sync_retry_delay' not in json:
+                json['sync_retry_delay'] = 10_000
+            inputs += [json['sync_retry_delay']]
+
             inputs += [json['batch_size']]
             inputs += [json['max_batch_delay']]
+            inputs += [json['tx_size']]
 
         except KeyError as e:
             raise ConfigError(f'Malformed parameters: missing key {e}')
@@ -129,7 +139,15 @@ class NodeParameters:
         if not all(isinstance(x, int) for x in inputs):
             raise ConfigError('Invalid parameters type')
 
-        self.json = json
+        self.servers = json['servers']
+        self.network_delay = json['network_delay']
+        self.gc_depth = json['gc_depth']
+        self.sync_retry_nodes = json['sync_retry_nodes']
+        self.sync_retry_delay = json['sync_retry_delay']
+        self.batch_size = json['batch_size']
+        self.max_batch_size = json['max_batch_delay']
+        self.tx_size = json['tx_size']
+        self.burst_interval = 50
 
 class BenchParameters:
     def __init__(self, json):

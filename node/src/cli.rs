@@ -81,7 +81,7 @@ pub struct CreateConfig {
     pub servers: usize,
 
     /// The delay parameter in ms (Delta)
-    #[arg(short = 'w', long = "delta")]
+    #[arg(short = 'w', long)]
     #[clap(default_value_t = 500)]
     pub network_delay: u64,
 
@@ -99,7 +99,7 @@ pub struct CreateConfig {
     #[arg(long)]
     #[clap(default_value_t = 1_000)]
     #[arg(short = 'd')]
-    pub sync_retry_delay_ms: u64,
+    pub sync_retry_delay: u64,
 
     /// List of ips [default: 127.0.0.1]
     #[arg(short, long)]
@@ -172,7 +172,7 @@ pub struct CreateConfig {
     /// Burst interval (in ms)
     #[arg(short = 'B', long)]
     #[clap(default_value_t = 50)]
-    pub burst_interval_ms: u64,
+    pub burst_interval: u64,
 
     /// Number of transactions in every burst
     #[arg(short = 'e', long)]
