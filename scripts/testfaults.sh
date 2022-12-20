@@ -14,7 +14,7 @@ rm -rf db-*.db
 echo "Starting $(($N-1)) servers"
 for((i=0;i<$((N-1));i++)); do
     # Start the server
-    cargo r -p node \
+    timeout 60 cargo r -p node \
         -- \
         -vvvv \
         server \
@@ -24,7 +24,7 @@ done
 
 sleep 1 
 echo "Starting the client" 
-cargo r -p node \
+timeout 55 cargo r -p node \
     -- \
     -v \
     client \

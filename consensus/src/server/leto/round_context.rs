@@ -174,7 +174,7 @@ where
         delay: Duration,
     ) -> Self {
         Self {
-            current_round: Round::MIN,
+            current_round: Round::MIN + 1,
             proposals_ready: FnvHashMap::default(),
             relay_ready: FnvHashMap::default(),
             blame_ready: FnvHashMap::default(),
