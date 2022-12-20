@@ -1,5 +1,4 @@
 use consensus::types::Transaction;
-use network::Message;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug, Display};
 
@@ -34,6 +33,4 @@ where
     }
 }
 
-impl<Data> Message for SimpleTx<Data> where Data: crate::Data {}
-impl<Data> mempool::Transaction for SimpleTx<Data> where Data: crate::Data {}
 impl<Data> Transaction for SimpleTx<Data> where Data: crate::Data {}

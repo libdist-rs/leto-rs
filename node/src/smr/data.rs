@@ -35,4 +35,3 @@ impl Display for SimpleData {
         write!(f, "{}", base64::encode(&self.tx))
     }
 }
-impl network::Message for SimpleData {}

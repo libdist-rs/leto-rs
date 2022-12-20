@@ -1,7 +1,7 @@
 use super::{ChainState, Leto};
 use crate::{
     types::{Element, Transaction},
-    Id, Round,
+    Id, Round, start_id,
 };
 use anyhow::{anyhow, Context, Result};
 use crypto::hash::Hash;
@@ -65,7 +65,7 @@ impl<Tx> CommitContext<Tx> {
         chain_state.genesis_setup().await?;
 
         // Genesis constants
-        let genesis_element = Arc::new(Element::<Id, Tx, Round>::genesis(0.into(), 0.into()));
+        let genesis_element = Arc::new(Element::<Id, Tx, Round>::genesis(start_id()));
         let genesis_element_hash = Hash::ser_and_hash(genesis_element.as_ref());
 
         // Commit Length

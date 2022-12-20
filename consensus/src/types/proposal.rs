@@ -1,5 +1,4 @@
 use super::{Block, Certificate};
-use network::Message;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -36,12 +35,4 @@ impl<Id, Tx, Round> Proposal<Id, Tx, Round> {
     pub fn block(&self) -> &Block<Id, Tx, Round> {
         &self.block
     }
-}
-
-impl<Id, Tx, Round> Message for Proposal<Id, Tx, Round>
-where
-    Tx: super::Transaction,
-    Round: Message,
-    Id: network::Identifier,
-{
 }

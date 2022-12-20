@@ -10,7 +10,7 @@ use anyhow::Result;
 use fnv::FnvHashMap;
 use log::*;
 use mempool::{Batch, BatchHash};
-use network::plaintcp::CancelHandler;
+use network::{plaintcp::CancelHandler, Acknowledgement};
 use tokio::time::{interval, Interval};
 
 type PropMsg<Id, Tx, Round> = (
@@ -52,7 +52,7 @@ pub struct RoundContext<Tx> {
 
     /// A collection of cancel handlers for messages which are undergoing
     /// transmission
-    pub(crate) cancel_handlers: FnvHashMap<Round, Vec<CancelHandler>>,
+    pub(crate) cancel_handlers: FnvHashMap<Round, Vec<CancelHandler<Acknowledgement>>>,
 
     /// The timeout for the current round
     pub(crate) timer: Interval,
@@ -78,16 +78,13 @@ fn gc_cancel_handlers(
     current_round: Round,
     num_nodes: usize,
 ) -> bool {
-    let round2: Round = 2.into();
-    let n: Round = num_nodes.into();
-
     // current round < 2n; retain
-    if current_round <= round2 * n {
+    if current_round <= 2 * num_nodes as u64 {
         return true;
     }
 
     // If we are in round 2n+1 and handler is from round 0 then delete
-    handler_round > current_round - (round2 * n)
+    handler_round > current_round - (2 * num_nodes as u64)
 }
 
 impl<Tx> Leto<Tx>
@@ -177,7 +174,7 @@ where
         delay: Duration,
     ) -> Self {
         Self {
-            current_round: Round::START,
+            current_round: Round::MIN,
             proposals_ready: FnvHashMap::default(),
             relay_ready: FnvHashMap::default(),
             blame_ready: FnvHashMap::default(),
@@ -196,7 +193,7 @@ where
     }
 
     pub fn advance_round(&mut self) {
-        self.current_round += 1.into();
+        self.current_round += 1;
 
         // GC too old cancel handlers
         self.cancel_handlers

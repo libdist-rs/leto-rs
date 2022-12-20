@@ -38,7 +38,11 @@ pub struct Synchronizer<Tx> {
     inner_channel: UnboundedSender<SInMsg<Tx>>,
 
     /// Track the relay messages for which we are waiting
-    relay_waiting: FnvHashMap<BatchHash<Tx>, FnvHashMap<Id, RelayMsg<Id, Tx, Round>>>,
+    #[allow(clippy::type_complexity)]
+    relay_waiting: FnvHashMap<
+        BatchHash<Tx>, 
+        FnvHashMap<Id, RelayMsg<Id, Tx, Round>>
+    >,
 }
 
 impl<Tx> Synchronizer<Tx> {

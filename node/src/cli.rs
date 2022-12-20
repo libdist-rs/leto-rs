@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use clap::{ArgGroup, Parser, ValueEnum};
 use consensus::Id;
 use crypto::Algorithm;
@@ -47,7 +48,7 @@ pub enum SubCommand {
         /// Config file (See examples/client-4.json for
         /// examples)
         #[arg(short, long, value_name = "FILE")]
-        #[clap(default_value = "examples/client-4.json")]
+        #[clap(default_value = "examples/client.json")]
         config: PathBuf,
     },
     /// Generate keypairs for all the servers
@@ -187,8 +188,10 @@ pub enum SealerType {
     Hybrid,
 }
 
-fn str_to_id_parser(id_str: &str) -> Result<Id, String> {
-    Id::try_from(id_str).map_err(|e| e.to_string())
+fn str_to_id_parser(id_str: &str) -> Result<Id> {
+    Id::from_str_radix(id_str, 10)
+        .map_err(anyhow::Error::new)
+        .context("Error parsing ID string (Must be a decimal number)")
 }
 
 #[derive(Debug, ValueEnum, Clone)]

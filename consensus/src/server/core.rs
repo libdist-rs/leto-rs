@@ -21,8 +21,7 @@ pub fn get_mempool_peers(
     settings: &Settings,
 ) -> Result<FnvHashMap<Id, SocketAddr>> {
     let mut map = FnvHashMap::default();
-    for i in 0..settings.committee_config.num_nodes() {
-        let id: Id = i.into();
+    for id in 0..settings.committee_config.num_nodes() {
         if id != my_id {
             let party = settings
                 .committee_config
@@ -41,8 +40,7 @@ pub fn get_consensus_peers(
     settings: &Settings,
 ) -> Result<FnvHashMap<Id, SocketAddr>> {
     let mut map = FnvHashMap::default();
-    for i in 0..settings.committee_config.num_nodes() {
-        let id: Id = i.into();
+    for id in 0..settings.committee_config.num_nodes() {
         if id != my_id {
             let party = settings
                 .committee_config

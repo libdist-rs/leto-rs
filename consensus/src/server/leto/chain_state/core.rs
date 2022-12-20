@@ -1,6 +1,6 @@
 use crate::{
     types::{Certificate, Element, Proposal, Signature, Transaction},
-    Id, Round,
+    Id, Round, start_id,
 };
 use anyhow::{Context, Result};
 use crypto::hash::Hash;
@@ -41,7 +41,7 @@ where
 {
     /// Returns the chainstate using the genesis block
     pub fn new(store: Storage) -> Self {
-        let genesis_element = Element::genesis(0.into(), 0.into());
+        let genesis_element = Element::genesis(start_id());
         let genesis_hash = Hash::ser_and_hash(&genesis_element);
         Self {
             highest_chain_hash: genesis_hash,

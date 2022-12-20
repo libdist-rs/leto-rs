@@ -89,7 +89,7 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
     // Create mempool config
     let mempool_config = mempool::Config::<Round> {
         sync_retry_nodes: config.sync_retry_nodes,
-        gc_depth: config.gc_depth.into(),
+        gc_depth: config.gc_depth as Round,
         sync_retry_delay: Duration::from_millis(config.sync_retry_delay),
     };
 
@@ -99,7 +99,7 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
     let mut server_parties = FnvHashMap::default();
     let mut client_parties = FnvHashMap::default();
     for i in 0..config.servers {
-        ids.push(i.into());
+        ids.push(i);
     }
     if config.local {
         while ips.len() < config.servers {

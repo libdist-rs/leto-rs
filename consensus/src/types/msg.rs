@@ -1,7 +1,6 @@
 use super::{Certificate, Proposal, Request, Response, Signature};
 use crypto::hash::Hash;
 use mempool::{Batch, BatchHash};
-use network::Identifier;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -34,19 +33,9 @@ pub enum ProtocolMsg<Id, Tx, Round> {
     },
 }
 
-impl<Id, Tx, Round> network::Message for ProtocolMsg<Id, Tx, Round>
-where
-    Id: Identifier,
-    Tx: super::Transaction,
-    Round: network::Message + mempool::Round,
-{
-}
-
 /// `ClientMsg` are messages sent between the client and the servers
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ClientMsg<Tx> {
     NewTx(Tx),
     Confirmation(Hash<Tx>),
 }
-
-impl<Tx> network::Message for ClientMsg<Tx> where Tx: super::Transaction {}

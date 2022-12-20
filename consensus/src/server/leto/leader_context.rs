@@ -1,4 +1,4 @@
-use crate::{Id, Round};
+use crate::{Id, Round, start_id};
 use crypto::hash::Hash;
 use fnv::FnvHashSet;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
@@ -41,7 +41,7 @@ impl LeaderContext {
     /// Update the round
     pub fn advance_round(&mut self) {
         // Update the round
-        self.current_round += 1.into();
+        self.current_round += 1;
 
         // Update the current leader
         self.current_leader = self.next_leader;
@@ -81,15 +81,15 @@ impl LeaderContext {
 
         let mut ctx = Self {
             rng: StdRng::from_seed(seed),
-            current_leader: Id::START,
-            current_round: Round::START,
+            current_leader: start_id(),
+            current_round: Round::MIN,
             elligible,
             history,
-            next_leader: Id::START,
+            next_leader: start_id(),
         };
 
         ctx.advance_round();
-        ctx.current_round = Round::START;
+        ctx.current_round = Round::MIN;
         ctx
     }
 }
@@ -98,7 +98,7 @@ impl LeaderContext {
 fn test_leader_ctx() {
     let (n, f) = (34usize, 10);
 
-    let ids: Vec<Id> = (1..n).into_iter().map(|i| i.into()).collect();
+    let ids: Vec<Id> = (1..n).into_iter().collect();
     let mut ctx = LeaderContext::new(ids.clone(), 10);
     let mut ctx2 = LeaderContext::new(ids, 10);
     ctx.advance_round();

@@ -4,6 +4,7 @@ use std::time::Duration;
 use crate::server::{
     get_consensus_peers, BatcherConsensusMsg, Handler, Parameters, RRBatcher, Settings,
 };
+use crate::{start_id};
 use crate::{
     to_socket_address,
     types::{self, ProtocolMsg},
@@ -82,8 +83,8 @@ pub struct Leto<Tx> {
 }
 
 impl<Tx> Leto<Tx> {
-    pub const INITIAL_LEADER: Id = Id::START;
-    pub const INITIAL_ROUND: Round = Round::START;
+    pub const INITIAL_LEADER: Id = start_id();
+    pub const INITIAL_ROUND: Round = Round::MIN;
 }
 
 impl<Tx> Leto<Tx>

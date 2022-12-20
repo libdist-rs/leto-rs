@@ -25,8 +25,7 @@ impl KeyConfig {
         let mut sks = FnvHashMap::default();
         let mut system = FnvHashMap::default();
         let mut configs = Vec::with_capacity(num_nodes);
-        for i in 0..num_nodes {
-            let id: Id = i.into();
+        for id in 0..num_nodes {
             let kpair = match alg {
                 Algorithm::RSA => {
                     #[cfg(feature = "RSA")]
@@ -41,8 +40,7 @@ impl KeyConfig {
             sks.insert(id, sk);
             system.insert(id, pk);
         }
-        for i in 0..num_nodes {
-            let id: Id = i.into();
+        for id in 0..num_nodes {
             configs.push(Self {
                 alg: alg.clone(),
                 secret: sks.remove(&id).unwrap(),
@@ -152,9 +150,7 @@ fn test_codec() -> anyhow::Result<()> {
     let mut secp_sks = FnvHashMap::default();
     let mut secp_system = FnvHashMap::default();
 
-    for i in 0..num_nodes {
-        let id: Id = i.into();
-
+    for id in 0..num_nodes {
         // Ed
         let ed_kpair = Keypair::generate_ed25519()?;
         let (ed_sk, ed_pk) = (ed_kpair.private(), ed_kpair.public());
@@ -168,8 +164,7 @@ fn test_codec() -> anyhow::Result<()> {
         secp_sks.insert(id, secp_sk);
     }
 
-    for i in 0..num_nodes {
-        let id: Id = i.into();
+    for id in 0..num_nodes {
         let ed_config = KeyConfig {
             alg: alg1.clone(),
             secret: ed_sks[&id].clone(),

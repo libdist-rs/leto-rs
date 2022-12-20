@@ -74,7 +74,7 @@ where
         }
         let parent = parent.unwrap();
         let is_proposal_valid = {
-            let mut start = parent.proposal.round() + 1.into();
+            let mut start = parent.proposal.round() + 1;
             let mut idx = 0usize;
             let mut status = true;
             let qc_len = (self.settings.committee_config.num_nodes()
@@ -112,7 +112,7 @@ where
                     status = false;
                     break;
                 }
-                start += 1.into();
+                start += 1;
                 idx += 1;
             }
             status
@@ -194,7 +194,7 @@ where
         let block = Block::new(batch_hash.clone(), prev_hash);
         let qc = {
             let end = self.chain_state.highest_chain().proposal.round();
-            let mut start = self.round_context.round() - 1.into();
+            let mut start = self.round_context.round() - 1;
             let mut qc_vec = Vec::new();
             while start > end {
                 qc_vec.push(
@@ -202,7 +202,7 @@ where
                         .get_qc(&start)
                         .expect("Expected qc for this round"),
                 );
-                start = start - 1.into();
+                start -= 1;
             }
             if qc_vec.is_empty() {
                 None

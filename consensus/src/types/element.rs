@@ -1,5 +1,4 @@
 use std::marker::PhantomData;
-
 use super::{Block, Proposal, Signature};
 use crypto::hash::Hash;
 use mempool::Batch;
@@ -28,20 +27,21 @@ impl<Id, Tx, Round> Element<Id, Tx, Round> {
         }
     }
 
-    pub fn genesis(
-        genesis_round: Round,
-        genesis_id: Id,
-    ) -> Self {
+    pub fn genesis(initial_leader: Id) -> Self 
+    where 
+        Round: mempool::Round,
+        Id: network::Identifier,
+    {
         // let
         Self {
             proposal: Proposal {
                 block: Block::new(Hash::EMPTY_HASH, Hash::EMPTY_HASH),
                 qc: None,
-                round: genesis_round,
+                round: Round::MIN,
             },
             auth: Signature {
                 raw: Vec::new(),
-                id: genesis_id,
+                id: initial_leader,
                 _x: PhantomData,
             },
             batch: Batch {
