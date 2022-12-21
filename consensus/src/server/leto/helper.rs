@@ -60,7 +60,7 @@ impl<Tx> Helper<Tx> {
                     match help {
                         HelperRequest::BatchRequest(source, req) => {
                             let req_hash = req.request_hash().clone();
-                            match self.handle_request(source, req).await {
+                            match self.handle_request(req).await {
                                 Ok(Some(batch)) => {
                                     let response_msg = ProtocolMsg::BatchResponse{
                                         response: Response::new(
@@ -77,7 +77,7 @@ impl<Tx> Helper<Tx> {
                         },
                         HelperRequest::ElementRequest(source, req) => {
                             let req_hash = req.request_hash().clone();
-                            match self.handle_request(source, req).await {
+                            match self.handle_request(req).await {
                                 Ok(Some(element)) => {
                                     let response_msg = ProtocolMsg::ElementResponse{
                                         response: Response::new(
@@ -102,14 +102,12 @@ impl<Tx> Helper<Tx> {
 
     async fn handle_request<T>(
         &mut self, 
-        source: Id, 
         req: Request<T>,
     ) -> Result<Option<T>> 
     where 
         T: DeserializeOwned,
     {
         let req_hash = req.request_hash().clone();
-        let key = req_hash.to_vec();
         self.db
             .read(req_hash)
             .await

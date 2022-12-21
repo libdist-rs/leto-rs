@@ -27,6 +27,7 @@ pub struct SyncHelper<Tx> {
     /// Pending batches
     pending_relays: FnvHashMap<(Round, Id), FnvHashSet<BatchHash<Tx>>>,
     /// Pending chain delivery
+    #[allow(clippy::type_complexity)]
     pending_elements: FnvHashMap<(Round, Id), FnvHashSet<Hash<Element<Id, Tx, Round>>>>,
 }
 
@@ -182,7 +183,7 @@ where
                         Ok(msg) => {
                             // TODO: Clear waiting
                             // self.pending_relays
-                                // .entry((self.current_round, ));
+                            //     .entry((self.current_round, ));
 
                             self.tx_outer.send(msg)
                                 .context("Failed to notify read")

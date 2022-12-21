@@ -1,6 +1,5 @@
-use super::Leto;
 use crate::{
-    server::BatcherConsensusMsg as BCM,
+    server::{BatcherConsensusMsg as BCM,Leto},
     types::{self, Block, Proposal, ProtocolMsg, Signature},
     Id, Round,
 };
@@ -21,59 +20,25 @@ where
         proposal: Proposal<Id, Tx, Round>,
         auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch: Batch<Tx>,
-        sender: Id,
     ) -> Result<()>
     where
         Tx: types::Transaction,
     {
-        debug!("Got a proposal: {:?}", proposal);
-        debug!("Proposal has sig: {:?}", auth);
+        debug!(
+            "Got a proposal: {:?} in round {}", 
+            proposal, 
+            self.round_context.round(),
+        );
 
-        // Check if this proposal is for the correct round
-        match proposal.round().cmp(&self.round_context.round()) {
-            std::cmp::Ordering::Less => {
-                // Ignore
-                warn!(
-                    "Got an old proposal for round {} in {}",
-                    proposal.round(),
-                    self.round_context.round()
-                );
-                return Ok(());
-            }
-            std::cmp::Ordering::Greater => {
-                // Handle future proposals
-                warn!(
-                    "Got a future proposal for round {} in {}",
-                    proposal.round(),
-                    self.round_context.round()
-                );
-                self.round_context.queue_proposal(proposal, auth, batch, sender);
-                return Ok(());
-            }
-            _ => (),
-        };
-        debug!("Got a proposal for the correct round");
-
-        // Check if the parent is known
+        // Get parent
         let parent_hash = proposal.block().parent_hash();
         trace!("Querying parent hash: {:?}", parent_hash);
-        let parent = self.chain_state.get_element(parent_hash).await?;
-        if parent.is_none() {
-            warn!("Parent not found for prop: {:?}", proposal);
-            // TODO: Handle unknown parent
-            // NOTE: This should never trigger in our experimental settings
-            // self
-            //    .tx_consensus_to_mem
-            //    .send(
-            //         ConsensusMempoolMsg::UnknownBatch(
-            //             self.my_id,
-            //             vec![parent_hash]
-            //         )
-            //     );
-            // TODO: For now, return
-            unreachable!("This case should never occur in our experiments");
-        }
-        let parent = parent.unwrap();
+        let parent = self.chain_state
+            .get_element(parent_hash)
+            .await?
+            .unwrap();
+        
+        // Check proposal validity
         let is_proposal_valid = {
             let mut start = parent.proposal.round() + 1;
             let mut idx = 0usize;
@@ -240,13 +205,10 @@ where
             .broadcast(&self.broadcast_peers, msg.clone())
             .await;
         self.round_context
-            .cancel_handlers
-            .entry(self.round_context.round())
-            .or_insert_with(Vec::new)
-            .extend(handlers);
+            .add_handlers(handlers);
 
         // Loopback
-        if let Err(e) = self.handle_proposal(proposal, auth, batch, self.my_id).await {
+        if let Err(e) = self.handle_proposal(proposal, auth, batch).await {
             error!("Error handling my own proposal: {}", e);
         }
 

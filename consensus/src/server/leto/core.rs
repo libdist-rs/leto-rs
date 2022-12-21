@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
-use crate::server::{Settings, BatcherConsensusMsg, Handler, Parameters, RRBatcher};
+use crate::server::{Settings, BatcherConsensusMsg, Handler, Parameters, RRBatcher, Event};
 use crate::start_id;
 use crate::types::Transaction;
 use crate::{
@@ -122,7 +122,6 @@ where
         Helper::<Tx>::spawn(store.clone(), rx_helper, consensus_peers.clone());
 
         // Start the synchronizer
-        // let (tx_from_sync, rx_from_sync) = unbounded_channel();
         let synchronizer =
             Synchronizer::<Tx>::new(
                 store.clone(), 
@@ -200,7 +199,7 @@ where
         self.chain_state.genesis_setup().await?;
 
         // Reset the timer
-        self.round_context.timer.reset();
+        self.round_context.init();
 
         // Start the protocol loop
         loop {
@@ -222,18 +221,44 @@ where
                         error!("Error handling new batch: {}", e);
                     }
                 }
+                // Receive delivery synchronized messages
+                // Forward to round synchronizer
+                sync_help = &mut self.synchronizer.next() => {
+                    let synced_msg = sync_help.ok_or_else(||
+                        anyhow!("Synchronizer channel closed")
+                    )?;
+                    if let Err(e) = self.round_context.sync(synced_msg) {
+                        error!("Error handling a synced message: {}", e);
+                    }
+                }
+                // Receive round synchronized and delivery synchronized messages
+                // Forward to generic msg handler which will forward to the corresponding handler
+                rnd_help = &mut self.round_context.next() => {
+                    let synced_msg = rnd_help.ok_or_else(||
+                        anyhow!("Round context error")
+                    )?;
+                    let res = match synced_msg {
+                        Event::Timeout => self.on_round_timeout().await,
+                        Event::Msg(m) => self.handle_msg(m).await,
+                    };
+                    if let Err(e) = res {
+                        error!("Error handling a round synced message: {}", e);
+                    }
+                }
                 // Receive consensus messages from loopback
-                // Loopback messages are always synchronized
+                // Loopback messages are always delivery synchronized 
+                // Hence, forward them to the round synchronizer
                 msg = self.rx_msg_loopback.recv() => {
                     let msg = msg.ok_or_else(||
                         anyhow!("Loopback layer has closed")
                     )?;
                     info!("Got a consensus message from loopback: {:?}", msg);
-                    if let Err(e) = self.handle_msg(msg).await {
+                    if let Err(e) = self.round_context.sync(msg) {
                         error!("Error handling consensus message from loopback: {}", e);
                     }
                 }
                 // Receive consensus messages from others
+                // Forward to Delivery synchronizer
                 msg = self.rx_net_to_consensus.recv() => {
                     let msg = msg.ok_or_else(||
                         anyhow!("Networking layer has closed")
@@ -241,24 +266,6 @@ where
                     info!("Got a consensus message from the network: {:?}", msg);
                     if let Err(e) = self.synchronizer.sync_msg(msg).await {
                         error!("Error handling consensus message: {}", e);
-                    }
-                }
-                // If we timeout for a round
-                _ = self.round_context.timer.tick(), 
-                if self.round_context.timer_enabled => 
-                {
-                    warn!("Round {} timing out", self.round_context.round());
-                    if let Err(e) = self.on_round_timeout().await {
-                        error!("Error handling round timeout: {}", e);
-                    }
-                }
-                // Receive synchronized messages
-                sync_help = &mut self.synchronizer.next() => {
-                    let synced_msg = sync_help.ok_or_else(||
-                        anyhow!("Synchronizer channel closed")
-                    )?;
-                    if let Err(e) = self.handle_msg(synced_msg).await {
-                        error!("Error handling a synced message: {}", e);
                     }
                 }
             };
@@ -272,19 +279,19 @@ where
         &mut self,
         msg: ProtocolMsg<Id, Tx, Round>,
     ) -> Result<()> {
+        debug!(
+            "RD: Got msg {:?} in round {}",
+            msg,
+            self.round_context.round(),
+        );
+
         match msg {
             ProtocolMsg::Propose {
                 proposal,
                 auth,
                 batch,
-                sender,
-            } => self.handle_proposal(proposal, auth, batch, sender).await,
-            ProtocolMsg::Relay {
-                proposal,
-                auth,
-                batch_hash,
-                sender,
-            } => self.handle_relay(proposal, auth, batch_hash, sender).await,
+                ..
+            } => self.handle_proposal(proposal, auth, batch).await,
             ProtocolMsg::Blame { 
                 round, 
                 auth 
@@ -294,6 +301,7 @@ where
                 qc 
             } => self.on_blame_qc(round, qc).await,
             // We should never see the other messages
+            ProtocolMsg::Relay {..} => unreachable!(),
             ProtocolMsg::BatchRequest {..} => unreachable!(),
             ProtocolMsg::BatchResponse {..} => unreachable!(),
             ProtocolMsg::ElementRequest {..} => unreachable!(),

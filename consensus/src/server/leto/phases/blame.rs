@@ -1,7 +1,6 @@
-use super::Leto;
 use crate::{
     types::{Certificate, ProtocolMsg, Signature, Transaction},
-    Id, Round,
+    Id, Round, server::Leto,
 };
 use anyhow::{anyhow, Result};
 use crypto::hash::Hash;
@@ -29,11 +28,8 @@ impl<Tx> Leto<Tx> {
             .consensus_net
             .broadcast(&self.broadcast_peers, pmsg.clone())
             .await;
-        self.round_context
-            .cancel_handlers
-            .entry(self.round_context.round())
-            .or_insert_with(Vec::new)
-            .extend(handlers);
+        self.round_context.add_handlers(handlers);
+
         // Loopback
         self.tx_msg_loopback
             .send(pmsg)
@@ -57,17 +53,6 @@ impl<Tx> Leto<Tx> {
         Tx: Transaction,
     {
         debug!("Got a blame message for round {}: {}", blame_round, auth);
-
-        // Filter for rounds
-        if blame_round < self.round_context.round() {
-            warn!("Got a blame for older rounds");
-            return Ok(());
-        }
-        if blame_round > self.round_context.round() {
-            self.round_context.queue_blame(blame_round, auth)?;
-            return Ok(());
-        }
-        debug!("Got a blame for the correct round");
 
         // Handle the case where we received a proposal for the current round and a
         // blame We will prefer the proposal over the blame
@@ -111,6 +96,7 @@ impl<Tx> Leto<Tx> {
         for (_, auth) in blame_map {
             qc.add(auth);
         }
+
         // By-pass checks
         self.handle_blame_qc(blame_round, qc).await
     }
@@ -129,18 +115,6 @@ impl<Tx> Leto<Tx> {
         Tx: Transaction,
     {
         debug!("Got a blame QC message for round {}: {:?}", blame_round, qc);
-
-        // Filter for the rounds
-        if blame_round < self.round_context.round() {
-            warn!("Got a blame QC for older rounds");
-            return Ok(());
-        }
-        // Re-schedule for future rounds
-        if blame_round > self.round_context.round() {
-            self.round_context.queue_blame_qc(blame_round, qc)?;
-            return Ok(());
-        }
-        debug!("Got a blame QC for the correct round");
 
         // Filter re-entry
         if self.round_context.got_qc {
@@ -180,11 +154,7 @@ impl<Tx> Leto<Tx> {
             .consensus_net
             .broadcast(&self.broadcast_peers, pmsg)
             .await;
-        self.round_context
-            .cancel_handlers
-            .entry(blame_round)
-            .or_default()
-            .extend(cancel_handlers);
+        self.round_context.add_handlers(cancel_handlers);
 
         // Update chain state
         self.chain_state.add_qc(blame_round, qc);
