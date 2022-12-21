@@ -2,7 +2,7 @@ use crate::{
     types::{Certificate, Element, Proposal, Signature, Transaction},
     Id, Round, start_id,
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crypto::hash::Hash;
 use fnv::FnvHashMap;
 use mempool::{Batch, BatchHash};
@@ -10,8 +10,10 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::{fmt, sync::Arc};
 use storage::rocksdb::Storage;
 
+use super::ChainDB;
+
 pub struct ChainState<Tx> {
-    pub(super) store: Storage,
+    pub(super) db: ChainDB,
     pub(super) highest_chain_hash: Hash<Element<Id, Tx, Round>>,
     pub(super) highest_chain_element: Arc<Element<Id, Tx, Round>>,
     pub(super) qc_map: FnvHashMap<Round, Certificate<Id, Round>>,
@@ -24,20 +26,17 @@ where
     pub async fn get_batch(
         &mut self,
         batch_hash: BatchHash<Tx>,
-    ) -> Result<Option<Batch<Tx>>> {
-        match self.store.read(batch_hash.to_vec()).await? {
-            Some(serialized) => bincode::deserialize::<Batch<Tx>>(&serialized)
-                .map_err(anyhow::Error::new)
-                .map(Some)
-                .context("Failed to deserialize batch"),
-            None => Ok(None),
-        }
+    ) -> Result<Option<Batch<Tx>>> 
+    where 
+        Tx: Transaction,
+    {
+        self.db.read(batch_hash).await
     }
 }
 
 impl<Tx> ChainState<Tx>
 where
-    Tx: Serialize,
+    Tx: Transaction,
 {
     /// Returns the chainstate using the genesis block
     pub fn new(store: Storage) -> Self {
@@ -46,7 +45,7 @@ where
         Self {
             highest_chain_hash: genesis_hash,
             highest_chain_element: Arc::new(genesis_element),
-            store,
+            db: ChainDB::new(store),
             qc_map: FnvHashMap::default(),
         }
     }
@@ -58,8 +57,6 @@ where
         auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch: Batch<Tx>,
     ) -> Result<()>
-    where
-        Tx: Transaction,
     {
         // Write chain element to the disk
         let chain_element = Arc::new(Element::new(prop, auth, batch));
@@ -76,9 +73,7 @@ where
         &mut self,
         blame_round: Round,
         qc: Certificate<Id, Round>,
-    ) where
-        Tx: Transaction,
-    {
+    ) {
         self.qc_map.insert(blame_round, qc);
     }
 
@@ -93,23 +88,8 @@ where
         &mut self,
         chain_element: Arc<Element<Id, Tx, Round>>,
     ) -> Result<()> {
-        // Index chain element hash -> chain_element (used in blocks in the prev_hash
-        // field)
-        let chain_element_serialized = bincode::serialize(chain_element.as_ref())?;
-        let chain_element_hash = Hash::<Element<Id, Tx, Round>>::do_hash(&chain_element_serialized);
-        self.store
-            .write(chain_element_hash.to_vec(), chain_element_serialized)
-            .await;
-
-        // Index batch_hash -> Batch (used when relay messages are received)
-        let batch_serialized = bincode::serialize(&chain_element.batch)?;
-        let batch_hash = Hash::<Batch<Tx>>::do_hash(&batch_serialized);
-        self.store
-            .write(batch_hash.to_vec(), batch_serialized)
-            .await;
-
-        // Done
-        Ok(())
+        let element: Element<Id, Tx, Round> = chain_element.as_ref().clone();
+        self.db.write::<Element<Id, Tx, Round>>(element).await
     }
 }
 
@@ -122,14 +102,12 @@ where
         Tx: Transaction,
     {
         // Write the genesis elements
-        let serialized = bincode::serialize(self.highest_chain_element.as_ref())?;
         self.write_element(self.highest_chain_element.clone())
             .await?;
-        let res = self
-            .store
-            .notify_read(self.highest_chain_hash.to_vec())
+        self
+            .db
+            .notify_read(self.highest_chain_hash.clone())
             .await?;
-        assert_eq!(res, serialized);
         Ok(())
     }
 }

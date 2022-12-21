@@ -1,4 +1,4 @@
-use super::{Certificate, Proposal, Request, Response, Signature};
+use super::{Certificate, Proposal, Request, Response, Signature, Element};
 use crypto::hash::Hash;
 use mempool::{Batch, BatchHash};
 use serde::{Deserialize, Serialize};
@@ -9,6 +9,7 @@ pub enum ProtocolMsg<Id, Tx, Round> {
         proposal: Proposal<Id, Tx, Round>,
         auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch: Batch<Tx>,
+        sender: Id,
     },
     Relay {
         proposal: Proposal<Id, Tx, Round>,
@@ -24,12 +25,20 @@ pub enum ProtocolMsg<Id, Tx, Round> {
         round: Round,
         qc: Certificate<Id, Round>,
     },
+    // Request-response messages
     BatchRequest {
         source: Id,
         request: Request<Batch<Tx>>,
     },
     BatchResponse {
         response: Response<Batch<Tx>>,
+    },
+    ElementRequest {
+        source: Id,
+        request: Request<Element<Id, Tx, Round>>,
+    },
+    ElementResponse {
+        response: Response<Element<Id, Tx, Round>>,
     },
 }
 

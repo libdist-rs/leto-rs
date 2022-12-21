@@ -1,9 +1,9 @@
 use super::Leto;
 use crate::{
-    types::{Proposal, ProtocolMsg, Request, Signature, Transaction},
+    types::{Proposal, ProtocolMsg, Signature, Transaction},
     Id, Round,
 };
-use anyhow::{Context, Result};
+use anyhow::{Result, anyhow};
 use log::*;
 use mempool::BatchHash;
 
@@ -86,31 +86,33 @@ where
         };
         debug!("Got a relay for the correct round");
 
-        // Check whether batch is known
-        let batch_opt = self
+        // // Check whether batch is known
+        let batch = self
             .chain_state
             .get_batch(batch_hash.clone())
-            .await
-            .context("Error getting batch hash when processing a relay")?;
-        if batch_opt.is_none() {
-            // Ask sender for the batch corresponding to this
-            let pmsg = ProtocolMsg::BatchRequest {
-                source: self.my_id,
-                request: Request::new(batch_hash.clone()),
-            };
-            let handler = self.consensus_net.send(source, pmsg).await;
-            self.round_context
-                .cancel_handlers
-                .entry(self.round_context.round())
-                .or_insert_with(Vec::new)
-                .push(handler);
-            // Reschedule self
-            return self
-                .synchronizer
-                .on_unknown_batch(proposal, auth, batch_hash, source)
-                .await;
-        }
-        let batch = batch_opt.unwrap();
-        self.handle_proposal(proposal, auth, batch).await
+            .await?
+            .ok_or_else(||
+                anyhow!("Synchronizer did not sync the relay message")
+            )?;
+        //     .context("Error getting batch hash when processing a relay")?;
+        // if batch_opt.is_none() {
+        //     // Ask sender for the batch corresponding to this
+        //     let pmsg = ProtocolMsg::BatchRequest {
+        //         source: self.my_id,
+        //         request: Request::new(batch_hash.clone()),
+        //     };
+        //     let handler = self.consensus_net.send(source, pmsg).await;
+        //     self.round_context
+        //         .cancel_handlers
+        //         .entry(self.round_context.round())
+        //         .or_insert_with(Vec::new)
+        //         .push(handler);
+        //     // Reschedule self
+        //     return self
+        //         .synchronizer
+        //         .on_unknown_batch(proposal, auth, batch_hash, source)
+        //         .await;
+        // }
+        self.handle_proposal(proposal, auth, batch, source).await
     }
 }

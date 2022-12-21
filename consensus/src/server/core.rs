@@ -1,10 +1,9 @@
 use super::{Leto, Settings};
 use crate::{to_socket_address, Id, KeyConfig};
-use anyhow::{anyhow, Result};
-use fnv::FnvHashMap;
+use anyhow::anyhow;
 use mempool::{Batch, MempoolMsg};
 use network::{plaintcp::TcpSimpleSender, Acknowledgement};
-use std::{marker::PhantomData, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{marker::PhantomData, path::PathBuf, sync::Arc};
 use storage::rocksdb::Storage;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedSender},
@@ -14,44 +13,6 @@ use tokio::sync::{
 /// This is the server that runs the protocol
 pub struct Server<Tx> {
     _x: PhantomData<Tx>,
-}
-
-pub fn get_mempool_peers(
-    my_id: Id,
-    settings: &Settings,
-) -> Result<FnvHashMap<Id, SocketAddr>> {
-    let mut map = FnvHashMap::default();
-    for id in 0..settings.committee_config.num_nodes() {
-        if id != my_id {
-            let party = settings
-                .committee_config
-                .get(&id)
-                .ok_or_else(|| anyhow!("Id {} not found", id))?;
-            let ip_str = &party.mempool_address;
-            let addr = to_socket_address(ip_str, party.mempool_port)?;
-            map.insert(id, addr);
-        }
-    }
-    Ok(map)
-}
-
-pub fn get_consensus_peers(
-    my_id: Id,
-    settings: &Settings,
-) -> Result<FnvHashMap<Id, SocketAddr>> {
-    let mut map = FnvHashMap::default();
-    for id in 0..settings.committee_config.num_nodes() {
-        if id != my_id {
-            let party = settings
-                .committee_config
-                .get(&id)
-                .ok_or_else(|| anyhow!("Id {} not found", id))?;
-            let ip_str = &party.consensus_address;
-            let addr = to_socket_address(ip_str, party.consensus_port)?;
-            map.insert(id, addr);
-        }
-    }
-    Ok(map)
 }
 
 impl<Tx> Server<Tx>
@@ -84,7 +45,7 @@ where
             .committee_config
             .get(&my_id)
             .ok_or_else(|| anyhow!("My Id {} is not present in the config", my_id))?;
-        let mempool_peers = get_mempool_peers(my_id, &settings)?;
+        let mempool_peers = settings.get_mempool_peers(my_id)?;
         let mempool_net =
             TcpSimpleSender::<Id, MempoolMsg<Id, Tx>, Acknowledgement>::with_peers(mempool_peers);
         let mempool_addr = to_socket_address("0.0.0.0", me.mempool_port)?;

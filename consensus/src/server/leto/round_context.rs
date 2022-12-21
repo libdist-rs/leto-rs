@@ -17,6 +17,7 @@ type PropMsg<Id, Tx, Round> = (
     Proposal<Id, Tx, Round>,
     Signature<Id, Proposal<Id, Tx, Round>>,
     Batch<Tx>,
+    Id,
 );
 
 pub type RelayMsg<Id, Tx, Round> = (
@@ -95,11 +96,11 @@ where
         // Update the leaders
         self.leader_context.advance_round();
 
-        // Clear the waiting_hashes for the relay messages
-        self.synchronizer.advance_round();
-
         // Update the round
         self.round_context.advance_round();
+
+        // Clear the waiting_hashes for the relay messages
+        self.synchronizer.advance_round(self.round_context.round())?;
 
         // Try committing
         self.try_commit().await?;
@@ -112,11 +113,12 @@ where
 
         // Process the propose messages from the new current round first
         if let Some(msgs) = self.round_context.propose_msgs() {
-            for (prop, auth, batch) in msgs {
+            for (prop, auth, batch, sender) in msgs {
                 let pmsg = ProtocolMsg::Propose {
                     proposal: prop,
                     auth,
                     batch,
+                    sender,
                 };
                 self.tx_msg_loopback.send(pmsg)?;
             }
@@ -233,11 +235,12 @@ where
         prop: Proposal<Id, Tx, Round>,
         auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch: Batch<Tx>,
+        sender: Id,
     ) {
         self.proposals_ready
             .entry(prop.round())
             .or_insert(Vec::new())
-            .push((prop, auth, batch));
+            .push((prop, auth, batch, sender));
     }
 
     pub fn queue_relay(

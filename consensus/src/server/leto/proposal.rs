@@ -21,6 +21,7 @@ where
         proposal: Proposal<Id, Tx, Round>,
         auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch: Batch<Tx>,
+        sender: Id,
     ) -> Result<()>
     where
         Tx: types::Transaction,
@@ -46,7 +47,7 @@ where
                     proposal.round(),
                     self.round_context.round()
                 );
-                self.round_context.queue_proposal(proposal, auth, batch);
+                self.round_context.queue_proposal(proposal, auth, batch, sender);
                 return Ok(());
             }
             _ => (),
@@ -230,6 +231,7 @@ where
             proposal: proposal.clone(),
             auth: auth.clone(),
             batch: batch.clone(),
+            sender: self.my_id,
         };
 
         // Broadcast message
@@ -244,7 +246,7 @@ where
             .extend(handlers);
 
         // Loopback
-        if let Err(e) = self.handle_proposal(proposal, auth, batch).await {
+        if let Err(e) = self.handle_proposal(proposal, auth, batch, self.my_id).await {
             error!("Error handling my own proposal: {}", e);
         }
 

@@ -23,4 +23,4 @@ test-run:
 clean:
 	@echo "Cleaning DB files"
 	@# https://www.baeldung.com/linux/find-exec-command
-	@find . -name "db-*.db" -exec rm -rf {} \;
+	@find . -name "db-*.db" -exec rm -rf {} +

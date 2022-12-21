@@ -27,13 +27,6 @@ where
         &mut self,
         element_hash: Hash<Element<Id, Tx, Round>>,
     ) -> Result<Option<Element<Id, Tx, Round>>> {
-        match self.store.read(element_hash.to_vec()).await? {
-            None => Ok(None),
-            Some(raw) => {
-                let element = bincode::deserialize::<Element<Id, Tx, Round>>(&raw)
-                    .map_err(anyhow::Error::new)?;
-                Ok(Some(element))
-            }
-        }
+        self.db.read(element_hash).await
     }
 }

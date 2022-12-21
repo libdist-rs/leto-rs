@@ -1,7 +1,8 @@
-use crate::{Id, Round};
+use crate::{Id, Round, to_socket_address};
 use fnv::FnvHashMap as HashMap;
 use serde::{Deserialize, Serialize};
-use std::{env, fmt, time::Duration};
+use std::{env, fmt, time::Duration, net::SocketAddr};
+use anyhow::{Result, anyhow};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StorageConfig {
@@ -132,4 +133,43 @@ impl Settings {
             .build()?;
         conf.try_deserialize().map_err(anyhow::Error::new)
     }
+
+
+    pub fn get_mempool_peers(&self, my_id: Id) 
+        -> Result<HashMap<Id, SocketAddr>> 
+    {
+        let mut map = HashMap::default();
+        for id in 0..self.committee_config.num_nodes() {
+            if id != my_id {
+                let party = self
+                    .committee_config
+                    .get(&id)
+                    .ok_or_else(|| anyhow!("Id {} not found", id))?;
+                let ip_str = &party.mempool_address;
+                let addr = to_socket_address(ip_str, party.mempool_port)?;
+                map.insert(id, addr);
+            }
+        }
+        Ok(map)
+    }
+
+    pub fn get_consensus_peers(
+        &self,
+        my_id: Id,
+    ) -> Result<HashMap<Id, SocketAddr>> {
+        let mut map = HashMap::default();
+        for id in 0..self.committee_config.num_nodes() {
+            if id != my_id {
+                let party = self
+                    .committee_config
+                    .get(&id)
+                    .ok_or_else(|| anyhow!("Id {} not found", id))?;
+                let ip_str = &party.consensus_address;
+                let addr = to_socket_address(ip_str, party.consensus_port)?;
+                map.insert(id, addr);
+            }
+        }
+        Ok(map)
+    }
+
 }

@@ -1,1 +1,1 @@
-pub trait Transaction: mempool::Transaction {}
+pub trait Transaction: mempool::Transaction + Unpin {}

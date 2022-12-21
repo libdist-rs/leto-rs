@@ -1,16 +1,15 @@
 use std::sync::Arc;
 use std::time::Duration;
-
-use crate::server::{
-    get_consensus_peers, BatcherConsensusMsg, Handler, Parameters, RRBatcher, Settings,
-};
-use crate::{start_id};
+use crate::server::{Settings, BatcherConsensusMsg, Handler, Parameters, RRBatcher};
+use crate::start_id;
+use crate::types::Transaction;
 use crate::{
     to_socket_address,
-    types::{self, ProtocolMsg},
+    types::ProtocolMsg,
     Id, KeyConfig, Round,
 };
 use anyhow::{anyhow, Result};
+use futures_util::StreamExt;
 use log::*;
 use mempool::{Batch, BatchHash, ConsensusMempoolMsg};
 use network::{
@@ -22,10 +21,8 @@ use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
-
 use super::{
-    ChainState, CommitContext, Helper, HelperRequest, LeaderContext, RoundContext, Synchronizer,
-    SynchronizerOutMsg,
+    ChainState, CommitContext, Helper, LeaderContext, RoundContext, Synchronizer,
 };
 
 pub struct Leto<Tx> {
@@ -50,19 +47,12 @@ pub struct Leto<Tx> {
     pub(crate) rx_net_to_consensus: UnboundedReceiver<ProtocolMsg<Id, Tx, Round>>,
     /// We get messages from ourselves (loopback) here
     pub(crate) rx_msg_loopback: UnboundedReceiver<ProtocolMsg<Id, Tx, Round>>,
-    /// We get messages from the synchronizer here
-    /// The synchronizer tells us when we get responses for unknown batches,
-    /// blocks, etc.
-    pub(crate) rx_synchronizer_to_consensus: UnboundedReceiver<SynchronizerOutMsg<Tx>>,
-
     /// We send messages to the batcher here
     /// We tell the batcher to clear a batch when committing or receiving a
     /// proposal, and notify it when we end a round
     pub(crate) tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Tx>>,
     /// A loopback channel to re-schedule suspended messages
     pub(crate) tx_msg_loopback: UnboundedSender<ProtocolMsg<Id, Tx, Round>>,
-    /// We respond to other server's help requests for unknown hashes here
-    pub(crate) tx_helper: UnboundedSender<HelperRequest<Tx>>,
 
     /// TODO: Use this (Currently, we do not need it)
     pub(crate) _tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
@@ -84,12 +74,12 @@ pub struct Leto<Tx> {
 
 impl<Tx> Leto<Tx> {
     pub const INITIAL_LEADER: Id = start_id();
-    pub const INITIAL_ROUND: Round = Round::MIN;
+    pub const INITIAL_ROUND: Round = 0;
 }
 
 impl<Tx> Leto<Tx>
 where
-    Tx: types::Transaction,
+    Tx: Transaction,
 {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
@@ -104,7 +94,8 @@ where
         tx_processor: UnboundedSender<Batch<Tx>>,
         tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
         tx_commit: UnboundedSender<Arc<Batch<Tx>>>,
-    ) -> Result<()> {
+    ) -> Result<()> 
+    {
         let me = settings
             .committee_config
             .get(&my_id)
@@ -120,7 +111,7 @@ where
         );
 
         // Start outgoing connections
-        let consensus_peers = get_consensus_peers(my_id, &settings)?;
+        let consensus_peers = settings.get_consensus_peers(my_id)?;
         let consensus_net =
             TcpReliableSender::<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>::with_peers(
                 consensus_peers.clone(),
@@ -131,9 +122,14 @@ where
         Helper::<Tx>::spawn(store.clone(), rx_helper, consensus_peers.clone());
 
         // Start the synchronizer
-        let (tx_from_sync, rx_from_sync) = unbounded_channel();
+        // let (tx_from_sync, rx_from_sync) = unbounded_channel();
         let synchronizer =
-            Synchronizer::<Tx>::new(store.clone(), my_id, tx_from_sync, consensus_peers);
+            Synchronizer::<Tx>::new(
+                store.clone(), 
+                my_id, 
+                tx_helper,
+                consensus_peers,
+            );
 
         // Start the batcher
         let (tx_consensus_to_batcher, rx_consensus_to_batcher) = unbounded_channel();
@@ -162,7 +158,7 @@ where
 
         let (tx_msg_loopback, rx_msg_loopback) = unbounded_channel();
         tokio::spawn(async move {
-            let res = Leto::<Tx> {
+            let mut protocol = Leto::<Tx> {
                 my_id,
                 crypto_system,
                 broadcast_peers: all_peers_except_me,
@@ -184,21 +180,20 @@ where
                 rx_msg_loopback,
                 chain_state: ChainState::new(store),
                 settings,
-                rx_synchronizer_to_consensus: rx_from_sync,
                 synchronizer,
-                tx_helper,
                 commit_ctx,
-            }
-            .run()
-            .await;
-            if let Err(e) = res {
+            };
+            if let Err(e) = protocol.run().await {
                 error!("Consensus error: {}", e);
             }
         });
         Ok(())
     }
 
-    async fn run(&mut self) -> Result<()> {
+    async fn run(&mut self) -> Result<()> 
+    where 
+        Tx: Transaction,
+    {
         info!("Starting the server");
 
         // Setup genesis context
@@ -216,7 +211,7 @@ where
                     info!("Termination signal received by the server. Exiting.");
                     break
                 }
-                // Handle batch ready messages from the mempool if I am the leader
+                // Handle batch ready messages from the mempool when I am the leader
                 batch_hash = self.rx_mem_to_consensus.recv(), if
                     self.leader_context.leader() == self.my_id
                 => {
@@ -228,6 +223,7 @@ where
                     }
                 }
                 // Receive consensus messages from loopback
+                // Loopback messages are always synchronized
                 msg = self.rx_msg_loopback.recv() => {
                     let msg = msg.ok_or_else(||
                         anyhow!("Loopback layer has closed")
@@ -243,26 +239,26 @@ where
                         anyhow!("Networking layer has closed")
                     )?;
                     info!("Got a consensus message from the network: {:?}", msg);
-                    if let Err(e) = self.handle_msg(msg).await {
+                    if let Err(e) = self.synchronizer.sync_msg(msg).await {
                         error!("Error handling consensus message: {}", e);
                     }
                 }
-                // On timeout for a round
-                _ = self.round_context.timer.tick(), if self.round_context.timer_enabled => {
+                // If we timeout for a round
+                _ = self.round_context.timer.tick(), 
+                if self.round_context.timer_enabled => 
+                {
                     warn!("Round {} timing out", self.round_context.round());
                     if let Err(e) = self.on_round_timeout().await {
                         error!("Error handling round timeout: {}", e);
                     }
                 }
-                // Receive synchronized messages from others
-                sync_help = self.rx_synchronizer_to_consensus.recv() => {
-                    let sync_msg = sync_help.ok_or_else(||
+                // Receive synchronized messages
+                sync_help = &mut self.synchronizer.next() => {
+                    let synced_msg = sync_help.ok_or_else(||
                         anyhow!("Synchronizer channel closed")
                     )?;
-                    if let Err(e) = match sync_msg {
-                        SynchronizerOutMsg::ResponseBatch(resp_batch) => self.on_batch_ready(resp_batch).await,
-                    } {
-                        error!("Error handling a ready batch: {}", e);
+                    if let Err(e) = self.handle_msg(synced_msg).await {
+                        error!("Error handling a synced message: {}", e);
                     }
                 }
             };
@@ -271,6 +267,7 @@ where
         Ok(())
     }
 
+    /// Handles synced messages
     async fn handle_msg(
         &mut self,
         msg: ProtocolMsg<Id, Tx, Round>,
@@ -280,23 +277,27 @@ where
                 proposal,
                 auth,
                 batch,
-            } => self.handle_proposal(proposal, auth, batch).await,
+                sender,
+            } => self.handle_proposal(proposal, auth, batch, sender).await,
             ProtocolMsg::Relay {
                 proposal,
                 auth,
                 batch_hash,
                 sender,
             } => self.handle_relay(proposal, auth, batch_hash, sender).await,
-            ProtocolMsg::Blame { round, auth } => self.handle_blame(round, auth).await,
-            ProtocolMsg::BlameQC { round, qc } => self.on_blame_qc(round, qc).await,
-            // Use the helper
-            ProtocolMsg::BatchRequest { source, request } => {
-                self.on_batch_request(source, request).await
-            }
-            // Use the synchronizer
-            ProtocolMsg::BatchResponse { response } => {
-                self.synchronizer.on_batch_response(response).await
-            }
+            ProtocolMsg::Blame { 
+                round, 
+                auth 
+            } => self.handle_blame(round, auth).await,
+            ProtocolMsg::BlameQC { 
+                round, 
+                qc 
+            } => self.on_blame_qc(round, qc).await,
+            // We should never see the other messages
+            ProtocolMsg::BatchRequest {..} => unreachable!(),
+            ProtocolMsg::BatchResponse {..} => unreachable!(),
+            ProtocolMsg::ElementRequest {..} => unreachable!(),
+            ProtocolMsg::ElementResponse {..} => unreachable!(),
         }
     }
 }

@@ -1,26 +1,28 @@
 use crate::{
-    types::{ProtocolMsg, Request, Response, Transaction},
+    types::{ProtocolMsg, Request, Response, Transaction, Element},
     Id, Round,
 };
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use fnv::FnvHashMap;
 use log::*;
 use mempool::Batch;
 use network::{plaintcp::TcpSimpleSender, Acknowledgement, NetSender};
+use serde::de::DeserializeOwned;
 use std::net::SocketAddr;
 use storage::rocksdb::Storage;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use super::Leto;
+use super::ChainDB;
 
 #[derive(Debug)]
 pub enum HelperRequest<Tx> {
     BatchRequest(Id, Request<Batch<Tx>>),
+    ElementRequest(Id, Request<Element<Id, Tx, Round>>),
 }
 
 pub struct Helper<Tx> {
     /// The persistent storage
-    store: Storage,
+    db: ChainDB,
     /// Channel to handle requests from others
     rx_requests: UnboundedReceiver<HelperRequest<Tx>>,
     /// A simple sender to send responses to the sender
@@ -39,7 +41,7 @@ impl<Tx> Helper<Tx> {
 
         tokio::spawn(async move {
             Self {
-                store,
+                db: ChainDB::new(store),
                 rx_requests,
                 network,
             }
@@ -58,21 +60,8 @@ impl<Tx> Helper<Tx> {
                     match help {
                         HelperRequest::BatchRequest(source, req) => {
                             let req_hash = req.request_hash().clone();
-                            let key = req_hash.to_vec();
-                            let batch_opt = self.store
-                                .read(key)
-                                .await
-                                .and_then(|res| {
-                                    res.ok_or_else(|| anyhow!(
-                                        "Unknown batch",
-                                    ))
-                                })
-                                .and_then(|b| {
-                                    bincode::deserialize::<Batch<Tx>>(&b)
-                                        .map_err(anyhow::Error::new)
-                                });
-                            match batch_opt {
-                                Ok(batch) => {
+                            match self.handle_request(source, req).await {
+                                Ok(Some(batch)) => {
                                     let response_msg = ProtocolMsg::BatchResponse{
                                         response: Response::new(
                                             req_hash,
@@ -82,9 +71,27 @@ impl<Tx> Helper<Tx> {
                                     self.network.send(source, response_msg).await;
                                     Ok(())
                                 },
+                                Ok(None) => Ok(()),
                                 Err(e) => Err(e),
                             }
                         },
+                        HelperRequest::ElementRequest(source, req) => {
+                            let req_hash = req.request_hash().clone();
+                            match self.handle_request(source, req).await {
+                                Ok(Some(element)) => {
+                                    let response_msg = ProtocolMsg::ElementResponse{
+                                        response: Response::new(
+                                            req_hash,
+                                            element,
+                                        )
+                                    };
+                                    self.network.send(source, response_msg).await;
+                                    Ok(())
+                                },
+                                Ok(None) => Ok(()),
+                                Err(e) => Err(e),
+                            }
+                        }
                     }
                 }
             } {
@@ -92,18 +99,19 @@ impl<Tx> Helper<Tx> {
             }
         }
     }
-}
 
-impl<Tx> Leto<Tx> {
-    pub async fn on_batch_request(
-        &mut self,
-        source: Id,
-        request: Request<Batch<Tx>>,
-    ) -> Result<()>
-    where
-        Tx: Transaction,
+    async fn handle_request<T>(
+        &mut self, 
+        source: Id, 
+        req: Request<T>,
+    ) -> Result<Option<T>> 
+    where 
+        T: DeserializeOwned,
     {
-        let helper_msg = HelperRequest::BatchRequest(source, request);
-        self.tx_helper.send(helper_msg).map_err(anyhow::Error::new)
+        let req_hash = req.request_hash().clone();
+        let key = req_hash.to_vec();
+        self.db
+            .read(req_hash)
+            .await
     }
 }

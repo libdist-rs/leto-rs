@@ -2,7 +2,7 @@ use network::Message;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug, Display};
 
-pub trait Data: Message {
+pub trait Data: Message + Unpin {
     fn with_payload(data: &[u8]) -> Self;
 }
 
