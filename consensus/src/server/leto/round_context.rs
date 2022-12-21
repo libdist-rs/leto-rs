@@ -56,7 +56,7 @@ pub struct RoundContext<Tx> {
     /// The timeout for the current round
     timer: Interval,
     /// This value tells if we already timed out for the current round
-    pub(crate) timer_enabled: bool,
+    timer_enabled: bool,
     /// The QC for the current round
     pub(crate) blame_map: FnvHashMap<Id, Signature<Id, Round>>,
     /// This is used to indicate that we already extracted QC from blame_map
@@ -141,6 +141,11 @@ where
             .entry(self.current_round)
             .or_default()
             .extend(handlers);
+    }
+
+    /// Disables blame timers for the current round
+    pub fn disable_blame_timers(&mut self) {
+        self.timer_enabled = false;
     }
 
     /// Move forward by one round

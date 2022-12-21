@@ -12,7 +12,7 @@ impl<Tx> Leto<Tx> {
         Tx: Transaction,
     {
         // Disable more timeouts for the same round until we advance
-        self.round_context.timer_enabled = false;
+        self.round_context.disable_blame_timers();
 
         // Construct blame message
         let blame_msg = self.round_context.round();
