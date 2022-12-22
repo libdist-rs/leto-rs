@@ -12,7 +12,7 @@ use tokio::sync::mpsc::unbounded_channel;
 fn dummy_ids(num_nodes: usize) -> Vec<Id> {
     let mut ids = Vec::with_capacity(num_nodes);
     for i in 0..num_nodes {
-        ids.push(i.into());
+        ids.push(i);
     }
     ids
 }
@@ -25,21 +25,20 @@ fn _dummy_settings(
     let ids = dummy_ids(num_nodes);
     let mempool_config = mempool::Config::<Round>::default();
     let storage_config = StorageConfig {
-        base: format!("src/server/test"),
-        prefix: format!("db"),
+        base: "src/server/test".to_string(),
+        prefix: "db".to_string(),
     };
     let mut parties = FnvHashMap::default();
-    for i in 0..num_nodes {
-        let id = ids[i];
+    for id in ids {
         parties.insert(
-            id.clone(),
+            id,
             Party {
-                id: id,
-                consensus_address: format!("127.0.0.1"),
-                consensus_port: 6000 + (i as u16),
-                mempool_address: format!("127.0.0.1"),
-                mempool_port: 7000 + (i as u16),
-                client_port: 8000 + (i as u16),
+                id,
+                consensus_address: "127.0.0.1".to_string(), 
+                consensus_port: 6000 + (id as u16),
+                mempool_address: "127.0.0.1".to_string(),
+                mempool_port: 7000 + (id as u16),
+                client_port: 8000 + (id as u16),
             },
         );
     }
@@ -51,7 +50,7 @@ fn _dummy_settings(
     }
 }
 
-const DEFAULT_CONFIG_FILE_LOCATION: &'static str = "./src/server/test/Default";
+const DEFAULT_CONFIG_FILE_LOCATION: &str = "./examples/server";
 
 #[tokio::test]
 async fn test_one() -> Result<()> {
