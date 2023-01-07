@@ -87,6 +87,8 @@ where
         let mut burst_timer = tokio::time::interval(Duration::from_millis(
             self.settings.bench_config.burst_interval_ms,
         ));
+        #[cfg(feature = "microbench")]
+        let mut first = true;
         loop {
             tokio::select! {
                 _ = &mut self.exit_rx => {
@@ -96,8 +98,23 @@ where
                 _ = burst_timer.tick() => {
                     // Time to send a burst of transactions
                     // Send `burst_tx` transactions every interval
-                    for _i in 0..burst_tx {
-                        let tx = Tx::mock_transaction(tx_id, self.id, tx_size);
+                    for i in 0..burst_tx {
+                        let tx = Tx::mock_transaction(
+                            tx_id, 
+                            self.id, 
+                            tx_size, 
+                            i == 0,
+                        );
+                        #[cfg(feature = "microbench")]
+                        {
+                            if first {
+                                info!(
+                                    "Tx size: {}", 
+                                    bincode::serialized_size(&tx)?,
+                                );
+                                first = false;
+                            }
+                        }
                         tx_id += 1;
                         self.consensus_sender.broadcast(
                             tx,

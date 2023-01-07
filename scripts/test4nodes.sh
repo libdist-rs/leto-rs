@@ -6,7 +6,7 @@ killall node
 N=${N:-4}
 
 echo "Building..."
-cargo b --all
+cargo b --all --features=microbench
 
 echo "Clearing the database"
 rm -rf db-*.db
@@ -15,6 +15,7 @@ echo "Starting ${N} servers"
 for((i=0;i<$N;i++)); do
     # Start the server
     cargo r -p node \
+        --features=consensus/microbench \
         -- \
         -vvvv \
         server \
@@ -25,7 +26,8 @@ done
 sleep 1 
 echo "Starting the client" 
 cargo r -p node \
+    --features=consensus/microbench \
     -- \
-    -v \
+    -vvv \
     client \
     --id 4 &> test-log-client.log

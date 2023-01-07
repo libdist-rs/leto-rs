@@ -71,7 +71,7 @@ where
         self.linked_hash_map.insert(hash, (tx, tx_size));
     }
 
-    /// Removes all the transactions from the transaction pool if they exist
+    /// Removes the transactions from the transaction pool if they exist
     pub fn clear_batch(
         &mut self,
         batch: Batch<Tx>,
@@ -101,8 +101,13 @@ where
                 self.current_size -= tx_size;
             }
         }
-        self.timer.reset();
+        self.reset_timer();
         Batch { payload }
+    }
+
+    /// Resets the timers
+    pub fn reset_timer(&mut self) {
+        self.timer.reset();
     }
 
     /// Checks whether there are sufficient transactions in the pool to make a

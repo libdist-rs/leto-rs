@@ -239,6 +239,8 @@ fn logger_from_file(
     Ok(())
 }
 
+type TestTx = SimpleTx<SimpleData>;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("Starting {} with {:?}", APP_NAME, std::env::args());
@@ -302,7 +304,7 @@ async fn main() -> Result<()> {
             DummyCommitSink::spawn(rx_commit);
 
             // Start the Server
-            let exit_tx = Server::<SimpleTx<SimpleData>>::spawn(
+            let exit_tx = Server::<TestTx>::spawn(
                 server_id,
                 all_ids,
                 crypto_system,
@@ -333,7 +335,7 @@ async fn main() -> Result<()> {
             info!("Using the settings: {:?}", settings);
 
             // Start the client
-            let exit_tx = Stressor::<SimpleTx<SimpleData>>::spawn(client_id, settings)?;
+            let exit_tx = Stressor::<TestTx>::spawn(client_id, settings)?;
             // Implement a waiting strategy
             let mut signals = Signals::new(&[SIGINT, SIGTERM])?;
             signals.forever().next();

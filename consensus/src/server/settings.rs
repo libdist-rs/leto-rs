@@ -113,8 +113,10 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn new(config_file_name: String) -> anyhow::Result<Self> {
-        let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "development".into());
+    pub fn new<T: ToString>(config_file_name: T) -> anyhow::Result<Self> {
+        let config_file_name = config_file_name.to_string();
+        let run_mode = env::var("RUN_MODE")
+            .unwrap_or_else(|_| "development".into());
         let conf = config::Config::builder()
             // DEFAULT settings Add in `./Settings.json`
             .add_source(config::File::with_name(&config_file_name).required(true))

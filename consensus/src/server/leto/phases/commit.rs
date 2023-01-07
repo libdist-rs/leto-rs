@@ -74,12 +74,19 @@ impl<Tx> CommitContext<Tx> {
         // Tracking variables
         let mut highest_committed_element = genesis_element.clone();
         let mut highest_committed_hash = Hash::ser_and_hash(highest_committed_element.as_ref());
+        let mut unique_proposers = LinkedHashMap::<Id, usize>::default();
+        unique_proposers.insert(
+            genesis_element.auth.get_id(), 
+            1,
+        );
         let mut commit_queue = LinkedHashMap::<
             Hash<Element<Id, Tx, Round>>,
             Arc<Element<Id, Tx, Round>>,
         >::with_capacity(commit_len);
-        commit_queue.insert(genesis_element_hash.clone(), genesis_element);
-        let mut unique_proposers = LinkedHashMap::<Id, usize>::default();
+        commit_queue.insert(
+            genesis_element_hash.clone(), 
+            genesis_element,
+        );
         loop {
             tokio::select! {
                 msg = rx_inner.recv() => {
@@ -91,6 +98,9 @@ impl<Tx> CommitContext<Tx> {
                             round_element_hash,
                             round_element,
                         } => {
+                            if round_element.proposal.round() == 0 {
+                                continue;
+                            }
                             let mut head = round_element;
                             let mut head_hash = round_element_hash;
                             let mut local_queue = LinkedHashMap::<Hash<Element<Id, Tx, Round>>, Arc<Element<Id, Tx, Round>>>::with_capacity(commit_len);
@@ -102,14 +112,14 @@ impl<Tx> CommitContext<Tx> {
                                 if let Some((hash, _)) = commit_queue.back()
                                 {
                                     if hash == &head_hash {
-                                        info!("Connected to commit queue");
+                                        debug!("Connected to commit queue");
                                         connected_to_commit_queue = true;
                                         break;
                                     }
                                 }
                                 // If we reached the highest committed block, skip
                                 if head_hash == highest_committed_hash {
-                                    info!("Connected to the highest committed block");
+                                    debug!("Connected to the highest committed block");
                                     break;
                                 }
                                 // Update local queue
@@ -140,7 +150,7 @@ impl<Tx> CommitContext<Tx> {
                             // (b) the genesis [first n rounds]
                             // (c) commit queue [others including crash only]
                             if !connected_to_commit_queue {
-                                info!("Replacing commit queue");
+                                debug!("Replacing commit queue");
                                 let _ = std::mem::replace(
                                     &mut commit_queue,
                                     local_queue
@@ -150,14 +160,22 @@ impl<Tx> CommitContext<Tx> {
                                     local_unique_proposers,
                                 );
                             } else {
-                                info!("Extending commit queue");
+                                debug!("Extending commit queue");
                                 commit_queue.extend(local_queue);
-                                unique_proposers.extend(local_unique_proposers);
+                                // merge unique_proposers and local_unique_proposers
+                                for (id, num) in local_unique_proposers
+                                    .into_iter() 
+                                {
+                                    *unique_proposers
+                                        .entry(id)
+                                        .or_insert(0) += num;
+                                }
                             }
                             // Commit logic
-                            while unique_proposers.len() > commit_len {
+                            while unique_proposers.len() >= commit_len {
                                 // Pop and commit
-                                let (hash, element) = commit_queue.pop_back()
+                                let (hash, element) = commit_queue
+                                    .pop_front()
                                     .expect("Must be unwrappable");
                                 let id = element.auth.get_id();
                                 let count = unique_proposers
@@ -169,6 +187,7 @@ impl<Tx> CommitContext<Tx> {
                                     unique_proposers.remove(&id);
                                 }
                                 // Commit element
+                                info!("Comitting {} in {}", element.batch.payload.len(), element.proposal.round());
                                 tx_commit.send(
                                     Arc::new(element.batch.clone())
                                 ).map_err(anyhow::Error::new)?;
@@ -211,7 +230,13 @@ impl DummyCommitSink {
         tokio::spawn(async move {
             while let Some(batch) = rx_inner.recv().await {
                 // Process the batch of transactions
-                info!("Committed batch: {:?}", batch);
+                info!(
+                    "Committed batch of {} transactions", 
+                    batch.payload.len(),
+                );
+                debug!("Committed batch of {:?}", 
+                    batch.payload.len(),
+                );
             }
         });
     }

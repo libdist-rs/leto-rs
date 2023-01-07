@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::time::Duration;
-use crate::server::{Settings, BatcherConsensusMsg, Handler, Parameters, RRBatcher, Event};
+use crate::server::{Settings, BatcherConsensusMsg, Handler, Parameters, RRBatcher};
 use crate::start_id;
 use crate::types::Transaction;
 use crate::{
@@ -21,6 +21,7 @@ use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
+use tokio::time::{Interval, interval};
 use super::{
     ChainState, CommitContext, Helper, LeaderContext, RoundContext, Synchronizer,
 };
@@ -70,6 +71,9 @@ pub struct Leto<Tx> {
     pub(crate) leader_context: LeaderContext,
     /// Chain state
     pub(crate) chain_state: ChainState<Tx>,
+    pub(crate) timer: Interval,         
+    // This value tells if we already timed out for the current round
+    pub(crate) timer_enabled: bool,
 }
 
 impl<Tx> Leto<Tx> {
@@ -99,29 +103,38 @@ where
         let me = settings
             .committee_config
             .get(&my_id)
-            .ok_or_else(|| anyhow!("My Id {} is not present in the config", my_id))?;
-        let consensus_addr = to_socket_address("0.0.0.0", me.consensus_port)?;
+            .ok_or_else(|| 
+                anyhow!("My Id {} is not present in the config", my_id),
+            )?;
+        let consensus_addr = to_socket_address(
+            "0.0.0.0", 
+            me.consensus_port,
+        )?;
 
+        // Start networking receiver for consensus messages
         let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
-
-        // Start receiver for consensus messages
         TcpReceiver::<Acknowledgement, ProtocolMsg<Id, Tx, Round>, _>::spawn(
             consensus_addr,
             Handler::<Id, Tx, Round>::new(tx_net_to_consensus),
         );
 
         // Start outgoing connections
-        let consensus_peers = settings.get_consensus_peers(my_id)?;
+        let consensus_peers = settings
+            .get_consensus_peers(my_id)?;
         let consensus_net =
             TcpReliableSender::<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>::with_peers(
                 consensus_peers.clone(),
             );
 
-        // Start the helper
+        // Start helper that syncs messages
         let (tx_helper, rx_helper) = unbounded_channel();
-        Helper::<Tx>::spawn(store.clone(), rx_helper, consensus_peers.clone());
+        Helper::<Tx>::spawn(
+            store.clone(), 
+            rx_helper, 
+            consensus_peers.clone(),
+        );
 
-        // Start the synchronizer
+        // Create the synchronizer
         let synchronizer =
             Synchronizer::<Tx>::new(
                 store.clone(), 
@@ -155,6 +168,7 @@ where
 
         let all_peers_except_me = all_peers.into_iter().filter(|x| x != &my_id).collect();
 
+        // Start the core protocol
         let (tx_msg_loopback, rx_msg_loopback) = unbounded_channel();
         tokio::spawn(async move {
             let mut protocol = Leto::<Tx> {
@@ -169,7 +183,6 @@ where
                 tx_consensus_to_batcher,
                 round_context: RoundContext::new(
                     settings.committee_config.num_nodes(),
-                    Duration::from_millis(settings.bench_config.delay_in_ms),
                 ),
                 leader_context: LeaderContext::new(
                     settings.committee_config.get_all_ids(),
@@ -178,9 +191,13 @@ where
                 tx_msg_loopback,
                 rx_msg_loopback,
                 chain_state: ChainState::new(store),
-                settings,
                 synchronizer,
                 commit_ctx,
+                timer: interval(Duration::from_millis(
+                    4 * settings.bench_config.delay_in_ms)
+                ),
+                timer_enabled: true,
+                settings,
             };
             if let Err(e) = protocol.run().await {
                 error!("Consensus error: {}", e);
@@ -198,8 +215,10 @@ where
         // Setup genesis context
         self.chain_state.genesis_setup().await?;
 
+
+        // The timeout for the current round
         // Reset the timer
-        self.round_context.init();
+        self.timer.reset();
 
         // Start the protocol loop
         loop {
@@ -211,8 +230,8 @@ where
                     break
                 }
                 // Handle batch ready messages from the mempool when I am the leader
-                batch_hash = self.rx_mem_to_consensus.recv(), if
-                    self.leader_context.leader() == self.my_id
+                batch_hash = self.rx_mem_to_consensus.recv(), 
+                    if self.leader_context.leader() == self.my_id
                 => {
                     let batch_hash = batch_hash.ok_or_else(||
                         anyhow!("Mempool processor has shut down")
@@ -233,16 +252,27 @@ where
                 }
                 // Receive round synchronized and delivery synchronized messages
                 // Forward to generic msg handler which will forward to the corresponding handler
-                rnd_help = &mut self.round_context.next() => {
+                rnd_help = &mut self.round_context.next(), 
+                    // IMPORTANT: Prevents `Poll::Pending` when no messages are present
+                    if self.round_context.is_ready() => 
+                {
                     let synced_msg = rnd_help.ok_or_else(||
                         anyhow!("Round context error")
                     )?;
-                    let res = match synced_msg {
-                        Event::Timeout => self.on_round_timeout().await,
-                        Event::Msg(m) => self.handle_msg(m).await,
-                    };
-                    if let Err(e) = res {
+                    // let res = match synced_msg {
+                    //     Event::Timeout => self.on_round_timeout().await,
+                        // Event::Msg(m) => self.handle_msg(m).await,
+                    // };
+                    // if let Err(e) = res {
+                    //     error!("Error handling a round synced message: {}", e);
+                    // }
+                    if let Err(e) = self.handle_msg(synced_msg).await {
                         error!("Error handling a round synced message: {}", e);
+                    }
+                }
+                _ = self.timer.tick(), if self.timer_enabled => {
+                    if let Err(e) = self.on_round_timeout().await {
+                        error!("Error handling on round timeout: {}", e);
                     }
                 }
                 // Receive consensus messages from loopback
@@ -252,7 +282,7 @@ where
                     let msg = msg.ok_or_else(||
                         anyhow!("Loopback layer has closed")
                     )?;
-                    info!("Got a consensus message from loopback: {:?}", msg);
+                    debug!("Got a consensus message from loopback: {:?}", msg);
                     if let Err(e) = self.round_context.sync(msg) {
                         error!("Error handling consensus message from loopback: {}", e);
                     }
@@ -263,7 +293,7 @@ where
                     let msg = msg.ok_or_else(||
                         anyhow!("Networking layer has closed")
                     )?;
-                    info!("Got a consensus message from the network: {:?}", msg);
+                    debug!("Got a consensus message from the network: {:?}", msg);
                     if let Err(e) = self.synchronizer.sync_msg(msg).await {
                         error!("Error handling consensus message: {}", e);
                     }
@@ -300,7 +330,7 @@ where
                 round, 
                 qc 
             } => self.on_blame_qc(round, qc).await,
-            // We should never see the other messages
+            // `handle_msg` should never see these messages
             ProtocolMsg::Relay {..} => unreachable!(),
             ProtocolMsg::BatchRequest {..} => unreachable!(),
             ProtocolMsg::BatchResponse {..} => unreachable!(),

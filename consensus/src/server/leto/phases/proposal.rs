@@ -192,6 +192,8 @@ where
                 anyhow!("Implementation Bug: Expected proposer to have his batch in his own DB")
             })?;
 
+        info!("Proposing a batch with {} tx", batch.payload.len());
+
         let msg = ProtocolMsg::<Id, Tx, Round>::Propose {
             proposal: proposal.clone(),
             auth: auth.clone(),

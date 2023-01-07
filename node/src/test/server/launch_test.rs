@@ -7,7 +7,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use crypto::Algorithm;
 use fnv::FnvHashMap;
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::{sync::mpsc::unbounded_channel, time::sleep};
 
 fn dummy_ids(num_nodes: usize) -> Vec<Id> {
     let mut ids = Vec::with_capacity(num_nodes);
@@ -54,18 +54,33 @@ const DEFAULT_CONFIG_FILE_LOCATION: &str = "./examples/server";
 
 #[tokio::test]
 async fn test_one() -> Result<()> {
-    let settings = Settings::new(DEFAULT_CONFIG_FILE_LOCATION.to_string())?;
-    let ids = dummy_ids(settings.committee_config.num_nodes());
-    let crypto_system = KeyConfig::generate(Algorithm::ED25519, 4)?;
+    let settings = Settings::new(DEFAULT_CONFIG_FILE_LOCATION)?;
+    let num_nodes = settings.committee_config.num_nodes();
+
+    // Build the ids
+    let ids = dummy_ids(num_nodes);
+    
+    // Build the cryptosystem
+    let crypto_system = KeyConfig::generate(
+        Algorithm::ED25519, 
+        num_nodes,
+    )?;
+
+    // Spawn the server
+    const TEST_ID: Id = 0;
     let (commit_tx, _) = unbounded_channel();
     let exit_tx = Server::<SimpleTx<SimpleData>>::spawn(
-        ids[0],
+        TEST_ID,
         ids,
-        crypto_system[0].clone(),
+        crypto_system[TEST_ID].clone(),
         settings,
         commit_tx,
     )?;
-    tokio::time::sleep(Duration::from_millis(3_000)).await;
+
+    // Sleep for some time until we can connect to all the servers
+    sleep(Duration::from_millis(3_000)).await;
+
+    // Try shutting down the server
     let res = exit_tx.send(());
     res.map_err(|_| anyhow!("Server did not successfully terminate"))
 }

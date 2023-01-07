@@ -4,14 +4,13 @@ use crate::{
 };
 use anyhow::Result;
 use fnv::FnvHashMap;
-use log::*;
+use futures_util::{stream::FuturesUnordered, StreamExt};
 use mempool::Batch;
 use network::{plaintcp::TcpSimpleSender, Acknowledgement, NetSender};
 use serde::de::DeserializeOwned;
 use std::net::SocketAddr;
 use storage::rocksdb::Storage;
 use tokio::sync::mpsc::UnboundedReceiver;
-
 use super::ChainDB;
 
 #[derive(Debug)]
@@ -54,62 +53,70 @@ impl<Tx> Helper<Tx> {
     where
         Tx: Transaction,
     {
+        let mut element_read_queue = FuturesUnordered::new();
+        let mut batch_read_queue = FuturesUnordered::new();
         loop {
-            if let Err(e) = tokio::select! {
+            tokio::select! {
                 Some(help) = self.rx_requests.recv() => {
                     match help {
                         HelperRequest::BatchRequest(source, req) => {
-                            let req_hash = req.request_hash().clone();
-                            match self.handle_request(req).await {
-                                Ok(Some(batch)) => {
-                                    let response_msg = ProtocolMsg::BatchResponse{
-                                        response: Response::new(
-                                            req_hash,
-                                            batch,
-                                        )
-                                    };
-                                    self.network.send(source, response_msg).await;
-                                    Ok(())
-                                },
-                                Ok(None) => Ok(()),
-                                Err(e) => Err(e),
-                            }
+                            batch_read_queue.push(
+                                Self::handle_request(
+                                    self.db.clone(), 
+                                    source, 
+                                    req,
+                                )
+                            );
                         },
                         HelperRequest::ElementRequest(source, req) => {
-                            let req_hash = req.request_hash().clone();
-                            match self.handle_request(req).await {
-                                Ok(Some(element)) => {
-                                    let response_msg = ProtocolMsg::ElementResponse{
-                                        response: Response::new(
-                                            req_hash,
-                                            element,
-                                        )
-                                    };
-                                    self.network.send(source, response_msg).await;
-                                    Ok(())
-                                },
-                                Ok(None) => Ok(()),
-                                Err(e) => Err(e),
-                            }
+                            element_read_queue.push(
+                                Self::handle_request(
+                                    self.db.clone(), 
+                                    source, 
+                                    req,
+                                )
+                            );
                         }
                     }
+                },
+                Some(Ok(Some((source, req, batch)))) = batch_read_queue.next(), 
+                    if !batch_read_queue.is_empty() => {
+                    let response_msg = ProtocolMsg::BatchResponse{
+                        response: Response::new(
+                            req.request_hash().clone(),
+                            batch,
+                        )
+                    };
+                    self.network.send(source, response_msg).await;
+                },
+                Some(Ok(Some((source, req, element)))) = element_read_queue.next(), 
+                if !element_read_queue.is_empty() => {
+                    let response_msg = ProtocolMsg::ElementResponse{
+                        response: Response::new(
+                            req.request_hash().clone(),
+                            element,
+                        )
+                    };
+                    self.network.send(source, response_msg).await;
                 }
-            } {
-                error!("Error helping with request: {}", e);
-            }
+            } 
         }
     }
 
     async fn handle_request<T>(
-        &mut self, 
+        mut db: ChainDB,
+        source: Id,
         req: Request<T>,
-    ) -> Result<Option<T>> 
+    ) -> Result<Option<(Id, Request<T>, T)>> 
     where 
         T: DeserializeOwned,
     {
-        let req_hash = req.request_hash().clone();
-        self.db
+        let req_hash = req
+            .request_hash()
+            .clone();
+        db
             .read(req_hash)
             .await
+            .map(|opt| opt.map(|v| (source, req, v)))
     }
 }

@@ -129,6 +129,7 @@ where
                         BatcherConsensusMsg::NewRound { leader } => {
                             self.current_leader = leader;
                             self.proposed = false;
+                            self.pool.reset_timer();
                             // Check if we can propose and propose
                             self.try_propose()?;
                         },

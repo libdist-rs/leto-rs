@@ -139,7 +139,9 @@ impl<Tx> Synchronizer<Tx> {
         self.db.write(batch.clone()).await?;
 
         // Check if we know the parent
-        let parent_hash = proposal.block().parent_hash(); 
+        let parent_hash = proposal
+            .block()
+            .parent_hash(); 
         match self.db
             .read(parent_hash.clone())
             .await? {
@@ -172,7 +174,7 @@ impl<Tx> Synchronizer<Tx> {
         }
     }
 
-    /// This function synchronizes the relay message and converts it into a relay message
+    /// This function synchronizes the relay message and converts it into a propose message
     async fn sync_relay_msg(
         &mut self,
         proposal: Proposal<Id, Tx, Round>,

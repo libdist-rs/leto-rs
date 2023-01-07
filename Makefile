@@ -15,10 +15,10 @@ logs-clean:
 	@sed -i '' '/Async Sending Tx \[/d' test-log-client.log
 
 test-run:
-	@timeout 10 bash scripts/test4nodes.sh
-	@sleep 1
-	@make logs-clean || true
-	@make clean || true
+	@timeout 60 bash scripts/test4nodes.sh
+	@echo "Cleaning up ..." && sleep 1
+	@make logs-clean
+	@make clean
 
 clean:
 	@echo "Cleaning DB files"

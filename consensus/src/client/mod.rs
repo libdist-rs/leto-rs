@@ -11,5 +11,6 @@ pub trait MockTx: crate::types::Transaction {
         tx_id: usize,
         client_id: Id,
         tx_size: usize,
+        sample: bool,
     ) -> Self;
 }

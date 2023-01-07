@@ -1,4 +1,4 @@
-use std::{time::Duration, cmp::Ordering, collections::VecDeque, pin::Pin, task::{self, Poll}};
+use std::{cmp::Ordering, collections::VecDeque, pin::Pin, task::{self, Poll}};
 use super::Leto;
 use crate::{
     server::BatcherConsensusMsg as BCM,
@@ -11,7 +11,7 @@ use futures_util::Stream;
 use log::*;
 use mempool::Batch;
 use network::{plaintcp::CancelHandler, Acknowledgement};
-use tokio::time::{interval, Interval};
+use tokio::time::Interval;
 
 type PropMsg<Id, Tx, Round> = (
     Proposal<Id, Tx, Round>,
@@ -24,11 +24,11 @@ type BlameMsg<Id, Round> = (Round, Signature<Id, Round>);
 
 type BlameQCMsg<Id, Round> = (Round, Certificate<Id, Round>);
 
-#[derive(Debug)]
-pub enum Event<Tx> {
-    Timeout,
-    Msg(ProtocolMsg<Id, Tx, Round>),
-}
+// #[derive(Debug)]
+// pub enum Event<Tx> {
+//     Timeout,
+//     Msg(ProtocolMsg<Id, Tx, Round>),
+// }
 
 #[derive(Debug)]
 pub struct RoundContext<Tx> {
@@ -53,10 +53,6 @@ pub struct RoundContext<Tx> {
     /// transmission
     cancel_handlers: FnvHashMap<Round, Vec<CancelHandler<Acknowledgement>>>,
 
-    /// The timeout for the current round
-    timer: Interval,
-    /// This value tells if we already timed out for the current round
-    timer_enabled: bool,
     /// The QC for the current round
     pub(crate) blame_map: FnvHashMap<Id, Signature<Id, Round>>,
     /// This is used to indicate that we already extracted QC from blame_map
@@ -100,7 +96,6 @@ where
 
     pub fn new(
         num_nodes: usize,
-        delay: Duration,
     ) -> Self {
         Self {
             current_round: Round::MIN + 1,
@@ -109,18 +104,16 @@ where
             blame_qc_ready: FnvHashMap::default(),
             cancel_handlers: FnvHashMap::default(),
             num_nodes,
-            timer: interval(4 * delay),
-            timer_enabled: true,
             blame_map: FnvHashMap::default(),
             got_qc: false,
             msg_buf: FnvHashMap::default(),
         }
     }
 
-    /// Resets the timer
-    pub fn init(&mut self) {
-        self.timer.reset();
-    }
+    // /// Resets the timer
+    // pub fn init(&mut self) {
+    //     self.timer.reset();
+    // }
 
     /// Returns the current round
     pub fn round(&self) -> Round {
@@ -144,28 +137,28 @@ where
     }
 
     /// Disables blame timers for the current round
-    pub fn disable_blame_timers(&mut self) {
-        self.timer_enabled = false;
+    pub fn disable_blame_timers(&mut self, timer_enabled: &mut bool) {
+        *timer_enabled = false;
     }
 
     /// Move forward by one round
-    pub fn advance_round(&mut self) -> Result<()> {
+    pub fn advance_round(
+        &mut self, timer: &mut Interval, 
+        timer_enabled: &mut bool,
+    ) -> Result<()> {
         self.current_round += 1;
-
-        // Reset msg buf
-        self.msg_buf.clear();
 
         // GC too old cancel handlers
         self.cancel_handlers
             .retain(|round, _| gc_cancel_handlers(*round, self.current_round, self.num_nodes));
         
-        // GC old round messages
+        // GC old round messages in msg_buf
         self.msg_buf
             .retain(|r, _| r >= &self.current_round);
 
         // Reset timers
-        self.timer.reset();
-        self.timer_enabled = true;
+        timer.reset();
+        *timer_enabled = true;
 
         // Reset QC for the current round
         self.blame_map.clear();
@@ -228,15 +221,22 @@ where
             ProtocolMsg::ElementRequest {..} => unreachable!(),
             ProtocolMsg::ElementResponse {..} => unreachable!(),
         };
+        // msg_round < = > current_round
         match msg_round.cmp(&self.current_round) {
             Ordering::Less => {
-                debug!("Got an old message for round {} in round {}", 
+                debug!("Got an old message {:?} for round {} in round {}", 
+                    msg,
                     msg_round, 
                     self.current_round,
                 );
                 return Ok(());
             },
             Ordering::Greater => {
+                debug!("Got a future message {:?} for round {} in round {}", 
+                    msg,
+                    msg_round, 
+                    self.current_round,
+                );
                 match msg {
                     ProtocolMsg::Propose { 
                         proposal, 
@@ -260,6 +260,11 @@ where
                 }
             },
             Ordering::Equal => {
+                debug!("Got a correct round message {:?} for round {} in round {}", 
+                    msg,
+                    msg_round, 
+                    self.current_round,
+                );
                 self.msg_buf
                     .entry(self.current_round)
                     .or_default()
@@ -318,31 +323,44 @@ where
             .or_insert_with(Vec::new)
             .push((round, qc));
     }
+
+    /// The round context is ready if there are messages 
+    pub fn is_ready(&self) -> bool {
+        !self.msg_buf
+            .get(&self.current_round)
+            .map(VecDeque::is_empty)
+            .unwrap_or(true) 
+        // ||
+        // self.timer_enabled
+    }
 }
 
 impl<Tx> Stream for RoundContext<Tx>
 where
     Tx: Transaction,
 {
-    type Item = Event<Tx>;
+    type Item = ProtocolMsg<Id, Tx, Round>;
 
     fn poll_next(
         mut self: Pin<&mut Self>, 
-        cx: &mut task::Context<'_>,
+        _cx: &mut task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let rnd = self.as_ref().current_round;
-        let buf = self.msg_buf
-            .entry(rnd)
-            .or_default();
-        if buf.is_empty() {
-            if self.timer_enabled && self.timer.poll_tick(cx).is_ready() {
-                return Poll::Ready(Some(Event::Timeout));
-            }
-            return Poll::Pending;
-        }
-        let msg = buf.pop_front()
-            .unwrap();
-        Poll::Ready(Some(Event::Msg(msg)))
+        let msg = self.msg_buf
+            .get_mut(&rnd)
+            .expect("Should not be polled when empty")
+            .pop_front()
+            .expect("Must have a msg in msg_buf");
+        // if buf.is_empty() {
+        //     if self.timer_enabled && self.timer.poll_tick(cx).is_ready() {
+        //         return Poll::Ready(Some(Event::Timeout));
+        //     }
+        //     return Poll::Pending;
+        // }
+        // let msg = buf
+        //     .pop_front()
+        //     .expect("");
+        Poll::Ready(Some(msg))
     }
 }
 
@@ -355,7 +373,10 @@ where
         self.leader_context.advance_round();
 
         // Update the round
-        self.round_context.advance_round()?;
+        self.round_context.advance_round(
+            &mut self.timer, 
+            &mut self.timer_enabled,
+        )?;
 
         // Clear the waiting_hashes for the relay messages
         self.synchronizer.advance_round(self.round_context.round())?;
@@ -369,7 +390,7 @@ where
         };
         self.tx_consensus_to_batcher.send(batcher_msg)?;
 
-        debug!("Advancing to round {}", self.round_context.round());
+        info!("Advancing to round {}", self.round_context.round());
         debug!("Using new leader: {}", self.leader_context.leader());
         Ok(())
     }
