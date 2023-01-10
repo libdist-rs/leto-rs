@@ -168,7 +168,6 @@ pub struct CreateConfig {
     /// Size of each transaction
     #[arg(short = 'm', long)]
     #[clap(default_value_t = 1_024)]
-    #[arg(value_parser = clap::value_parser!(u64).range(33..))]
     pub tx_size: usize,
 
     /// Burst interval (in ms)
