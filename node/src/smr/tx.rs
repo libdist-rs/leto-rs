@@ -1,6 +1,7 @@
 use consensus::types::Transaction;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug, Display};
+use base64::{Engine as _, engine::general_purpose};
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SimpleTx<Data> {
@@ -17,7 +18,8 @@ where
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        write!(f, "Tx [{:?}, {}]", self.data, &base64::encode(&self.extra))
+        let encoded = general_purpose::STANDARD_NO_PAD.encode(&self.extra);
+        write!(f, "Tx [{:?}, {}]", self.data, &encoded)
     }
 }
 
@@ -29,7 +31,8 @@ where
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        write!(f, "Tx [{:?}, {}]", self.data, &base64::encode(&self.extra))
+        let encoded = general_purpose::STANDARD_NO_PAD.encode(&self.extra);
+        write!(f, "Tx [{:?}, {}]", self.data, &encoded)
     }
 }
 

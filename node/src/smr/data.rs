@@ -1,6 +1,7 @@
 use network::Message;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug, Display};
+use base64::{Engine as _, engine::general_purpose};
 
 pub trait Data: Message + Unpin {
     fn with_payload(data: &[u8]) -> Self;
@@ -23,7 +24,9 @@ impl Debug for SimpleData {
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        write!(f, "{}", base64::encode(&self.tx))
+        let encoded = general_purpose::STANDARD_NO_PAD
+            .encode(&self.tx);
+        write!(f, "{}", encoded)
     }
 }
 
@@ -32,6 +35,8 @@ impl Display for SimpleData {
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        write!(f, "{}", base64::encode(&self.tx))
+        let encoded = general_purpose::STANDARD_NO_PAD
+            .encode(&self.tx);
+        write!(f, "{}", &encoded)
     }
 }
