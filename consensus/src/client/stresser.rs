@@ -12,6 +12,7 @@ use network::{
     plaintcp::{TcpReceiver, TcpSimpleSender},
     Acknowledgement,
 };
+use rand::{thread_rng, Rng};
 use std::marker::PhantomData;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -38,6 +39,11 @@ where
         my_id: Id,
         settings: Settings,
     ) -> Result<oneshot::Sender<()>> {
+
+        // NOTE: Used for benchmarking
+        info!("Transactions size: {} B", settings.bench_config.tx_size);
+        info!("Transactions rate: {} tx/s", (settings.bench_config.txs_per_burst as u64 * 1000)/settings.bench_config.burst_interval_ms);
+
         let (exit_tx, exit_rx) = oneshot::channel();
 
         let mut peer_map = FnvHashMap::default();
@@ -89,6 +95,11 @@ where
         ));
         #[cfg(feature = "microbench")]
         let mut first = true;
+        let mut sample_id: u64 = thread_rng().gen();
+
+        // NOTE: This log entry is used to compute performance.
+        info!("Start sending transactions");
+
         loop {
             tokio::select! {
                 _ = &mut self.exit_rx => {
@@ -104,7 +115,14 @@ where
                             self.id, 
                             tx_size, 
                             i == 0,
+                            sample_id,
                         );
+                        #[cfg(feature = "benchmark")]
+                        {
+                            if i == 0 {
+                                info!("Sending sample transaction {}", sample_id);
+                            }
+                        }
                         #[cfg(feature = "microbench")]
                         {
                             if first {
@@ -115,12 +133,13 @@ where
                                 first = false;
                             }
                         }
-                        tx_id += 1;
                         self.consensus_sender.broadcast(
                             tx,
                             &all_ids, // SendAll
                         ).await;
+                        tx_id += 1;
                     }
+                    sample_id += 1;
                 }
                 confirmation = self.consensus_rx.recv() => {
                     info!("Received a confirmation message: {:?}", confirmation);

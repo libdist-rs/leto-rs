@@ -179,6 +179,15 @@ where
         let round = self.round_context.round();
         let proposal = Proposal::new(block, round, qc);
 
+        #[cfg(feature = "benchmark")]
+        {
+            // NOTE: This log entry is used to compute performance.
+            info!("Created B{} -> {:?}", 
+                proposal.round(), 
+                proposal.block().batch_hash(),
+            );
+        }
+
         // Create sig
         let prop_hash = Hash::ser_and_hash(&proposal);
         let auth = Signature::new(prop_hash, self.my_id, &self.crypto_system.secret)?;

@@ -90,7 +90,7 @@ where
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        let encoded = general_purpose::STANDARD_NO_PAD
+        let encoded = general_purpose::STANDARD
             .encode(&self.raw);
         f.debug_struct("Signature")
             .field("sig", &encoded)
@@ -107,7 +107,7 @@ where
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        let encoded = general_purpose::STANDARD_NO_PAD
+        let encoded = general_purpose::STANDARD
             .encode(&self.raw);
         f.debug_struct("Signature")
             .field("sig", &encoded)

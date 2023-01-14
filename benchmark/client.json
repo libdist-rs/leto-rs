@@ -26,6 +26,6 @@
   "bench_config": {
     "tx_size": 512,
     "burst_interval_ms": 50,
-    "txs_per_burst": 625
+    "txs_per_burst": 500
   }
 }

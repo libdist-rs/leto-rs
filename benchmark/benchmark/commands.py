@@ -20,7 +20,7 @@ class CommandMaker:
 
     @staticmethod
     def compile():
-        return f'cargo build --quiet --release -p node'
+        return f'cargo build --quiet --release -p node --features=benchmark'
 
     @staticmethod
     def generate_keys(num_nodes, directory):

@@ -24,7 +24,7 @@ impl Debug for SimpleData {
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        let encoded = general_purpose::STANDARD_NO_PAD
+        let encoded = general_purpose::STANDARD
             .encode(&self.tx);
         write!(f, "{}", encoded)
     }
@@ -35,7 +35,7 @@ impl Display for SimpleData {
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        let encoded = general_purpose::STANDARD_NO_PAD
+        let encoded = general_purpose::STANDARD
             .encode(&self.tx);
         write!(f, "{}", &encoded)
     }

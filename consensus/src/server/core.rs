@@ -1,6 +1,7 @@
 use super::{Leto, Settings};
 use crate::{to_socket_address, Id, KeyConfig};
 use anyhow::anyhow;
+use log::info;
 use mempool::{Batch, MempoolMsg};
 use network::{plaintcp::TcpSimpleSender, Acknowledgement};
 use std::{marker::PhantomData, path::PathBuf, sync::Arc};
@@ -26,6 +27,9 @@ where
         settings: Settings,
         tx_commit: UnboundedSender<Arc<Batch<Tx>>>,
     ) -> anyhow::Result<oneshot::Sender<()>> {
+        #[cfg(feature = "benchmark")]
+        settings.bench_log();
+
         // Create the DB
         let path = {
             let mut path = PathBuf::new();
@@ -48,8 +52,15 @@ where
         let mempool_peers = settings.get_mempool_peers(my_id)?;
         let mempool_net =
             TcpSimpleSender::<Id, MempoolMsg<Id, Tx>, Acknowledgement>::with_peers(mempool_peers);
-        let mempool_addr = to_socket_address("0.0.0.0", me.mempool_port)?;
-        let client_addr = to_socket_address("0.0.0.0", me.client_port)?;
+        let mempool_addr = to_socket_address(
+            "0.0.0.0", 
+            me.mempool_port,
+        )?;
+        let client_addr = to_socket_address(
+            "0.0.0.0", 
+            me.client_port,
+        )?;
+        info!("Server booted on {}", me.mempool_address);
 
         // A channel for the consensus to communicate with the mempool
         let (tx_consensus_to_mem, rx_consensus_to_mem) = unbounded_channel();
@@ -93,6 +104,7 @@ where
             tx_consensus_to_mem,
             tx_commit,
         )?;
+
         Ok(exit_tx)
     }
 }

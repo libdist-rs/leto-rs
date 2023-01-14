@@ -28,3 +28,4 @@ rand = "0.8"
 [features]
 default = []
 microbench = []
+benchmark = []

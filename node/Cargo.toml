@@ -39,3 +39,6 @@ git = "https://github.com/libdist-rs/libcrypto-rs.git"
 [dependencies.network]
 package = "network"
 git = "https://github.com/libdist-rs/libnet-rs.git"
+
+[features]
+benchmark = ["consensus/benchmark"]

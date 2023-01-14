@@ -18,7 +18,7 @@ where
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        let encoded = general_purpose::STANDARD_NO_PAD.encode(&self.extra);
+        let encoded = general_purpose::STANDARD.encode(&self.extra);
         write!(f, "Tx [{:?}, {}]", self.data, &encoded)
     }
 }
@@ -31,9 +31,27 @@ where
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        let encoded = general_purpose::STANDARD_NO_PAD.encode(&self.extra);
+        let encoded = general_purpose::STANDARD.encode(&self.extra);
         write!(f, "Tx [{:?}, {}]", self.data, &encoded)
     }
 }
 
-impl<Data> Transaction for SimpleTx<Data> where Data: crate::Data {}
+impl<Data> Transaction for SimpleTx<Data> where Data: crate::Data {
+    #[cfg(feature = "benchmark")]
+    fn is_sample(&self) -> bool {
+        use crate::ExtraData;
+
+        let extra_data: ExtraData = bincode::deserialize(&self.extra)
+            .expect("Failed to deserialize");
+        extra_data.sample
+    }
+
+    #[cfg(feature = "benchmark")]
+    fn get_id(&self) -> u64 {
+        use crate::ExtraData;
+
+        let extra_data: ExtraData = bincode::deserialize(&self.extra)
+            .expect("Failed to deserialize");
+        extra_data.sample_id
+    }
+}

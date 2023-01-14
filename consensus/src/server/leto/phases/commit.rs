@@ -187,7 +187,48 @@ impl<Tx> CommitContext<Tx> {
                                     unique_proposers.remove(&id);
                                 }
                                 // Commit element
-                                info!("Comitting {} in {}", element.batch.payload.len(), element.proposal.round());
+                                info!(
+                                    "Comitting {} in {}", 
+                                    element.batch.payload.len(), 
+                                    element.proposal.round(),
+                                );        
+
+                                #[cfg(feature = "benchmark")]
+                                {
+                                    // NOTE: This log entry is used to compute performance.
+                                    if element.proposal.round() != 0 {
+                                        info!(
+                                            "Committed B{} -> {:?}", 
+                                            element.proposal.round(), 
+                                            element.proposal.block().batch_hash(),
+                                        );
+                                    }
+
+                                    let tx_ids:Vec<_> = element 
+                                        .batch
+                                        .payload 
+                                        .iter()
+                                        .filter(|tx| tx.is_sample())
+                                        .map(|tx| tx.get_id())
+                                        .collect();
+
+                                    for tx_id in tx_ids {
+                                        // NOTE: This log entry is used to compute performance.
+                                        info!(
+                                            "Batch {:?} contains sample tx {}",
+                                            element.proposal.block().batch_hash(),
+                                            tx_id,
+                                        );
+                                    }
+
+                                    // NOTE: This log entry is used to compute performance.
+                                    info!(
+                                        "Batch {:?} contains {} B", 
+                                        element.proposal.block().batch_hash(), 
+                                        bincode::serialized_size(&element.batch).expect("Failed to get size"),
+                                    );
+                                }
+
                                 tx_commit.send(
                                     Arc::new(element.batch.clone())
                                 ).map_err(anyhow::Error::new)?;

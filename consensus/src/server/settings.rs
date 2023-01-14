@@ -136,7 +136,6 @@ impl Settings {
         conf.try_deserialize().map_err(anyhow::Error::new)
     }
 
-
     pub fn get_mempool_peers(&self, my_id: Id) 
         -> Result<HashMap<Id, SocketAddr>> 
     {
@@ -174,4 +173,33 @@ impl Settings {
         Ok(map)
     }
 
+    #[cfg(feature = "benchmark")]
+    pub fn bench_log(&self) {
+        use log::info;
+
+        info!(
+            "Timeout delay is {}",
+            self.bench_config.delay_in_ms,
+        );
+        info!(
+            "Garbage collection depth is {}",
+            self.mempool_config.gc_depth,
+        );
+        info!(
+            "Sync retry delay is {}", 
+            self.mempool_config.sync_retry_delay.as_millis(),
+        );
+        info!(
+            "Sync retry nodes is {}", 
+            self.mempool_config.sync_retry_nodes,
+        );
+        info!(
+            "Batch size is {}", 
+            self.bench_config.batch_size,
+        );
+        info!(
+            "Max batch delay is {}", 
+            self.bench_config.batch_timeout.as_millis(),
+        );
+    }
 }

@@ -21,7 +21,11 @@ impl<Id, Tx, Round> Block<Id, Tx, Round> {
         }
     }
 
-    pub(crate) fn parent_hash(&self) -> Hash<Element<Id, Tx, Round>> {
+    pub fn parent_hash(&self) -> Hash<Element<Id, Tx, Round>> {
         self.prev_hash.clone()
     }
+
+    pub fn batch_hash(&self) -> &BatchHash<Tx> {
+        &self.batch_hash
+    } 
 }
