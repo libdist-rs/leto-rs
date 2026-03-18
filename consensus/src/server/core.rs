@@ -3,7 +3,7 @@ use crate::{to_socket_address, Id, KeyConfig};
 use anyhow::anyhow;
 use log::info;
 use mempool::{Batch, MempoolMsg};
-use network::{plaintcp::TcpSimpleSender, Acknowledgement};
+use tcp_sender::TcpSimpleSender;
 use std::{marker::PhantomData, path::PathBuf, sync::Arc};
 use storage::rocksdb::Storage;
 use tokio::sync::{
@@ -51,7 +51,7 @@ where
             .ok_or_else(|| anyhow!("My Id {} is not present in the config", my_id))?;
         let mempool_peers = settings.get_mempool_peers(my_id)?;
         let mempool_net =
-            TcpSimpleSender::<Id, MempoolMsg<Id, Tx>, Acknowledgement>::with_peers(mempool_peers);
+            TcpSimpleSender::<Id, MempoolMsg<Id, Tx>>::with_peers(mempool_peers);
         let mempool_addr = to_socket_address(
             "0.0.0.0", 
             me.mempool_port,

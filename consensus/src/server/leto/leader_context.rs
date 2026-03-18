@@ -1,4 +1,4 @@
-use crate::{Id, Round, start_id};
+use crate::{Id, Round, START_ID};
 use crypto::hash::Hash;
 use fnv::FnvHashSet;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
@@ -81,11 +81,11 @@ impl LeaderContext {
 
         let mut ctx = Self {
             rng: StdRng::from_seed(seed),
-            current_leader: start_id(),
+            current_leader: START_ID,
             current_round: Round::MIN,
             elligible,
             history,
-            next_leader: start_id(),
+            next_leader: START_ID,
         };
 
         ctx.advance_round();

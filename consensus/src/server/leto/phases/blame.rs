@@ -11,6 +11,9 @@ impl<Tx> Leto<Tx> {
     where
         Tx: Transaction,
     {
+        #[cfg(feature = "microbench")]
+        let start = tokio::time::Instant::now();
+
         // Disable more timeouts for the same round until we advance
         self.round_context.disable_blame_timers(&mut self.timer_enabled);
 
@@ -24,10 +27,12 @@ impl<Tx> Leto<Tx> {
         };
 
         // Broadcast to all the servers
-        let handlers = self
+        let bytes = bytes::Bytes::from(bincode::serialize(&pmsg).unwrap());
+        let results = self
             .consensus_net
-            .broadcast(&self.broadcast_peers, pmsg.clone())
+            .broadcast(&self.broadcast_peers, bytes)
             .await;
+        let handlers: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
         self.round_context.add_handlers(handlers);
 
         // Loopback
@@ -35,6 +40,8 @@ impl<Tx> Leto<Tx> {
             .send(pmsg)
             .map_err(anyhow::Error::new)?;
 
+        #[cfg(feature = "microbench")]
+        println!("Time spent in on_round_timeout is {}", start.elapsed().as_micros());
         Ok(())
     }
 
@@ -52,6 +59,9 @@ impl<Tx> Leto<Tx> {
     where
         Tx: Transaction,
     {
+        #[cfg(feature = "microbench")]
+        let start = tokio::time::Instant::now();
+
         debug!("Got a blame message for round {}: {}", blame_round, auth);
 
         // Handle the case where we received a proposal for the current round and a
@@ -98,7 +108,12 @@ impl<Tx> Leto<Tx> {
         }
 
         // By-pass checks
-        self.handle_blame_qc(blame_round, qc).await
+        self.handle_blame_qc(blame_round, qc).await?;
+
+        #[cfg(feature = "microbench")]
+        println!("Time spent in handle_blame is {}", start.elapsed().as_micros());
+
+        Ok(())
     }
 
     /// On getting a blame QC we broadcast the QC to all the servers
@@ -150,10 +165,12 @@ impl<Tx> Leto<Tx> {
         };
 
         // Broadcast the certificate
-        let cancel_handlers = self
+        let bytes = bytes::Bytes::from(bincode::serialize(&pmsg).unwrap());
+        let results = self
             .consensus_net
-            .broadcast(&self.broadcast_peers, pmsg)
+            .broadcast(&self.broadcast_peers, bytes)
             .await;
+        let cancel_handlers: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
         self.round_context.add_handlers(cancel_handlers);
 
         // Update chain state

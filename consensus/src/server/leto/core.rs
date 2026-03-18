@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
-use crate::server::{Settings, BatcherConsensusMsg, Handler, Parameters, RRBatcher};
-use crate::start_id;
+use crate::server::{Settings, BatcherConsensusMsg, Parameters, RRBatcher};
+use crate::START_ID;
 use crate::types::Transaction;
 use crate::{
     to_socket_address,
@@ -12,10 +12,7 @@ use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use log::*;
 use mempool::{Batch, BatchHash, ConsensusMempoolMsg};
-use network::{
-    plaintcp::{TcpReceiver, TcpReliableSender},
-    Acknowledgement,
-};
+use tcp_reliable_sender::TcpReliableSender;
 use storage::rocksdb::Storage;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
@@ -36,7 +33,7 @@ pub struct Leto<Tx> {
     /// Settings
     pub(crate) settings: Settings,
     /// Network abstraction
-    pub(crate) consensus_net: TcpReliableSender<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>,
+    pub(crate) consensus_net: TcpReliableSender<Id, ProtocolMsg<Id, Tx, Round>>,
 
     // Channel handlers
     /// A signal to exit the protocol
@@ -76,8 +73,18 @@ pub struct Leto<Tx> {
     pub(crate) timer_enabled: bool,
 }
 
+#[derive(Debug)]
+enum STEP {
+    BatchHash,
+    Synchronizer,
+    RoundSynchronizedMsg,
+    TimerTick,
+    LoopbackMsg,
+    RawNetMsg,
+}
+
 impl<Tx> Leto<Tx> {
-    pub const INITIAL_LEADER: Id = start_id();
+    pub const INITIAL_LEADER: Id = START_ID;
     pub const INITIAL_ROUND: Round = 0;
 }
 
@@ -113,16 +120,22 @@ where
 
         // Start networking receiver for consensus messages
         let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
-        TcpReceiver::<Acknowledgement, ProtocolMsg<Id, Tx, Round>, _>::spawn(
-            consensus_addr,
-            Handler::<Id, Tx, Round>::new(tx_net_to_consensus),
-        );
+        let mut receiver = tcp_receiver::TcpReceiver::<ProtocolMsg<Id, Tx, Round>>::spawn(consensus_addr);
+        // Spawn a forwarding task
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            while let Some(Ok(msg)) = receiver.next().await {
+                if tx_net_to_consensus.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
 
         // Start outgoing connections
         let consensus_peers = settings
             .get_consensus_peers(my_id)?;
         let consensus_net =
-            TcpReliableSender::<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>::with_peers(
+            TcpReliableSender::<Id, ProtocolMsg<Id, Tx, Round>>::with_peers(
                 consensus_peers.clone(),
             );
 
@@ -215,10 +228,12 @@ where
         // Setup genesis context
         self.chain_state.genesis_setup().await?;
 
-
         // The timeout for the current round
         // Reset the timer
         self.timer.reset();
+
+        let mut bench_start; 
+        let mut step;
 
         // Start the protocol loop
         loop {
@@ -233,6 +248,8 @@ where
                 batch_hash = self.rx_mem_to_consensus.recv(), 
                     if self.leader_context.leader() == self.my_id
                 => {
+                    bench_start = tokio::time::Instant::now();
+                    step = STEP::BatchHash;
                     let batch_hash = batch_hash.ok_or_else(||
                         anyhow!("Mempool processor has shut down")
                     )?;
@@ -243,6 +260,8 @@ where
                 // Receive delivery synchronized messages
                 // Forward to round synchronizer
                 sync_help = &mut self.synchronizer.next() => {
+                    bench_start = tokio::time::Instant::now();
+                    step = STEP::Synchronizer;
                     let synced_msg = sync_help.ok_or_else(||
                         anyhow!("Synchronizer channel closed")
                     )?;
@@ -256,6 +275,8 @@ where
                     // IMPORTANT: Prevents `Poll::Pending` when no messages are present
                     if self.round_context.is_ready() => 
                 {
+                    bench_start = tokio::time::Instant::now();
+                    step = STEP::RoundSynchronizedMsg;
                     let synced_msg = rnd_help.ok_or_else(||
                         anyhow!("Round context error")
                     )?;
@@ -271,6 +292,8 @@ where
                     }
                 }
                 _ = self.timer.tick(), if self.timer_enabled => {
+                    bench_start = tokio::time::Instant::now();
+                    step = STEP::TimerTick;
                     if let Err(e) = self.on_round_timeout().await {
                         error!("Error handling on round timeout: {}", e);
                     }
@@ -279,6 +302,8 @@ where
                 // Loopback messages are always delivery synchronized 
                 // Hence, forward them to the round synchronizer
                 msg = self.rx_msg_loopback.recv() => {
+                    bench_start = tokio::time::Instant::now();
+                    step = STEP::LoopbackMsg;
                     let msg = msg.ok_or_else(||
                         anyhow!("Loopback layer has closed")
                     )?;
@@ -290,6 +315,8 @@ where
                 // Receive consensus messages from others
                 // Forward to Delivery synchronizer
                 msg = self.rx_net_to_consensus.recv() => {
+                    bench_start = tokio::time::Instant::now();
+                    step = STEP::RawNetMsg;
                     let msg = msg.ok_or_else(||
                         anyhow!("Networking layer has closed")
                     )?;
@@ -299,6 +326,9 @@ where
                     }
                 }
             };
+            println!("Time for step {:?} is {}", 
+                step,
+                bench_start.elapsed().as_micros())
         }
         info!("Server is shutting down!");
         Ok(())

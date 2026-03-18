@@ -6,7 +6,7 @@ use anyhow::Result;
 use fnv::FnvHashMap;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use mempool::Batch;
-use network::{plaintcp::TcpSimpleSender, Acknowledgement, NetSender};
+use tcp_sender::TcpSimpleSender;
 use serde::de::DeserializeOwned;
 use std::net::SocketAddr;
 use storage::rocksdb::Storage;
@@ -25,7 +25,7 @@ pub struct Helper<Tx> {
     /// Channel to handle requests from others
     rx_requests: UnboundedReceiver<HelperRequest<Tx>>,
     /// A simple sender to send responses to the sender
-    network: TcpSimpleSender<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>,
+    network: TcpSimpleSender<Id, ProtocolMsg<Id, Tx, Round>>,
 }
 
 impl<Tx> Helper<Tx> {
@@ -81,23 +81,25 @@ impl<Tx> Helper<Tx> {
                 },
                 Some(Ok(Some((source, req, batch)))) = batch_read_queue.next(), 
                     if !batch_read_queue.is_empty() => {
-                    let response_msg = ProtocolMsg::BatchResponse{
+                    let response_msg: ProtocolMsg<Id, Tx, Round> = ProtocolMsg::BatchResponse{
                         response: Response::new(
                             req.request_hash().clone(),
                             batch,
                         )
                     };
-                    self.network.send(source, response_msg).await;
+                    let bytes = bytes::Bytes::from(bincode::serialize(&response_msg).unwrap());
+                    let _ = self.network.send(source, bytes).await;
                 },
-                Some(Ok(Some((source, req, element)))) = element_read_queue.next(), 
+                Some(Ok(Some((source, req, element)))) = element_read_queue.next(),
                 if !element_read_queue.is_empty() => {
-                    let response_msg = ProtocolMsg::ElementResponse{
+                    let response_msg: ProtocolMsg<Id, Tx, Round> = ProtocolMsg::ElementResponse{
                         response: Response::new(
                             req.request_hash().clone(),
                             element,
                         )
                     };
-                    self.network.send(source, response_msg).await;
+                    let bytes = bytes::Bytes::from(bincode::serialize(&response_msg).unwrap());
+                    let _ = self.network.send(source, bytes).await;
                 }
             } 
         }

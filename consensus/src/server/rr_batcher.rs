@@ -3,7 +3,6 @@ use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use log::*;
 use mempool::{Batch, Transaction};
-use network::Identifier;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -66,7 +65,7 @@ pub struct RRBatcher<Id, Tx> {
 
 impl<Id, Tx> RRBatcher<Id, Tx>
 where
-    Id: Identifier,
+    Id: std::fmt::Debug + Clone + Eq + std::hash::Hash + Send + Sync + 'static,
     Tx: Transaction,
 {
     pub fn spawn(

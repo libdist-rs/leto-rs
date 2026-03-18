@@ -1,6 +1,7 @@
 use super::{Certificate, Proposal, Request, Response, Signature, Element};
 use crypto::hash::Hash;
 use mempool::{Batch, BatchHash};
+use net_common::Message;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -47,4 +48,24 @@ pub enum ProtocolMsg<Id, Tx, Round> {
 pub enum ClientMsg<Tx> {
     NewTx(Tx),
     Confirmation(Hash<Tx>),
+}
+
+impl<Id, Tx, Round> Message for ProtocolMsg<Id, Tx, Round>
+where
+    Self: serde::de::DeserializeOwned,
+{
+    type DeserializationError = Box<bincode::ErrorKind>;
+    fn from_bytes(bytes: &[u8]) -> Result<Self, Self::DeserializationError> {
+        bincode::deserialize(bytes)
+    }
+}
+
+impl<Tx> Message for ClientMsg<Tx>
+where
+    Self: serde::de::DeserializeOwned,
+{
+    type DeserializationError = Box<bincode::ErrorKind>;
+    fn from_bytes(bytes: &[u8]) -> Result<Self, Self::DeserializationError> {
+        bincode::deserialize(bytes)
+    }
 }

@@ -38,7 +38,7 @@ pub use cli::*;
 mod smr;
 pub use smr::*;
 
-// generate a default stdout logger
+// Generate a default stdout logger
 fn default_logger(
     id: String,
     level: log::Level,
@@ -59,6 +59,7 @@ fn default_logger(
     Ok(log4rs::init_config(config)?)
 }
 
+/// This function writes the final settings in the config directory
 fn write_config_files(
     output_dir: PathBuf,
     server_settings: &server::Settings,
@@ -85,6 +86,7 @@ fn write_config_files(
     Ok(())
 }
 
+/// Creates the settings based on the arguments
 fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::Settings)> {
     // Create mempool config
     let mempool_config = mempool::Config::<Round> {
@@ -304,13 +306,8 @@ async fn main() -> Result<()> {
             DummyCommitSink::spawn(rx_commit);
 
             // Start the Server
-            let exit_tx = Server::<TestTx>::spawn(
-                server_id,
-                all_ids,
-                crypto_system,
-                settings,
-                tx_commit,
-            )?;
+            let exit_tx =
+                Server::<TestTx>::spawn(server_id, all_ids, crypto_system, settings, tx_commit)?;
 
             // Implement a waiting strategy
             let mut signals = Signals::new(&[SIGINT, SIGTERM])?;

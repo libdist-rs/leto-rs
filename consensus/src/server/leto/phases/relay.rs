@@ -17,6 +17,9 @@ where
         auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch_hash: BatchHash<Tx>,
     ) -> Result<()> {
+        #[cfg(feature = "microbench")]
+        let start = tokio::time::Instant::now();
+
         debug!("Relaying the proposal");
 
         // Get the leader for the next round
@@ -25,7 +28,8 @@ where
         // If I am the next leader, ignore
         if next_leader == self.my_id {
             debug!("Returning because I am the next leader");
-            // self.tx_msg_loopback.send(relay_msg)?;
+            #[cfg(feature = "microbench")]
+            println!("Time spent in relay_proposal is {}", start.elapsed().as_micros());
             return Ok(());
         }
 
@@ -38,9 +42,14 @@ where
         };
 
         // If I am not the next leader, send real message
-        let handler = self.consensus_net.send(next_leader, relay_msg).await;
-        self.round_context
-            .add_handler(handler);
+        let bytes = bytes::Bytes::from(bincode::serialize(&relay_msg).unwrap());
+        if let Ok(handler) = self.consensus_net.send(next_leader, bytes).await {
+            self.round_context
+                .add_handler(handler);
+        }
+
+        #[cfg(feature = "microbench")]
+        println!("Time spent in relay_proposal is {}", start.elapsed().as_micros());
 
         Ok(())
     }

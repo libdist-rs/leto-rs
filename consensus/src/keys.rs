@@ -36,7 +36,10 @@ impl KeyConfig {
                 Algorithm::ED25519 => Keypair::generate_ed25519()?,
                 Algorithm::SECP256K1 => Keypair::generate_secp256k1(),
             };
-            let (sk, pk) = (kpair.private(), kpair.public());
+            let (sk, pk) = (
+                kpair.private(), 
+                kpair.public(),
+            );
             sks.insert(id, sk);
             system.insert(id, pk);
         }
@@ -51,55 +54,18 @@ impl KeyConfig {
     }
 }
 
-impl Serialize for KeyConfig {
-    fn serialize<S>(
-        &self,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let mut new_system = FnvHashMap::default();
-        for (id, v) in &self.system {
-            let pub_key_bytes = match v {
-                PublicKey::Ed25519(pk) => bincode::serialize(&pk).unwrap(),
-                PublicKey::Secp256k1(pk) => pk.encode().to_vec(),
-                #[cfg(feature = "RSA")]
-                PublicKey::RSA(pk) => {
-                    todo!();
-                }
-            };
-            new_system.insert(*id, pub_key_bytes);
-        }
-        let sk_bytes = match &self.secret {
-            SecretKey::Ed25519(sk) => bincode::serialize(sk).unwrap(),
-            SecretKey::Secp256k1(sk) => sk.to_bytes().to_vec(),
-            #[cfg(feature = "RSA")]
-            SecretKey::RSA(sk) => {}
-        };
-        let raw = RawKeyConfig {
-            alg: self.alg.clone(),
-            secret_bytes: sk_bytes,
-            system: new_system,
-        };
-        raw.serialize(serializer)
-    }
-}
+impl TryFrom<RawKeyConfig> for KeyConfig {
+    type Error = anyhow::Error;
 
-impl<'de> Deserialize<'de> for KeyConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let mut raw = RawKeyConfig::deserialize(deserializer)?;
+    fn try_from(mut raw: RawKeyConfig) -> anyhow::Result<Self> {
         let sk = match raw.alg {
             Algorithm::ED25519 => {
                 let skey: crypto::ed25519::SecretKey =
-                    bincode::deserialize(&raw.secret_bytes).unwrap();
+                    bincode::deserialize(&raw.secret_bytes)?;
                 crypto::SecretKey::Ed25519(skey)
             }
             Algorithm::SECP256K1 => {
-                let skey = crypto::secp256k1::SecretKey::from_bytes(&mut raw.secret_bytes).unwrap();
+                let skey = crypto::secp256k1::SecretKey::from_bytes(&mut raw.secret_bytes)?;
                 crypto::SecretKey::Secp256k1(skey)
             }
             #[cfg(feature = "RSA")]
@@ -111,11 +77,11 @@ impl<'de> Deserialize<'de> for KeyConfig {
         for (id, pk_bytes) in raw.system {
             let pk = match raw.alg {
                 Algorithm::ED25519 => {
-                    let pk: ed25519::PublicKey = bincode::deserialize(&pk_bytes).unwrap();
+                    let pk: ed25519::PublicKey = bincode::deserialize(&pk_bytes)?;
                     PublicKey::Ed25519(pk)
                 }
                 Algorithm::SECP256K1 => {
-                    let pk = secp256k1::PublicKey::decode(&pk_bytes).unwrap();
+                    let pk = secp256k1::PublicKey::decode(&pk_bytes)?;
                     PublicKey::Secp256k1(pk)
                 }
                 Algorithm::RSA => {
@@ -132,6 +98,60 @@ impl<'de> Deserialize<'de> for KeyConfig {
             secret: sk,
             system: new_system,
         })
+    }
+}
+
+impl TryFrom<&KeyConfig> for RawKeyConfig {
+    type Error = anyhow::Error;
+
+    fn try_from(key_config: &KeyConfig) -> anyhow::Result<Self> {
+        let mut new_system = FnvHashMap::default();
+        for (id, v) in &key_config.system {
+            let pub_key_bytes = match v {
+                PublicKey::Ed25519(pk) => bincode::serialize(&pk)?,
+                PublicKey::Secp256k1(pk) => pk.encode().to_vec(),
+                #[cfg(feature = "RSA")]
+                _ => unimplemented!(),
+            };
+            new_system.insert(*id, pub_key_bytes);
+        }
+        let sk_bytes = match &key_config.secret {
+            SecretKey::Ed25519(sk) => bincode::serialize(sk)?,
+            SecretKey::Secp256k1(sk) => sk.to_bytes().to_vec(),
+            #[cfg(feature = "RSA")]
+            SecretKey::RSA(sk) => {}
+        };
+        Ok(RawKeyConfig {
+            alg: key_config.alg.clone(),
+            secret_bytes: sk_bytes,
+            system: new_system,
+        })
+    }
+}
+
+impl Serialize for KeyConfig {
+    fn serialize<S>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let raw: RawKeyConfig = self.try_into()
+            .expect("Failed to serialize key config into raw key config");
+        raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawKeyConfig::deserialize(deserializer)?;
+        let key_config: Self = raw.try_into()
+            .expect("Failed to deserialize key config from raw key config");
+        Ok(key_config)
     }
 }
 

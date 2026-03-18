@@ -10,7 +10,7 @@ use fnv::FnvHashMap;
 use futures_util::Stream;
 use log::*;
 use mempool::Batch;
-use network::{plaintcp::CancelHandler, Acknowledgement};
+use tcp_reliable_sender::CancelHandler;
 use tokio::time::Interval;
 
 type PropMsg<Id, Tx, Round> = (
@@ -51,7 +51,7 @@ pub struct RoundContext<Tx> {
 
     /// A collection of cancel handlers for messages which are undergoing
     /// transmission
-    cancel_handlers: FnvHashMap<Round, Vec<CancelHandler<Acknowledgement>>>,
+    cancel_handlers: FnvHashMap<Round, Vec<CancelHandler>>,
 
     /// The QC for the current round
     pub(crate) blame_map: FnvHashMap<Id, Signature<Id, Round>>,
@@ -121,7 +121,7 @@ where
     }
 
     /// Track the following handler
-    pub fn add_handler(&mut self, handler: CancelHandler<Acknowledgement>) {
+    pub fn add_handler(&mut self, handler: CancelHandler) {
         self.cancel_handlers
             .entry(self.current_round)
             .or_default()
@@ -129,7 +129,7 @@ where
     }
 
     /// Track the following send handlers
-    pub fn add_handlers(&mut self, handlers: Vec<CancelHandler<Acknowledgement>>) {
+    pub fn add_handlers(&mut self, handlers: Vec<CancelHandler>) {
         self.cancel_handlers
             .entry(self.current_round)
             .or_default()

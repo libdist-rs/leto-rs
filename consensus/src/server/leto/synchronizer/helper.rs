@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use fnv::{FnvHashMap, FnvHashSet};
 use futures_util::{stream::FuturesUnordered, StreamExt, FutureExt};
 use mempool::{BatchHash, Batch};
-use network::{plaintcp::TcpSimpleSender, Acknowledgement, NetSender};
+use tcp_sender::TcpSimpleSender;
 use serde::de::DeserializeOwned;
 use storage::rocksdb::Storage;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -21,7 +21,7 @@ pub struct SyncHelper<Tx> {
     /// A channel to tell the outside world that this message is synced and ready
     tx_outer: UnboundedSender<ProtocolMsg<Id, Tx, Round>>,
     /// Networking
-    network: TcpSimpleSender<Id, ProtocolMsg<Id, Tx, Round>, Acknowledgement>,
+    network: TcpSimpleSender<Id, ProtocolMsg<Id, Tx, Round>>,
     /// The current round
     current_round: Round,
     /// Pending batches
@@ -62,6 +62,8 @@ where
         loop {
             if let Err(e) = tokio::select! {
                 Some(request) = self.rx_from_out.recv() => {
+                    #[cfg(feature = "microbench")]
+                    let start = tokio::time::Instant::now();
                     match request {
                         SyncMsg::DeliverBatchOnly(
                             req_hash, 
@@ -69,6 +71,7 @@ where
                             proposal, 
                             auth
                         ) => {
+
                             // Check if we are already waiting for this
                             let round_map = self.pending_relays
                                 .entry((self.current_round, sender))
@@ -79,12 +82,13 @@ where
                             round_map.insert(req_hash.clone());
                             
                             // Request batch from the sender
-                            let req_msg = ProtocolMsg::BatchRequest{
+                            let req_msg: ProtocolMsg<Id, Tx, Round> = ProtocolMsg::BatchRequest{
                                 source: self.my_id,
                                 request: Request::new(req_hash.clone()),
                             };
-                            self.network
-                                .send(sender, req_msg)
+                            let bytes = bytes::Bytes::from(bincode::serialize(&req_msg).unwrap());
+                            let _ = self.network
+                                .send(sender, bytes)
                                 .await;
 
                             // Add future that will be complete once this batch is loaded
@@ -96,7 +100,9 @@ where
                                     auth,
                                     sender,
                                 ).boxed()
-                            )
+                            );
+                            #[cfg(feature = "microbench")]
+                            println!("Time spent in handle_syncmsg_deliver_batch_only is {}", start.elapsed().as_micros());
                         },
                         SyncMsg::DeliverParentOnly(
                             parent_hash,
@@ -114,12 +120,13 @@ where
                             round_map.insert(parent_hash.clone());
 
                             // Request parent from the sender
-                            let req_msg = ProtocolMsg::ElementRequest {
+                            let req_msg: ProtocolMsg<Id, Tx, Round> = ProtocolMsg::ElementRequest {
                                 source: self.my_id,
                                 request: Request::new(parent_hash.clone()),
                             };
-                            self.network
-                                .send(sender, req_msg)
+                            let bytes = bytes::Bytes::from(bincode::serialize(&req_msg).unwrap());
+                            let _ = self.network
+                                .send(sender, bytes)
                                 .await;
 
                             // Add future that will be complete once this batch is loaded
@@ -131,7 +138,9 @@ where
                                     auth,
                                     sender,
                                 ).boxed()
-                            )
+                            );
+                            #[cfg(feature = "microbench")]
+                            println!("Time spent in handle_syncmsg_deliver_parent_only is {}", start.elapsed().as_micros());
                         },
                         SyncMsg::DeliverParentAndBatch(
                             batch_hash,
@@ -155,12 +164,16 @@ where
                                 .or_default();
                             if !relay_map.contains(&batch_hash) {
                                 relay_map.insert(batch_hash.clone());
-                                let msg = ProtocolMsg::BatchRequest{
+                                let msg: ProtocolMsg<Id, Tx, Round> = ProtocolMsg::BatchRequest{
                                     request: Request::new(batch_hash),
                                     source: self.my_id,
                                 };
-                                self.network.send(sender, msg).await;
+                                let bytes = bytes::Bytes::from(bincode::serialize(&msg).unwrap());
+                                let _ = self.network.send(sender, bytes).await;
                             }
+                            #[cfg(feature = "microbench")]
+                            println!("Time spent in both_parent_and_batch is {}", start.elapsed().as_micros());
+
                         },
                         SyncMsg::AdvanceRound(new_round) => {
                             // Ensure we are advancing forward
@@ -174,6 +187,8 @@ where
                                 .retain(|(round, _), _| *round >= new_round);
                             // Update the round
                             self.current_round = new_round;
+                            #[cfg(feature = "microbench")]
+                            println!("Time spent in handle_syncmsg_advance_round is {}", start.elapsed().as_micros());
                         }
                     };
                     Ok(())
@@ -220,6 +235,9 @@ where
     where
         Tx: DeserializeOwned,
     {
+        #[cfg(feature = "microbench")]
+        let start = tokio::time::Instant::now();
+
         let batch = db.notify_read(batch_hash).await?;
 
         // Now write this proposal so its children can be delivered
@@ -228,6 +246,9 @@ where
             auth.clone(), 
             batch.clone(),
         )).await?;
+
+        #[cfg(feature = "microbench")]
+        println!("Time spent in on_deliver_batch is {}", start.elapsed().as_micros());
 
         // Deliver message
         Ok(ProtocolMsg::Propose{ 
@@ -248,6 +269,9 @@ where
     where
         Tx: DeserializeOwned,
     {
+        #[cfg(feature = "microbench")]
+        let start = tokio::time::Instant::now();
+
         let batch = db.notify_read(batch_hash).await?;
         let _ = db.notify_read(proposal.block().parent_hash()).await?;
 
@@ -257,6 +281,9 @@ where
             auth.clone(), 
             batch.clone(),
         )).await?;
+        
+        #[cfg(feature = "microbench")]
+        println!("Time spent in on_deliver_parent_and_batch is {}", start.elapsed().as_micros());
 
         // Deliver message
         Ok(ProtocolMsg::Propose{ 
@@ -278,6 +305,9 @@ where
     where
         Tx: DeserializeOwned,
     {
+        #[cfg(feature = "microbench")]
+        let start = tokio::time::Instant::now();
+
         let _ = db.notify_read(proposal.block().parent_hash()).await?;
 
         // Now write this proposal so its children can be delivered
@@ -286,6 +316,9 @@ where
             auth.clone(), 
             batch.clone(),
         )).await?;
+
+        #[cfg(feature = "microbench")]
+        println!("Time spent in on_deliver_parent is {}", start.elapsed().as_micros());
 
         // Deliver message
         Ok(ProtocolMsg::Propose{ 

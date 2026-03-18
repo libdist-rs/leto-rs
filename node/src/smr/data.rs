@@ -1,9 +1,8 @@
-use network::Message;
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug, Display};
 use base64::{Engine as _, engine::general_purpose};
 
-pub trait Data: Message + Unpin {
+pub trait Data: Serialize + serde::de::DeserializeOwned + Send + Sync + Debug + Clone + Unpin + 'static {
     fn with_payload(data: &[u8]) -> Self;
 }
 

@@ -173,7 +173,8 @@ class LogParser:
         for sent, received in zip(self.sent_samples, self.received_samples):
             for tx_id, batch_id in received.items():
                 if batch_id in self.commits:
-                    assert tx_id in sent  # We receive txs that we sent.
+                    if tx_id not in sent:  # This tx_id was not sent by this client; move on
+                        continue
                     start = sent[tx_id]
                     end = self.commits[batch_id]
                     latency += [end-start]
@@ -183,7 +184,7 @@ class LogParser:
         consensus_latency = self._consensus_latency() * 1000
         consensus_tps, consensus_bps, _ = self._consensus_throughput()
         end_to_end_tps, end_to_end_bps, duration = self._end_to_end_throughput()
-        # end_to_end_latency = self._end_to_end_latency() * 1000
+        end_to_end_latency = self._end_to_end_latency() * 1000
 
         consensus_timeout_delay = self.configs[0]['consensus']['timeout_delay']
         consensus_sync_retry_delay = self.configs[0]['consensus']['sync_retry_delay']
@@ -220,7 +221,7 @@ class LogParser:
             '\n'
             f' End-to-end TPS: {round(end_to_end_tps):,} tx/s\n'
             f' End-to-end BPS: {round(end_to_end_bps):,} B/s\n'
-            # f' End-to-end latency: {round(end_to_end_latency):,} ms\n'
+            f' End-to-end latency: {round(end_to_end_latency):,} ms\n'
             '-----------------------------------------\n'
         )
 

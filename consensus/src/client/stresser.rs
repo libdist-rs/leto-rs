@@ -1,23 +1,16 @@
 use super::Settings;
-use crate::types::{self};
 use crate::{to_socket_address, Id};
 use anyhow::anyhow;
 use anyhow::Result;
-use async_trait::async_trait;
 use fnv::FnvHashMap;
-use futures_util::SinkExt;
 use log::*;
-use network::NetSender;
-use network::{
-    plaintcp::{TcpReceiver, TcpSimpleSender},
-    Acknowledgement,
-};
 use rand::{thread_rng, Rng};
 use std::marker::PhantomData;
 use std::time::Duration;
+use tcp_sender::TcpSimpleSender;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{
-    mpsc::{unbounded_channel, UnboundedSender},
+    mpsc::unbounded_channel,
     oneshot,
 };
 
@@ -26,7 +19,7 @@ pub struct Stressor<Tx> {
     id: Id,
     exit_rx: oneshot::Receiver<()>,
     settings: Settings,
-    consensus_sender: TcpSimpleSender<Id, Tx, Acknowledgement>,
+    consensus_sender: TcpSimpleSender<Id, Tx>,
     consensus_rx: UnboundedReceiver<Tx>,
     _x: PhantomData<Tx>,
 }
@@ -58,12 +51,21 @@ where
             peer_map.insert(*id, consensus_addr);
         }
         debug!("Using servers: {:?}", peer_map);
-        let consensus_sender = TcpSimpleSender::<Id, Tx, Acknowledgement>::with_peers(peer_map);
+        let consensus_sender = TcpSimpleSender::<Id, Tx>::with_peers(peer_map);
 
         // Networking setup
         let (consensus_tx, consensus_rx) = unbounded_channel();
         let my_addr = to_socket_address("0.0.0.0", 0)?; // Random available port
-        TcpReceiver::spawn(my_addr, Handler::<Tx>::new(consensus_tx));
+        let mut receiver = tcp_receiver::TcpReceiver::<Tx>::spawn(my_addr);
+        // Spawn a forwarding task
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            while let Some(Ok(msg)) = receiver.next().await {
+                if consensus_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
 
         // Start the client
         tokio::spawn(async move {
@@ -111,9 +113,9 @@ where
                     // Send `burst_tx` transactions every interval
                     for i in 0..burst_tx {
                         let tx = Tx::mock_transaction(
-                            tx_id, 
-                            self.id, 
-                            tx_size, 
+                            tx_id,
+                            self.id,
+                            tx_size,
                             i == 0,
                             sample_id,
                         );
@@ -127,15 +129,16 @@ where
                         {
                             if first {
                                 info!(
-                                    "Tx size: {}", 
+                                    "Tx size: {}",
                                     bincode::serialized_size(&tx)?,
                                 );
                                 first = false;
                             }
                         }
-                        self.consensus_sender.broadcast(
-                            tx,
-                            &all_ids, // SendAll
+                        let bytes = bytes::Bytes::from(bincode::serialize(&tx).unwrap());
+                        let _ = self.consensus_sender.broadcast(
+                            &all_ids,
+                            bytes,
                         ).await;
                         tx_id += 1;
                     }
@@ -148,39 +151,5 @@ where
             }
         }
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Handler<Tx> {
-    tx: UnboundedSender<Tx>,
-}
-
-impl<Tx> Handler<Tx> {
-    pub fn new(tx: UnboundedSender<Tx>) -> Self {
-        Self { tx }
-    }
-}
-
-#[async_trait]
-impl<Tx> network::Handler<Acknowledgement, Tx> for Handler<Tx>
-where
-    Tx: types::Transaction,
-{
-    async fn dispatch(
-        &self,
-        msg: Tx,
-        writer: &mut network::Writer<Acknowledgement>,
-    ) {
-        // Forward the message
-        self.tx
-            .send(msg)
-            .expect("Failed to send message to the consensus channel");
-
-        // Acknowledge
-        writer
-            .send(Acknowledgement::Pong)
-            .await
-            .expect("Failed to send an acknowledgement");
     }
 }

@@ -24,6 +24,9 @@ where
     where
         Tx: types::Transaction,
     {
+        #[cfg(feature = "microbench")]
+        let start = tokio::time::Instant::now();
+
         debug!(
             "Got a proposal: {:?} in round {}", 
             proposal, 
@@ -106,7 +109,12 @@ where
         }
 
         /* WE NOW HAVE A CORRECT PROPOSAL */
-        self.on_correct_proposal(proposal, auth, batch).await
+        self.on_correct_proposal(proposal, auth, batch).await?;
+        
+        #[cfg(feature = "microbench")]
+        println!("Time spent in handle_proposal is {}", start.elapsed().as_micros());
+
+        Ok(())
     }
 
     pub async fn on_correct_proposal(
@@ -115,6 +123,9 @@ where
         auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch: Batch<Tx>,
     ) -> Result<()> {
+        #[cfg(feature = "microbench")]
+        let start = tokio::time::Instant::now();
+
         // Get batch hash
         let batch_hash = Hash::ser_and_hash(&batch);
 
@@ -136,7 +147,12 @@ where
             .context("Error while sending optimistic clear")?;
 
         // Advance the round
-        self.advance_round().await
+        self.advance_round().await?;
+
+        #[cfg(feature = "microbench")]
+        println!("Time spent in on_correct_proposal is {}", start.elapsed().as_micros());
+
+        Ok(())
     }
 
     /// A function that will propose the new batch to all the servers
@@ -147,6 +163,9 @@ where
     where
         Tx: types::Transaction,
     {
+        #[cfg(feature = "microbench")]
+        let start = tokio::time::Instant::now();
+
         debug!("Got a batch hash: {}", batch_hash);
         debug!(
             "Server {} proposing for round {} as leader {}",
@@ -157,7 +176,10 @@ where
 
         // Create proposal
         let prev_hash = self.chain_state.highest_hash();
-        let block = Block::new(batch_hash.clone(), prev_hash);
+        let block = Block::new(
+            batch_hash.clone(), 
+            prev_hash,
+        );
         let qc = {
             let end = self.chain_state.highest_chain().proposal.round();
             let mut start = self.round_context.round() - 1;
@@ -177,7 +199,11 @@ where
             }
         };
         let round = self.round_context.round();
-        let proposal = Proposal::new(block, round, qc);
+        let proposal = Proposal::new(
+            block, 
+            round, 
+            qc,
+        );
 
         #[cfg(feature = "benchmark")]
         {
@@ -211,10 +237,12 @@ where
         };
 
         // Broadcast message
-        let handlers = self
+        let bytes = bytes::Bytes::from(bincode::serialize(&msg).unwrap());
+        let results = self
             .consensus_net
-            .broadcast(&self.broadcast_peers, msg.clone())
+            .broadcast(&self.broadcast_peers, bytes)
             .await;
+        let handlers: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
         self.round_context
             .add_handlers(handlers);
 
@@ -223,6 +251,8 @@ where
             error!("Error handling my own proposal: {}", e);
         }
 
+        #[cfg(feature = "microbench")]
+        println!("Time spent in handle_new_batch is {}", start.elapsed().as_micros());
         Ok(())
     }
 }

@@ -3,7 +3,6 @@ pub mod server;
 pub mod types;
 
 mod id;
-
 pub use id::*;
 
 mod round;
@@ -12,6 +11,7 @@ pub use round::*;
 use anyhow::Result;
 use std::net::{SocketAddr, SocketAddrV4};
 
+/// Converts "127.0.0.1", 3000 into a `SocketAddr` type
 pub fn to_socket_address(
     ip_str: &str,
     port: u16,

@@ -2,4 +2,8 @@
 members = [
     "consensus",
     "node",
+    "crypto",
+    "bench_macro",
+    "stress-test",
 ]
+resolver = "2"

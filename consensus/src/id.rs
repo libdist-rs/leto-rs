@@ -1,3 +1,3 @@
 pub type Id = usize;
 
-pub const fn start_id() -> Id { 0 }
+pub const START_ID:Id = 0;

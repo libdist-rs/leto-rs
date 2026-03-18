@@ -1,7 +1,7 @@
 use crate::{
     server::{ChainState, Leto},
     types::{Element, Transaction},
-    Id, Round, start_id,
+    Id, Round, START_ID,
 };
 use anyhow::{anyhow, Context, Result};
 use crypto::hash::Hash;
@@ -65,7 +65,7 @@ impl<Tx> CommitContext<Tx> {
         chain_state.genesis_setup().await?;
 
         // Genesis constants
-        let genesis_element = Arc::new(Element::<Id, Tx, Round>::genesis(start_id()));
+        let genesis_element = Arc::new(Element::<Id, Tx, Round>::genesis(START_ID));
         let genesis_element_hash = Hash::ser_and_hash(genesis_element.as_ref());
 
         // Commit Length
@@ -90,6 +90,8 @@ impl<Tx> CommitContext<Tx> {
         loop {
             tokio::select! {
                 msg = rx_inner.recv() => {
+                    #[cfg(feature = "microbench")]
+                    let bench_start = tokio::time::Instant::now();
                     let msg = msg.ok_or_else(||
                         anyhow!("Shutting down commit helper")
                     )?;
@@ -236,7 +238,9 @@ impl<Tx> CommitContext<Tx> {
                                 highest_committed_element = element;
                             }
                         },
-                    }
+                    };
+                    #[cfg(feature = "microbench")]
+                    println!("Time spent in commit_loop is {}", bench_start.elapsed().as_micros());
                 },
             }
         }

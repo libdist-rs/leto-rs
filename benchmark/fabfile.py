@@ -2,6 +2,7 @@
 from fabric import task
 
 from benchmark.local import LocalBench
+from benchmark.profile import ProfileBench
 from benchmark.logs import ParseError, LogParser
 from benchmark.utils import Print
 from benchmark.plot import Ploter, PlotError
@@ -10,7 +11,33 @@ from benchmark.remote import Bench, BenchError
 
 
 @task
-def local(ctx, debug = True):
+def local(ctx, debugMode = False):
+    ''' Run benchmarks on localhost '''
+    node_params = {
+        'servers': 4,
+        'network_delay': 500, # in milliseconds (Optional)
+        'gc_depth': 50,  # rounds (Optional)
+        'sync_retry_nodes': 3,  # number of nodes (Optional)
+        'sync_retry_delay': 10_000,  # ms (Optional)
+        'batch_size': 500_000,  # bytes
+        'max_batch_delay': 200,  # ms
+        'tx_size': 512,
+    }
+    bench_params = {
+        'faults': 0,
+        'rate': 100_000,
+        'local': True, # (Optional)
+        'duration': 60,
+        'runs': 1, # (Optional)
+    }
+    try:
+        ret = LocalBench(node_params, bench_params).run(debugMode).result()
+        print(ret)
+    except BenchError as e:
+        Print.error(e)
+
+@task
+def profile(ctx, debugMode=False):
     ''' Run benchmarks on localhost '''
     node_params = {
         'servers': 4,
@@ -26,12 +53,11 @@ def local(ctx, debug = True):
         'faults': 0,
         'rate': 40_000,
         'local': True, # (Optional)
-        'duration': 20,
+        'duration': 60,
         'runs': 1, # (Optional)
     }
     try:
-        ret = LocalBench(node_params, bench_params).run(debug).result()
-        print(ret)
+        ProfileBench(node_params, bench_params).run(debugMode)
     except BenchError as e:
         Print.error(e)
 
@@ -149,3 +175,29 @@ def logs(ctx):
         print(LogParser.process('./logs', faults='?').result())
     except ParseError as e:
         Print.error(BenchError('Failed to parse logs', e))
+
+if __name__ == '__main__':
+    ''' Run benchmarks on localhost '''
+    node_params = {
+        'servers': 4,
+        'network_delay': 500, # in milliseconds (Optional)
+        'gc_depth': 50,  # rounds (Optional)
+        'sync_retry_nodes': 3,  # number of nodes (Optional)
+        'sync_retry_delay': 10_000,  # ms (Optional)
+        'batch_size': 500_000,  # bytes
+        'max_batch_delay': 200,  # ms
+        'tx_size': 512,
+    }
+    bench_params = {
+        'faults': 0,
+        'rate': 40_000,
+        'local': True, # (Optional)
+        'duration': 20,
+        'runs': 1, # (Optional)
+    }
+    try:
+        log_data = LocalBench(node_params, bench_params).run(True)
+        ret = log_data.result()
+        print(ret)
+    except BenchError as e:
+        Print.error(e)

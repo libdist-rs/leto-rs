@@ -36,6 +36,16 @@ where
     }
 }
 
+impl<Data> net_common::Message for SimpleTx<Data>
+where
+    Self: serde::de::DeserializeOwned,
+{
+    type DeserializationError = Box<bincode::ErrorKind>;
+    fn from_bytes(bytes: &[u8]) -> Result<Self, Self::DeserializationError> {
+        bincode::deserialize(bytes)
+    }
+}
+
 impl<Data> Transaction for SimpleTx<Data> where Data: crate::Data {
     #[cfg(feature = "benchmark")]
     fn is_sample(&self) -> bool {

@@ -1,5 +1,4 @@
 use std::fmt::Debug;
-
 use super::Signature;
 use anyhow::{anyhow, Result};
 use crypto::hash::Hash;

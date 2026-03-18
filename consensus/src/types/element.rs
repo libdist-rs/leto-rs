@@ -4,6 +4,7 @@ use crypto::hash::Hash;
 use mempool::Batch;
 use serde::{Deserialize, Serialize};
 
+/// This is an element of the chain
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Element<Id, Tx, Round> {
     /// The proposal
@@ -30,12 +31,15 @@ impl<Id, Tx, Round> Element<Id, Tx, Round> {
     pub fn genesis(initial_leader: Id) -> Self 
     where 
         Round: mempool::Round,
-        Id: network::Identifier,
+        Id: std::fmt::Debug + Clone + Eq + std::hash::Hash + Send + Sync + 'static,
     {
         // let
         Self {
             proposal: Proposal {
-                block: Block::new(Hash::EMPTY_HASH, Hash::EMPTY_HASH),
+                block: Block::new(
+                    Hash::EMPTY_HASH, 
+                    Hash::EMPTY_HASH,
+                ),
                 qc: None,
                 round: Round::MIN,
             },
@@ -50,3 +54,5 @@ impl<Id, Tx, Round> Element<Id, Tx, Round> {
         }
     }
 }
+
+pub type ElementHash<Id, Tx, Round> = Hash<Element<Id, Tx, Round>>;
