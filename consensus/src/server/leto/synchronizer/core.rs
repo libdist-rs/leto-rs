@@ -146,15 +146,11 @@ impl<Tx> Synchronizer<Tx> {
             .read(parent_hash.clone())
             .await? {
             Some(..) => {
-                // Write the proposal so that messages that are dependent on this are resolved
-                self.db.write(Element::new(
-                    proposal.clone(),
-                    auth.clone(),
-                    batch.clone(),
-                )).await?;
-                let msg = ProtocolMsg::Propose { 
+                // Element write is handled by chain_state.update_highest_chain
+                // to avoid duplicate ~500KB serialization
+                let msg = ProtocolMsg::Propose {
                     proposal,
-                    auth, 
+                    auth,
                     batch,
                     sender,
                 };

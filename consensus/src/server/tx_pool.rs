@@ -71,7 +71,25 @@ where
         self.linked_hash_map.insert(hash, (tx, tx_size));
     }
 
-    /// Removes the transactions from the transaction pool if they exist
+    /// Removes transactions from the pool by count from the front.
+    /// Since make_batch pops from the front in FIFO order, clearing
+    /// by count avoids re-hashing every transaction in the batch.
+    pub fn clear_batch_count(
+        &mut self,
+        count: usize,
+    ) {
+        for _ in 0..count {
+            if let Some((_, (_, tx_size))) = self.linked_hash_map.pop_front() {
+                self.current_size -= tx_size;
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Removes the transactions from the transaction pool by hash.
+    /// Used when receiving batches from other nodes where we can't
+    /// rely on FIFO ordering.
     pub fn clear_batch(
         &mut self,
         batch: Batch<Tx>,

@@ -62,25 +62,6 @@ pub struct RoundContext<Tx> {
     num_nodes: usize,
 }
 
-/// Determine whether or not to retain the cancel handler for some message that
-/// we are transmitting
-///
-/// If true, we will try some more
-/// If false, we will stop the retransmission of the message to the servers and
-/// move on
-fn gc_cancel_handlers(
-    handler_round: Round,
-    current_round: Round,
-    num_nodes: usize,
-) -> bool {
-    // current round < 2n; retain
-    if current_round <= 2 * num_nodes as u64 {
-        return true;
-    }
-
-    // If we are in round 2n+1 and handler is from round 0 then delete
-    handler_round > current_round - (2 * num_nodes as u64)
-}
 
 impl<Tx> RoundContext<Tx>
 where
@@ -148,9 +129,16 @@ where
     ) -> Result<()> {
         self.current_round += 1;
 
-        // GC too old cancel handlers
-        self.cancel_handlers
-            .retain(|round, _| gc_cancel_handlers(*round, self.current_round, self.num_nodes));
+        // GC cancel handlers only after they've resolved.
+        // Dropping a CancelHandler before the message is transmitted causes
+        // the reliable sender to silently discard the message (is_closed check),
+        // which triggers timeouts, blame cycles, and connection churn.
+        self.cancel_handlers.retain(|_, handlers| {
+            handlers.retain_mut(|h| {
+                matches!(h.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty))
+            });
+            !handlers.is_empty()
+        });
         
         // GC old round messages in msg_buf
         self.msg_buf

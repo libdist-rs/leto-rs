@@ -313,7 +313,6 @@ where
                     }
                 }
                 // Receive consensus messages from others
-                // Forward to Delivery synchronizer
                 msg = self.rx_net_to_consensus.recv() => {
                     bench_start = tokio::time::Instant::now();
                     step = STEP::RawNetMsg;
@@ -321,12 +320,31 @@ where
                         anyhow!("Networking layer has closed")
                     )?;
                     debug!("Got a consensus message from the network: {:?}", msg);
-                    if let Err(e) = self.synchronizer.sync_msg(msg).await {
+                    // Fast path: Propose for current round with known parent.
+                    // Skip synchronizer pipeline, write batch to DB for peer
+                    // requests, and deliver directly to the round context.
+                    let res = match msg {
+                        ProtocolMsg::Propose { proposal, auth, batch, sender }
+                            if proposal.round() == self.round_context.round()
+                            && proposal.block().parent_hash()
+                                == self.chain_state.highest_hash()
+                        => {
+                            // Write batch to DB for peer sync, then deliver
+                            self.chain_state.write_batch_ref(&batch).await
+                                .and_then(|_| self.round_context.sync(
+                                    ProtocolMsg::Propose { proposal, auth, batch, sender }
+                                ))
+                        }
+                        msg => {
+                            self.synchronizer.sync_msg(msg).await
+                        }
+                    };
+                    if let Err(e) = res {
                         error!("Error handling consensus message: {}", e);
                     }
                 }
             };
-            println!("Time for step {:?} is {}", 
+            trace!("Time for step {:?} is {}μs",
                 step,
                 bench_start.elapsed().as_micros())
         }

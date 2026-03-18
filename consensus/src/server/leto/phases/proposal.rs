@@ -33,13 +33,17 @@ where
             self.round_context.round(),
         );
 
-        // Get parent
+        // Get parent - use in-memory cache when possible to avoid DB round-trip
         let parent_hash = proposal.block().parent_hash();
         trace!("Querying parent hash: {:?}", parent_hash);
-        let parent = self.chain_state
-            .get_element(parent_hash)
-            .await?
-            .unwrap();
+        let parent = if parent_hash == self.chain_state.highest_hash() {
+            (*self.chain_state.highest_chain()).clone()
+        } else {
+            self.chain_state
+                .get_element(parent_hash)
+                .await?
+                .unwrap()
+        };
         
         // Check proposal validity
         let is_proposal_valid = {
@@ -126,8 +130,9 @@ where
         #[cfg(feature = "microbench")]
         let start = tokio::time::Instant::now();
 
-        // Get batch hash
-        let batch_hash = Hash::ser_and_hash(&batch);
+        // Reuse the batch hash already stored in the proposal block
+        // instead of re-serializing the entire batch for hashing
+        let batch_hash = proposal.block().batch_hash().clone();
 
         // Send the proposal to the next leader and wait for an ack from them
         self.relay_proposal(proposal.clone(), auth.clone(), batch_hash)
@@ -137,12 +142,12 @@ where
 
         // Update the chain state (Will write this proposal to the disk)
         self.chain_state
-            .update_highest_chain(proposal, auth, batch.clone())
+            .update_highest_chain(proposal, auth, batch)
             .await?;
 
-        // Let the mempool know that we can clear these transactions
+        // Signal the batcher (txs already removed from pool by make_batch)
         self.tx_consensus_to_batcher
-            .send(BCM::OptimisticClear { batch })
+            .send(BCM::OptimisticClear)
             .map_err(anyhow::Error::new)
             .context("Error while sending optimistic clear")?;
 
@@ -229,15 +234,19 @@ where
 
         info!("Proposing a batch with {} tx", batch.payload.len());
 
-        let msg = ProtocolMsg::<Id, Tx, Round>::Propose {
-            proposal: proposal.clone(),
-            auth: auth.clone(),
-            batch: batch.clone(),
-            sender: self.my_id,
+        // Serialize the broadcast message once, then reuse the original
+        // proposal/auth/batch for loopback without extra clones
+        let bytes = {
+            let msg = ProtocolMsg::<Id, Tx, Round>::Propose {
+                proposal: proposal.clone(),
+                auth: auth.clone(),
+                batch: batch.clone(),
+                sender: self.my_id,
+            };
+            bytes::Bytes::from(bincode::serialize(&msg).unwrap())
         };
 
-        // Broadcast message
-        let bytes = bytes::Bytes::from(bincode::serialize(&msg).unwrap());
+        // Broadcast serialized message
         let results = self
             .consensus_net
             .broadcast(&self.broadcast_peers, bytes)
@@ -246,7 +255,7 @@ where
         self.round_context
             .add_handlers(handlers);
 
-        // Loopback
+        // Loopback: pass ownership to avoid cloning batch again
         if let Err(e) = self.handle_proposal(proposal, auth, batch).await {
             error!("Error handling my own proposal: {}", e);
         }

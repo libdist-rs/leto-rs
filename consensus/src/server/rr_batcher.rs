@@ -15,9 +15,9 @@ pub enum BatcherConsensusMsg<Id, Tx> {
     NewRound { leader: Id },
     /// On committing a batch, clear the batch
     Commit { batch: Batch<Tx> },
-    /// Clear this batch so that future proposers don't propose the same batch
-    /// in their turn if not committed
-    OptimisticClear { batch: Batch<Tx> },
+    /// Signal that a batch was received/proposed. The txs are already removed
+    /// from the pool by make_batch, so no clearing is needed.
+    OptimisticClear,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -136,9 +136,9 @@ where
                             // Clear in-memory mempool
                             self.pool.clear_batch(batch);
                         },
-                        BatcherConsensusMsg::OptimisticClear { batch } => {
-                            // Clear in-memory mempool
-                            self.pool.clear_batch(batch);
+                        BatcherConsensusMsg::OptimisticClear { .. } => {
+                            // No-op: the txs were already removed from the pool
+                            // by make_batch (pop_front) when the batch was sealed.
                         }
                     }
                 }

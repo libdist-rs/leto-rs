@@ -26,8 +26,8 @@ where
     pub async fn get_batch(
         &mut self,
         batch_hash: BatchHash<Tx>,
-    ) -> Result<Option<Batch<Tx>>> 
-    where 
+    ) -> Result<Option<Batch<Tx>>>
+    where
         Tx: Transaction,
     {
         self.db.read(batch_hash).await
@@ -50,7 +50,9 @@ where
         }
     }
 
-    /// Update the highest known chain
+    /// Update the highest known chain.
+    /// Serializes the element once and reuses the bytes for both the DB write
+    /// and the hash computation, avoiding ~1MB of redundant serialization.
     pub async fn update_highest_chain(
         &mut self,
         prop: Proposal<Id, Tx, Round>,
@@ -58,12 +60,17 @@ where
         batch: Batch<Tx>,
     ) -> Result<()>
     {
-        // Write chain element to the disk
         let chain_element = Arc::new(Element::new(prop, auth, batch));
-        self.write_element(chain_element.clone()).await?;
 
-        // Update highest state
-        self.highest_chain_hash = Hash::ser_and_hash(&chain_element);
+        // Serialize once
+        let serialized = bincode::serialize(chain_element.as_ref())?;
+        let element_hash = Hash::do_hash(&serialized);
+
+        // Write to DB using pre-serialized bytes
+        self.db.write_serialized(element_hash.clone(), serialized).await?;
+
+        // Update in-memory state
+        self.highest_chain_hash = element_hash;
         self.highest_chain_element = chain_element;
 
         Ok(())
@@ -90,6 +97,17 @@ where
     ) -> Result<()> {
         let element: Element<Id, Tx, Round> = chain_element.as_ref().clone();
         self.db.write::<Element<Id, Tx, Round>>(element).await
+    }
+
+    /// Write a batch to DB so peers can request it via BatchRequest.
+    /// Serializes from a reference to avoid cloning the batch.
+    pub async fn write_batch_ref(
+        &mut self,
+        batch: &Batch<Tx>,
+    ) -> Result<()> {
+        let serialized = bincode::serialize(batch)?;
+        let hash: BatchHash<Tx> = Hash::do_hash(&serialized);
+        self.db.write_serialized(hash, serialized).await
     }
 }
 
