@@ -1,0 +1,414 @@
+#+title: leto-rs local todo
+#+tags: { Layer : Zeus Leto Crypto Net } { Kind : Perf Correctness Refactor Test }
+
+* Zeus perf findings (2026-05-18) [0/3]
+
+  Source: profile pass against Zeus at 5k tx/s offered (in-process 4-node
+  harness). Baseline: 2,790 tx/s committed vs Leto 20,009 tx/s. Sig-chain
+  CPU-bound; per-round latency grows monotonically with data-chain height
+  (87 ms → 2,651 ms over a 30 s run). All findings produced by
+  ~cargo flamegraph -p stress-test-zeus --release~ + microbench traces.
+
+** DONE [#A] data_chain_valid O(H × B) re-hash (35% CPU)         :Zeus:Perf:Correctness:
+   CLOSED: [2026-05-18]
+   Refactor landed: data_block_store is now a validated-only set
+   under the admission invariant; child_of index added; three-case
+   admission (fast/bridge/parked); equivocation rejection O(1) (was
+   O(n) scan); data_chain_valid = store.contains_key (one line,
+   walk deleted). Parallel-check ran clean (debug_assert_eq!
+   between old walk and new path agreed for all admits during a
+   sustained stress run). Sig-round latency at H~130 is ~40 ms,
+   FLAT, vs 2,651 ms and growing pre-refactor.
+
+   *Design call made by developer (note):* added
+   =rleader_wakeup_pending: bool= flag on =Zeus= struct. The
+   admit-chain unwinds across async-recursion-bounded calls
+   (Box::pin), so the rleader-wakeup that used to fire inline
+   from on_data_propose now sets this flag from inside the drain
+   and the outermost on_data_propose / on_data_response consumes
+   it. Same observable behavior; touches the freshness rule
+   surface so flagged here for awareness.
+   :PROPERTIES:
+   :Location: consensus/src/server/zeus/chain_state/data_chain.rs:125
+   :Cost:     ~762 MB/s SHA256 input across the 4-node loop at H=113
+   :END:
+
+   *Symptom.* On every admit, =data_chain_valid= walks the ancestor chain
+   back to genesis. Inside the walk, =parent.hash() != parent_hash=
+   re-serializes the full =DataBlockEnvelope= (including ~480 KB payload)
+   and SHA256s it. At height H this is H × 500 KB of SHA256 input per
+   call. Sig-round latency grows monotonically with H, dominating the
+   tokio event loop.
+
+   *Root causes (compounding).*
+   1. The check =parent.hash() != parent_hash= verifies a property the
+      =FnvHashMap= key invariant already provides (=parent= was inserted
+      under its own envelope hash; fetching by that hash trivially
+      satisfies the predicate). Structurally untriggerable.
+   2. =data_chain_valid= itself is called on the fast admission path,
+      walking the full prefix on every admit. The prefix was already
+      validated when each ancestor was admitted -- no new safety added.
+
+   *Constraint from user (this session).* Want a clean, correct,
+   performant solution. Refactor is on the table. No band-aids.
+
+   See [[*Design: data-chain-valid refactor][Design section below]] for
+   the proposed approach. Currently in design phase.
+
+** DONE [#B] DataBlock clone/drop in the walk (11% CPU)             :Zeus:Perf:
+   CLOSED: [2026-05-18]
+   Resolved as a side effect of [#A] -- the walk is gone, the per-
+   iteration =current = parent.clone()= is gone. Re-profile if any
+   remaining clone site becomes a hot spot.
+   :PROPERTIES:
+   :Location: consensus/src/server/zeus/chain_state/data_chain.rs (walk body)
+   :Cost:     54 MB allocated+dropped per data_chain_valid call at H=113
+   :END:
+
+   The walk does =current = parent.clone()= per iteration, copying the
+   480 KB payload. Disappears for free when [[*data_chain_valid O(H × B) re-hash (35% CPU)][#A]] is fixed (the walk
+   itself goes away on the steady-state path). Re-evaluate after #A
+   lands; if any remaining call sites clone =DataBlock= unnecessarily,
+   convert to =&DataBlock= refs or wrap payload in =Arc<Vec<Tx>>=.
+
+* Zeus perf findings (2026-05-18, re-profile after #A) [0/5]
+
+  Baseline shift after the data_chain_valid O(1) refactor:
+  Zeus @ 5k offered: 2,790 → 5,012 tx/s (+79%)
+  Zeus saturation: ~20k wedge → ~45k tx/s (+125%)
+  Sig-round latency at H~130: 2,651 ms → 40 ms, FLAT.
+  At 40k offered: 24.7 data blocks/sec/node, 2.57 sig-rounds/sec/node,
+  ~9.6 blocks per sig round (prefix-commit batches them under the
+  W=16 in-flight pipeline).
+  Data plane is now the rate gate; sig-chain is catch-up.
+  TimerData fires ~2× per 30s run -- essentially dead code under
+  healthy load (1s timer vs 40ms block interval).
+
+** DONE [#D] DataBlock envelope re-hashed on every admit (15.3% CPU)  :Zeus:Perf:
+   CLOSED: [2026-05-18]
+   Resolved by Change A (OnceCell hash cache on DataBlock) and the
+   verify_data_block_sig site now calls block.hash() (cached ref).
+** TODO [#D-archived]
+   :PROPERTIES:
+   :Location: consensus/src/server/zeus/phases/data.rs:743 (verify_data_block_sig)
+   :Cost:     ~47 MB/s bincode + SHA256 of 480 KB envelope payloads
+   :END:
+
+   =Hash::ser_and_hash(&block.envelope)= serializes the full
+   =DataBlockEnvelope= -- including =payload: Vec<Tx>= (~480 KB) --
+   into a temporary buffer and SHA256s it, on every =on_data_propose=
+   call including the eleader's own loopback. No caching.
+
+   Same root cause as [#E] below. Both reduce dramatically if
+   =Hash<DataBlockEnvelope>= is computed once at construction on the
+   eleader and propagated alongside the block.
+
+   *Possible directions:* (1) Cache =Hash<DataBlockEnvelope>= as a
+   field on =DataBlock= at construction; receivers skip recompute.
+   (2) Pre-serialized hash field that emerges from deserialization.
+   (3) Reorder verification to skip the hash op when an earlier
+   cheaper check (epoch, sender) can reject.
+
+** DONE [#E] Attestation envelope re-hash embeds full DataBlock        :Zeus:Perf:Refactor:
+   CLOSED: [2026-05-18]
+   Resolved by Change A (OnceCell hash cache on Attestation) + Change C
+   (AttestationEnvelope no longer embeds the full DataBlock). attestation
+   hashing now serializes ~80 bytes instead of ~480 KB.
+** TODO [#E-archived]
+   :PROPERTIES:
+   :Location: consensus/src/server/zeus/phases/attestation.rs:77 (sign), :124 (validate)
+   :Cost:     ~10 calls/sec × 480 KB; secondary contributor to the 15.3% cluster
+   :END:
+
+   =AttestationEnvelope= embeds =data_block: DataBlock<Tx>=, so
+   hashing an attestation re-serializes the entire 480 KB payload a
+   second time. Same data was already hashed in [#D].
+
+   This is the same data-structure decision as previously logged
+   [#C] (=AttestationEnvelope.data_block= full embed on the wire).
+   Resolving [#C] also resolves [#E]; resolving [#E] alone via
+   caching helps but doesn't help WAN bandwidth.
+
+   *Possible directions:* (1) Embed only =(height, Hash<DataBlockEnvelope>)=
+   in =AttestationEnvelope= -- protocol-level change, needs paper
+   sign-off. (2) Cache the data-block hash on =DataBlock= so
+   attestation hashing reuses it without re-serializing. (3) Pre-hash
+   the attestation envelope at the proposer and ship a cached_hash
+   field.
+
+** DONE [#F] Future-drop overhead from large Zeus struct (12% CPU)     :Zeus:Perf:
+   CLOSED: [2026-05-18]
+   Partially resolved by Change B: DataBlock clone is now an Arc refcount
+   increment, so data_block_store entries and their payload bytes are not
+   deep-copied on clone. The store itself still grows; see the new GC TODO
+   in the coordinated-refactor section above for the remaining tail.
+** TODO [#F-archived]
+   :PROPERTIES:
+   :Location: consensus/src/server/zeus/core.rs:447 (Zeus::spawn closure)
+   :Cost:     ~12% active CPU in drop_in_place of select! arm futures
+   :END:
+
+   Tokio's async state machine captures =Zeus<Tx>= by reference;
+   each =select!= arm completion drops a future that holds the
+   struct's owned fields. =data_block_store= grows unbounded
+   (no pruning landed) -- drop cost rises with admitted height.
+
+   *Possible directions:* (1) Prune =data_block_store= below the
+   Zeus-committed watermark periodically (already noted as a
+   follow-up in the [#A] design). (2) Audit =Zeus<Tx>= field
+   layout -- Arc-wrap large owned containers so drop is a refcount
+   decrement, not a deep walk. (3) Box the heavy fields to keep
+   the per-poll stack frame lean.
+
+** DONE [#G] conflicts_data_prefix clones DataBlock per call            :Zeus:Perf:
+   CLOSED: [2026-05-18]
+   Resolved by Change B: payload is Arc<Vec<Tx>>; the walk clone is now
+   O(1) refcount inc instead of O(|payload|) deep copy.
+** TODO [#G-archived]
+   :PROPERTIES:
+   :Location: consensus/src/server/zeus/chain_state/data_chain.rs:157,161
+   :Cost:     ~12 MB/s clone bandwidth even at depth 0
+   :END:
+
+   The ancestor walk clones full =DataBlock<Tx>= (=d_prime = d.clone()=
+   line 157) on every call, even when the walk depth is 0. Steady
+   state has a 1-entry =commit_lock=, so depth is usually 0 or 1 --
+   but the unconditional incoming-block clone is paid per admit.
+
+   *Possible directions:* (1) Restructure the walk on borrowed
+   =&DataBlock= references. (2) Compare on =(height, hash)= tuples
+   instead of =PartialEq= over full blocks (depends on [#D] cached
+   hash).
+
+** TODO [#H] RocksDB Snappy compaction on shared store (4.1% wall)     :Zeus:Perf:
+   :PROPERTIES:
+   :Location: Background compaction thread (snappy::CompressFragment)
+   :Cost:     ~20.5 MB/s compress input at 40k tx/s
+   :END:
+
+   Mempool and sig-chain share a single =Storage= instance. Mempool
+   writes raw batches; RocksDB compaction runs Snappy off the tokio
+   path but competes for CPU with consensus workers under load.
+
+   *Possible directions:* (1) Disable compression on the mempool
+   store (ephemeral, latency-sensitive). (2) Split mempool into a
+   separate RocksDB instance with independent compaction settings.
+
+** Note on prior [#C] Attestation full-block embed
+   Subsumed into [#E] above. Resolving [#C] (wire-format change to
+   pin by ={height, hash}=) also resolves [#E]'s root cause. The
+   choice is whether to fix [#D]+[#E] via local caching (no wire-
+   format change, no paper revisit) or via [#C]/[#E] together
+   (protocol-level cleanup).
+
+** Observable: rleader_wakeup_pending batching
+   Confirmed at the profile: the flag is set inside =post_admit_side_effects=
+   called from drain paths, but consumed only by the outermost
+   =on_data_propose= / =on_data_response= after the entire admit
+   chain unwinds. With W=16 in-flight on loopback, up to 16 blocks
+   can be admitted before the rleader fires its next attestation
+   -- explains the ~9.6 blocks/round ratio. This is by-design
+   batching, not a bug, and is what lets the prefix commit deliver
+   large per-commit transaction volumes.
+
+** DONE [#C] Attestation embeds full DataBlock on the wire        :Zeus:Perf:Refactor:
+   CLOSED: [2026-05-18]
+   Resolved by Change C.
+   :PROPERTIES:
+   :Location: consensus/src/types/zeus.rs:101 -- AttestationEnvelope<Tx>.data_block
+   :Cost:     ~1.9 MB/s redundant on loopback (negligible); WAN-relevant
+   :END:
+
+   Every =SigPropose= carries the pinned =DataBlock= with payload that
+   peers already received via =DataPropose=. =make_attestation= also
+   re-serializes + SHA256s the embedded block per round. Not the
+   bottleneck on loopback; will dominate on WAN.
+
+   Decision deferred -- this is a protocol-level wire-format change
+   (pin by ={hash, height}= only, lean on the existing =Parked=
+   catch-up path on the receiver). Needs cross-check against the paper
+   before changing. Tag for WAN bring-up.
+
+* Zeus perf refactor (2026-05-18, #D + #E + #F coordinated)     :Zeus:Perf:Refactor:
+
+  Three changes landed together in one pass:
+  - Change A: Hash cached on DataBlock and Attestation via OnceCell<Hash<...>>.
+    hash() is now lock-free read after first call. PartialEq compares by hash.
+  - Change B: payload: Vec<Tx> → Arc<Vec<Tx>> in DataBlockEnvelope.
+    DataBlock clone is now O(1) refcount inc. conflicts_data_prefix walk
+    bandwidth collapsed. Wire format identical (serde rc feature serializes
+    Arc<T> as T).
+  - Change C: AttestationEnvelope.data_block: DataBlock<Tx> replaced by
+    (data_block_hash, data_block_height, data_block_epoch). Attestation wire
+    size ~80 bytes vs ~480 KB. attestation_valid looks up the block by hash;
+    miss returns Parked(hash) and triggers catch-up (§8.6). Paper confirmed:
+    §8.6 "A.D_h absent from local dataBlockStore" requires a reference
+    interpretation, not embedded value.
+
+  Smoke: Zeus @ 5k offered → 5483 tx/s. Leto @ 5k offered → 10388 tx/s (no regression).
+
+** TODO data_block_store GC below zeus_committed_high watermark     :Zeus:Perf:
+   Store grows unbounded; drop cost rises with H. Add periodic GC pass
+   removing blocks below zeus_committed_high once prefix emission confirms
+   they are finalized. Check that conflicts_data_prefix walk still has access
+   to recently committed ancestors during catch-up windows (pin the last N
+   committed blocks before pruning). No urgency until store depth > ~10k.
+
+** TODO Attestation epoch gate full wiring for multi-epoch         :Zeus:Correctness:
+   attestation_valid step 2 has a TODO(zeus-view-change) placeholder.
+   When multi-epoch support lands, wire the admitted_change_qcs check
+   for future-epoch pinned blocks (equivalent to epoch_gate_valid conditions
+   but without a DataBlock in hand — use data_block_epoch from the envelope).
+
+* Design: data-chain-valid refactor                              :Zeus:Refactor:Correctness:
+
+  Replace the lazy O(H) =data_chain_valid= with eager O(1) admission
+  invariants enforced at insert time.
+
+** Invariant (new)
+   Every block in =data_block_store= has been confirmed:
+   1. Signature valid under the eleader of its epoch.
+   2. =parent_hash= links to another block already in the store
+      (or to =dataGenesis= for height 1).
+   3. No equivocation: no other store entry has the same
+      =parent_hash= (one child per parent).
+
+   Consequence: chain-membership of any stored block is structural,
+   not computed. =data_chain_valid(D)= becomes a store-membership
+   lookup -- O(1).
+
+** State changes in DataChainState
+   - Keep: =head_hash=, =head_height=, =data_block_store=.
+   - Add: =child_of: FnvHashMap<DataBlockHash, DataBlockHash>=
+     -- parent_hash → child_hash. Built on each successful admit.
+     Enables O(1) "is the next height already pending?" and powers
+     equivocation rejection.
+   - Add (optional, later): =pruning_floor: u64= for store GC below
+     the Zeus-committed watermark. Out of scope for this refactor.
+
+** Admission rules (new on_data_propose path)
+   On admit attempt for incoming block D:
+   1. =data_block_valid(D, e_cur)= -- signature, epoch, height fields.
+      Reject on failure (existing).
+   2. *Equivocation check*: if =child_of.contains_key(&D.parent_hash)=
+      and =child_of[D.parent_hash] != H(D)=, the eleader has signed
+      two distinct children of the same parent. Reject with
+      =warn!("equivocation: …")=. (Full blame logic stays deferred.)
+   3. Position D:
+      a. =D.parent_hash == head_hash=  →  *fast path*: insert D,
+         set =head_hash = H(D)=, =head_height += 1=, populate
+         =child_of[old_head_hash] = H(D)=. *O(1).*
+      b. =D.parent_hash != head_hash= AND parent is in store  →
+         out-of-order extension of a non-head block (catch-up
+         filling forward). Insert D, populate =child_of=. Do NOT
+         advance head. Then *drain*: while =child_of[head_hash]=
+         exists, advance head one step. *O(k)* where k = bridged
+         depth.
+      c. Parent not in store  →  park reception, emit =DataRequest=
+         for =D.parent_hash=. (Existing catch-up flow; trigger via
+         the same =pendingAttestations= idiom or a parallel
+         =pendingDataBlocks=.)
+
+** data_chain_valid (new)
+   #+begin_src rust
+   pub fn data_chain_valid(&self, hash: &DataBlockHash<Tx>) -> bool {
+       // O(1): membership in the validated store IS chain-validity
+       // by the admission invariant.
+       self.data_block_store.contains_key(hash)
+   }
+   #+end_src
+
+   This replaces the entire backward walk. The =attestation_valid=
+   call site (=phases/attestation.rs=) inherits the speedup
+   automatically. The =Parked(hash)= branch of =AttestationValidity=
+   is unchanged -- if the pinned block is not in the store, we still
+   park and request.
+
+** Correctness sketch
+   *Induction.* Genesis block satisfies invariants trivially (height 0,
+   no parent). Inductive step: when D is admitted via case (a), its
+   parent (head) is in the store by induction; the equivocation check
+   ensures =child_of= remains injective; the parent_hash linkage is
+   verified by direct comparison =D.parent_hash == head_hash=. The
+   store now contains D, and the chain head → ... → genesis is
+   well-formed. Case (b) is the same induction applied to a non-head
+   ancestor; head doesn't advance unless the drain succeeds. Case (c)
+   does not insert anything until parent arrives.
+
+   *Equivocation.* A Byzantine eleader signing two distinct children
+   D₁, D₂ of the same parent is caught at step 2 of admission: the
+   second arrival sees =child_of[parent_hash]= already set, rejects.
+   The first arrival -- whichever wins the race -- is admitted; the
+   second is dropped (logged). This matches the spec's
+   "no equivocation admitted on the locally-extended data prefix"
+   without invoking blame logic.
+
+   *Out-of-order delivery.* The catch-up flow (=on_data_response=
+   inserting a missing intermediate block) lands in case (b). Drain
+   advances head as the bridge completes.
+
+** What this refactor does NOT change
+   - Wire format (=DataBlock=, =Attestation= shapes unchanged).
+   - =attestation_valid= tri-state semantics
+     (=Valid= / =Invalid= / =Parked=).
+   - =commit_lock= population or the prefix-commit projection.
+   - =pendingAttestations= replay path.
+   - The =data_block_valid(D, e_cur)= signature -- catch-up still
+     passes =D.epoch= as =e_cur=.
+   - The deferred view-change path or any blame logic.
+
+** Risk
+   - The walk currently exists; some code may implicitly depend on
+     its side-effects (e.g. propagating a missing-ancestor signal up
+     to trigger =DataRequest=). The refactor must preserve that:
+     case (c) is explicitly the parked-parent branch.
+   - Pruning is NOT in scope; the store grows. Add a separate task to
+     GC below the Zeus-committed watermark once this lands and is
+     stable.
+
+** Refactor steps (in dependency order)
+   1. Add =child_of= to =DataChainState=; populate on existing insert
+      sites (no behavior change yet).
+   2. Add equivocation rejection at the admit site, gated by
+      =child_of= collision. Smoke test: confirm no rejections under
+      honest eleader.
+   3. Add the three-case admission logic in =on_data_propose=.
+      Migrate fast-path callers to case (a). Keep the old
+      =data_chain_valid= temporarily as a parallel check (assert old
+      and new agree).
+   4. Once parity confirmed across a stress run, delete the old
+      walk-based =data_chain_valid= body and replace with the O(1)
+      store-membership lookup. Remove parallel-check.
+   5. Re-profile. Confirm 35% CPU freed and sig-round latency no
+      longer grows with H.
+
+** Case (c) handling: request/response
+   *Decision (user, 2026-05-18).* Handle missing-parent via the
+   existing =MsgDataRequest= / =MsgDataResponse= machinery. The
+   responding node must serve from its own validated
+   =data_block_store= -- no fabrication, no relay-from-elsewhere.
+
+   *Mechanics.*
+   - On =on_data_propose= reaching case (c): park D in a new
+     =pendingDataBlocks: FnvHashMap<DataBlockHash, Vec<DataBlock>>=
+     keyed by =D.parent_hash=. Broadcast
+     =ZeusMsg::DataRequest { target_hash: D.parent_hash, source: self.my_id }=.
+     Capture the returned =CancelHandler=s into =round_state.add_handlers=
+     -- see [[file:~/.claude/projects/-Users-hermitsage-Github-leto-rs/memory/feedback_cancel_handlers_first.md][feedback_cancel_handlers_first]].
+   - =on_data_request= is unchanged: serves =DataResponse= only if
+     the requested hash is in the local =data_block_store= (which
+     under the new invariant means the responder has validated it).
+   - =on_data_response= becomes an admit call: re-enters the three-
+     case logic. If the response's parent is also missing, this
+     cascades into another =DataRequest=, bounded by the depth from
+     the response back to the nearest in-store ancestor.
+   - On successful admission of a block D' (any case), drain
+     =pendingDataBlocks[H(D')]= and re-admit each parked child. The
+     drain naturally interleaves with the case-(b) head-advance
+     drain so a long out-of-order chain unwinds in one pass.
+
+   *Symmetry.* This mirrors =pendingAttestations= exactly. Same park-
+   then-replay idiom, same wire messages -- only the index type
+   differs (data-block-hash vs. attestation's data-block-hash).
+   Consider whether to unify the two maps as a follow-up; not in
+   scope for this refactor.
