@@ -17,7 +17,7 @@ tcp-reliable-sender = { git = "https://github.com/libdist-rs/libnet-rs.git" }
 tcp-receiver = { git = "https://github.com/libdist-rs/libnet-rs.git" }
 net-common = { package = "common", git = "https://github.com/libdist-rs/libnet-rs.git" }
 bytes = "1"
-serde = { version = "1", features = ["derive"]}
+serde = { version = "1", features = ["derive", "rc"]}
 bincode = "1"
 base64 = "0"
 anyhow = "1"
@@ -28,6 +28,7 @@ async-trait = "0"
 futures-util = "0"
 linked-hash-map = "0"
 rand = "0.8"
+once_cell = "1"
 
 [features]
 default = []

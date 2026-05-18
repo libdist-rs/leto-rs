@@ -75,18 +75,12 @@ impl<Tx> CommitContext<Tx> {
         let mut highest_committed_element = genesis_element.clone();
         let mut highest_committed_hash = Hash::ser_and_hash(highest_committed_element.as_ref());
         let mut unique_proposers = LinkedHashMap::<Id, usize>::default();
-        unique_proposers.insert(
-            genesis_element.auth.get_id(), 
-            1,
-        );
+        unique_proposers.insert(genesis_element.auth.get_id(), 1);
         let mut commit_queue = LinkedHashMap::<
             Hash<Element<Id, Tx, Round>>,
             Arc<Element<Id, Tx, Round>>,
         >::with_capacity(commit_len);
-        commit_queue.insert(
-            genesis_element_hash.clone(), 
-            genesis_element,
-        );
+        commit_queue.insert(genesis_element_hash.clone(), genesis_element);
         loop {
             tokio::select! {
                 msg = rx_inner.recv() => {
@@ -166,7 +160,7 @@ impl<Tx> CommitContext<Tx> {
                                 commit_queue.extend(local_queue);
                                 // merge unique_proposers and local_unique_proposers
                                 for (id, num) in local_unique_proposers
-                                    .into_iter() 
+                                    .into_iter()
                                 {
                                     *unique_proposers
                                         .entry(id)
@@ -190,25 +184,25 @@ impl<Tx> CommitContext<Tx> {
                                 }
                                 // Commit element
                                 info!(
-                                    "Comitting {} in {}", 
-                                    element.batch.payload.len(), 
+                                    "Comitting {} in {}",
+                                    element.batch.payload.len(),
                                     element.proposal.round(),
-                                );        
+                                );
 
                                 #[cfg(feature = "benchmark")]
                                 {
                                     // NOTE: This log entry is used to compute performance.
                                     if element.proposal.round() != 0 {
                                         info!(
-                                            "Committed B{} -> {:?}", 
-                                            element.proposal.round(), 
+                                            "Committed B{} -> {:?}",
+                                            element.proposal.round(),
                                             element.proposal.block().batch_hash(),
                                         );
                                     }
 
-                                    let tx_ids:Vec<_> = element 
+                                    let tx_ids:Vec<_> = element
                                         .batch
-                                        .payload 
+                                        .payload
                                         .iter()
                                         .filter(|tx| tx.is_sample())
                                         .map(|tx| tx.get_id())
@@ -225,8 +219,8 @@ impl<Tx> CommitContext<Tx> {
 
                                     // NOTE: This log entry is used to compute performance.
                                     info!(
-                                        "Batch {:?} contains {} B", 
-                                        element.proposal.block().batch_hash(), 
+                                        "Batch {:?} contains {} B",
+                                        element.proposal.block().batch_hash(),
                                         bincode::serialized_size(&element.batch).expect("Failed to get size"),
                                     );
                                 }
@@ -275,13 +269,8 @@ impl DummyCommitSink {
         tokio::spawn(async move {
             while let Some(batch) = rx_inner.recv().await {
                 // Process the batch of transactions
-                info!(
-                    "Committed batch of {} transactions", 
-                    batch.payload.len(),
-                );
-                debug!("Committed batch of {:?}", 
-                    batch.payload.len(),
-                );
+                info!("Committed batch of {} transactions", batch.payload.len(),);
+                debug!("Committed batch of {:?}", batch.payload.len(),);
             }
         });
     }

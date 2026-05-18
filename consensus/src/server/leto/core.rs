@@ -1,27 +1,21 @@
-use std::sync::Arc;
-use std::time::Duration;
-use crate::server::{Settings, BatcherConsensusMsg, Parameters, RRBatcher};
-use crate::START_ID;
+use super::{ChainState, CommitContext, Helper, LeaderContext, RoundContext, Synchronizer};
+use crate::server::{BatcherConsensusMsg, Parameters, RRBatcher, Settings};
 use crate::types::Transaction;
-use crate::{
-    to_socket_address,
-    types::ProtocolMsg,
-    Id, KeyConfig, Round,
-};
+use crate::START_ID;
+use crate::{to_socket_address, types::ProtocolMsg, Id, KeyConfig, Round};
 use anyhow::{anyhow, Result};
 use futures_util::StreamExt;
 use log::*;
 use mempool::{Batch, BatchHash, ConsensusMempoolMsg};
-use tcp_reliable_sender::TcpReliableSender;
+use std::sync::Arc;
+use std::time::Duration;
 use storage::rocksdb::Storage;
+use tcp_reliable_sender::TcpReliableSender;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
-use tokio::time::{Interval, interval};
-use super::{
-    ChainState, CommitContext, Helper, LeaderContext, RoundContext, Synchronizer,
-};
+use tokio::time::{interval, Interval};
 
 pub struct Leto<Tx> {
     // Static state
@@ -68,7 +62,7 @@ pub struct Leto<Tx> {
     pub(crate) leader_context: LeaderContext,
     /// Chain state
     pub(crate) chain_state: ChainState<Tx>,
-    pub(crate) timer: Interval,         
+    pub(crate) timer: Interval,
     // This value tells if we already timed out for the current round
     pub(crate) timer_enabled: bool,
 }
@@ -105,22 +99,17 @@ where
         tx_processor: UnboundedSender<Batch<Tx>>,
         tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
         tx_commit: UnboundedSender<Arc<Batch<Tx>>>,
-    ) -> Result<()> 
-    {
+    ) -> Result<()> {
         let me = settings
             .committee_config
             .get(&my_id)
-            .ok_or_else(|| 
-                anyhow!("My Id {} is not present in the config", my_id),
-            )?;
-        let consensus_addr = to_socket_address(
-            "0.0.0.0", 
-            me.consensus_port,
-        )?;
+            .ok_or_else(|| anyhow!("My Id {} is not present in the config", my_id))?;
+        let consensus_addr = to_socket_address("0.0.0.0", me.consensus_port)?;
 
         // Start networking receiver for consensus messages
         let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
-        let mut receiver = tcp_receiver::TcpReceiver::<ProtocolMsg<Id, Tx, Round>>::spawn(consensus_addr);
+        let mut receiver =
+            tcp_receiver::TcpReceiver::<ProtocolMsg<Id, Tx, Round>>::spawn(consensus_addr);
         // Spawn a forwarding task
         tokio::spawn(async move {
             use futures_util::StreamExt;
@@ -132,29 +121,18 @@ where
         });
 
         // Start outgoing connections
-        let consensus_peers = settings
-            .get_consensus_peers(my_id)?;
-        let consensus_net =
-            TcpReliableSender::<Id, ProtocolMsg<Id, Tx, Round>>::with_peers(
-                consensus_peers.clone(),
-            );
-
-        // Start helper that syncs messages
-        let (tx_helper, rx_helper) = unbounded_channel();
-        Helper::<Tx>::spawn(
-            store.clone(), 
-            rx_helper, 
+        let consensus_peers = settings.get_consensus_peers(my_id)?;
+        let consensus_net = TcpReliableSender::<Id, ProtocolMsg<Id, Tx, Round>>::with_peers(
             consensus_peers.clone(),
         );
 
+        // Start helper that syncs messages
+        let (tx_helper, rx_helper) = unbounded_channel();
+        Helper::<Tx>::spawn(store.clone(), rx_helper, consensus_peers.clone());
+
         // Create the synchronizer
         let synchronizer =
-            Synchronizer::<Tx>::new(
-                store.clone(), 
-                my_id, 
-                tx_helper,
-                consensus_peers,
-            );
+            Synchronizer::<Tx>::new(store.clone(), my_id, tx_helper, consensus_peers);
 
         // Start the batcher
         let (tx_consensus_to_batcher, rx_consensus_to_batcher) = unbounded_channel();
@@ -194,9 +172,7 @@ where
                 consensus_net,
                 _tx_consensus_to_mem: tx_consensus_to_mem,
                 tx_consensus_to_batcher,
-                round_context: RoundContext::new(
-                    settings.committee_config.num_nodes(),
-                ),
+                round_context: RoundContext::new(settings.committee_config.num_nodes()),
                 leader_context: LeaderContext::new(
                     settings.committee_config.get_all_ids(),
                     settings.committee_config.num_faults(),
@@ -206,9 +182,7 @@ where
                 chain_state: ChainState::new(store),
                 synchronizer,
                 commit_ctx,
-                timer: interval(Duration::from_millis(
-                    4 * settings.bench_config.delay_in_ms)
-                ),
+                timer: interval(Duration::from_millis(4 * settings.bench_config.delay_in_ms)),
                 timer_enabled: true,
                 settings,
             };
@@ -219,8 +193,8 @@ where
         Ok(())
     }
 
-    async fn run(&mut self) -> Result<()> 
-    where 
+    async fn run(&mut self) -> Result<()>
+    where
         Tx: Transaction,
     {
         info!("Starting the server");
@@ -232,7 +206,7 @@ where
         // Reset the timer
         self.timer.reset();
 
-        let mut bench_start; 
+        let mut bench_start;
         let mut step;
 
         // Start the protocol loop
@@ -245,7 +219,7 @@ where
                     break
                 }
                 // Handle batch ready messages from the mempool when I am the leader
-                batch_hash = self.rx_mem_to_consensus.recv(), 
+                batch_hash = self.rx_mem_to_consensus.recv(),
                     if self.leader_context.leader() == self.my_id
                 => {
                     bench_start = tokio::time::Instant::now();
@@ -271,9 +245,9 @@ where
                 }
                 // Receive round synchronized and delivery synchronized messages
                 // Forward to generic msg handler which will forward to the corresponding handler
-                rnd_help = &mut self.round_context.next(), 
+                rnd_help = &mut self.round_context.next(),
                     // IMPORTANT: Prevents `Poll::Pending` when no messages are present
-                    if self.round_context.is_ready() => 
+                    if self.round_context.is_ready() =>
                 {
                     bench_start = tokio::time::Instant::now();
                     step = STEP::RoundSynchronizedMsg;
@@ -299,7 +273,7 @@ where
                     }
                 }
                 // Receive consensus messages from loopback
-                // Loopback messages are always delivery synchronized 
+                // Loopback messages are always delivery synchronized
                 // Hence, forward them to the round synchronizer
                 msg = self.rx_msg_loopback.recv() => {
                     bench_start = tokio::time::Instant::now();
@@ -344,9 +318,11 @@ where
                     }
                 }
             };
-            trace!("Time for step {:?} is {}μs",
+            trace!(
+                "Time for step {:?} is {}μs",
                 step,
-                bench_start.elapsed().as_micros())
+                bench_start.elapsed().as_micros()
+            )
         }
         info!("Server is shutting down!");
         Ok(())
@@ -370,20 +346,14 @@ where
                 batch,
                 ..
             } => self.handle_proposal(proposal, auth, batch).await,
-            ProtocolMsg::Blame { 
-                round, 
-                auth 
-            } => self.handle_blame(round, auth).await,
-            ProtocolMsg::BlameQC { 
-                round, 
-                qc 
-            } => self.on_blame_qc(round, qc).await,
+            ProtocolMsg::Blame { round, auth } => self.handle_blame(round, auth).await,
+            ProtocolMsg::BlameQC { round, qc } => self.on_blame_qc(round, qc).await,
             // `handle_msg` should never see these messages
-            ProtocolMsg::Relay {..} => unreachable!(),
-            ProtocolMsg::BatchRequest {..} => unreachable!(),
-            ProtocolMsg::BatchResponse {..} => unreachable!(),
-            ProtocolMsg::ElementRequest {..} => unreachable!(),
-            ProtocolMsg::ElementResponse {..} => unreachable!(),
+            ProtocolMsg::Relay { .. } => unreachable!(),
+            ProtocolMsg::BatchRequest { .. } => unreachable!(),
+            ProtocolMsg::BatchResponse { .. } => unreachable!(),
+            ProtocolMsg::ElementRequest { .. } => unreachable!(),
+            ProtocolMsg::ElementResponse { .. } => unreachable!(),
         }
     }
 }

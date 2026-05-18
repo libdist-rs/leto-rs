@@ -1,4 +1,3 @@
-use std::{cmp::Ordering, collections::VecDeque, pin::Pin, task::{self, Poll}};
 use super::Leto;
 use crate::{
     server::BatcherConsensusMsg as BCM,
@@ -10,6 +9,12 @@ use fnv::FnvHashMap;
 use futures_util::Stream;
 use log::*;
 use mempool::Batch;
+use std::{
+    cmp::Ordering,
+    collections::VecDeque,
+    pin::Pin,
+    task::{self, Poll},
+};
 use tcp_reliable_sender::CancelHandler;
 use tokio::time::Interval;
 
@@ -62,7 +67,6 @@ pub struct RoundContext<Tx> {
     num_nodes: usize,
 }
 
-
 impl<Tx> RoundContext<Tx>
 where
     Tx: Transaction,
@@ -75,9 +79,7 @@ where
      * elligible.add(oldest.pop_back())
      */
 
-    pub fn new(
-        num_nodes: usize,
-    ) -> Self {
+    pub fn new(num_nodes: usize) -> Self {
         Self {
             current_round: Round::MIN + 1,
             proposals_ready: FnvHashMap::default(),
@@ -102,7 +104,10 @@ where
     }
 
     /// Track the following handler
-    pub fn add_handler(&mut self, handler: CancelHandler) {
+    pub fn add_handler(
+        &mut self,
+        handler: CancelHandler,
+    ) {
         self.cancel_handlers
             .entry(self.current_round)
             .or_default()
@@ -110,7 +115,10 @@ where
     }
 
     /// Track the following send handlers
-    pub fn add_handlers(&mut self, handlers: Vec<CancelHandler>) {
+    pub fn add_handlers(
+        &mut self,
+        handlers: Vec<CancelHandler>,
+    ) {
         self.cancel_handlers
             .entry(self.current_round)
             .or_default()
@@ -118,13 +126,17 @@ where
     }
 
     /// Disables blame timers for the current round
-    pub fn disable_blame_timers(&mut self, timer_enabled: &mut bool) {
+    pub fn disable_blame_timers(
+        &mut self,
+        timer_enabled: &mut bool,
+    ) {
         *timer_enabled = false;
     }
 
     /// Move forward by one round
     pub fn advance_round(
-        &mut self, timer: &mut Interval, 
+        &mut self,
+        timer: &mut Interval,
         timer_enabled: &mut bool,
     ) -> Result<()> {
         self.current_round += 1;
@@ -135,14 +147,16 @@ where
         // which triggers timeouts, blame cycles, and connection churn.
         self.cancel_handlers.retain(|_, handlers| {
             handlers.retain_mut(|h| {
-                matches!(h.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty))
+                matches!(
+                    h.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                )
             });
             !handlers.is_empty()
         });
-        
+
         // GC old round messages in msg_buf
-        self.msg_buf
-            .retain(|r, _| r >= &self.current_round);
+        self.msg_buf.retain(|r, _| r >= &self.current_round);
 
         // Reset timers
         timer.reset();
@@ -195,69 +209,59 @@ where
     }
 
     pub fn sync(
-        &mut self, 
+        &mut self,
         msg: ProtocolMsg<Id, Tx, Round>,
-    ) -> Result<()> 
-    {
+    ) -> Result<()> {
         let msg_round = match &msg {
-            ProtocolMsg::Propose { proposal, ..} => proposal.round(),
-            ProtocolMsg::Blame { round, ..} => *round,
-            ProtocolMsg::BlameQC { round, ..} => *round,
-            ProtocolMsg::Relay {..} => unreachable!(),
-            ProtocolMsg::BatchRequest {..} => unreachable!(),
-            ProtocolMsg::BatchResponse {..} => unreachable!(),
-            ProtocolMsg::ElementRequest {..} => unreachable!(),
-            ProtocolMsg::ElementResponse {..} => unreachable!(),
+            ProtocolMsg::Propose { proposal, .. } => proposal.round(),
+            ProtocolMsg::Blame { round, .. } => *round,
+            ProtocolMsg::BlameQC { round, .. } => *round,
+            ProtocolMsg::Relay { .. } => unreachable!(),
+            ProtocolMsg::BatchRequest { .. } => unreachable!(),
+            ProtocolMsg::BatchResponse { .. } => unreachable!(),
+            ProtocolMsg::ElementRequest { .. } => unreachable!(),
+            ProtocolMsg::ElementResponse { .. } => unreachable!(),
         };
         // msg_round < = > current_round
         match msg_round.cmp(&self.current_round) {
             Ordering::Less => {
-                debug!("Got an old message {:?} for round {} in round {}", 
-                    msg,
-                    msg_round, 
-                    self.current_round,
+                debug!(
+                    "Got an old message {:?} for round {} in round {}",
+                    msg, msg_round, self.current_round,
                 );
                 return Ok(());
-            },
+            }
             Ordering::Greater => {
-                debug!("Got a future message {:?} for round {} in round {}", 
-                    msg,
-                    msg_round, 
-                    self.current_round,
+                debug!(
+                    "Got a future message {:?} for round {} in round {}",
+                    msg, msg_round, self.current_round,
                 );
                 match msg {
-                    ProtocolMsg::Propose { 
-                        proposal, 
-                        auth, 
-                        batch, 
-                        sender 
+                    ProtocolMsg::Propose {
+                        proposal,
+                        auth,
+                        batch,
+                        sender,
                     } => self.queue_proposal(proposal, auth, batch, sender),
-                    ProtocolMsg::Blame { 
-                        round, 
-                        auth 
-                    } => self.queue_blame(round, auth),
-                    ProtocolMsg::BlameQC { 
-                        round, 
-                        qc 
-                    } => self.queue_blame_qc(round, qc),
-                    ProtocolMsg::Relay {..} => unreachable!(),
-                    ProtocolMsg::BatchRequest {..} => unreachable!(),
-                    ProtocolMsg::BatchResponse {..} => unreachable!(),
-                    ProtocolMsg::ElementRequest {..} => unreachable!(),
-                    ProtocolMsg::ElementResponse {..} => unreachable!(),
+                    ProtocolMsg::Blame { round, auth } => self.queue_blame(round, auth),
+                    ProtocolMsg::BlameQC { round, qc } => self.queue_blame_qc(round, qc),
+                    ProtocolMsg::Relay { .. } => unreachable!(),
+                    ProtocolMsg::BatchRequest { .. } => unreachable!(),
+                    ProtocolMsg::BatchResponse { .. } => unreachable!(),
+                    ProtocolMsg::ElementRequest { .. } => unreachable!(),
+                    ProtocolMsg::ElementResponse { .. } => unreachable!(),
                 }
-            },
+            }
             Ordering::Equal => {
-                debug!("Got a correct round message {:?} for round {} in round {}", 
-                    msg,
-                    msg_round, 
-                    self.current_round,
+                debug!(
+                    "Got a correct round message {:?} for round {} in round {}",
+                    msg, msg_round, self.current_round,
                 );
                 self.msg_buf
                     .entry(self.current_round)
                     .or_default()
                     .push_back(msg);
-            },
+            }
         };
         Ok(())
     }
@@ -312,12 +316,13 @@ where
             .push((round, qc));
     }
 
-    /// The round context is ready if there are messages 
+    /// The round context is ready if there are messages
     pub fn is_ready(&self) -> bool {
-        !self.msg_buf
+        !self
+            .msg_buf
             .get(&self.current_round)
             .map(VecDeque::is_empty)
-            .unwrap_or(true) 
+            .unwrap_or(true)
         // ||
         // self.timer_enabled
     }
@@ -330,11 +335,12 @@ where
     type Item = ProtocolMsg<Id, Tx, Round>;
 
     fn poll_next(
-        mut self: Pin<&mut Self>, 
+        mut self: Pin<&mut Self>,
         _cx: &mut task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         let rnd = self.as_ref().current_round;
-        let msg = self.msg_buf
+        let msg = self
+            .msg_buf
             .get_mut(&rnd)
             .expect("Should not be polled when empty")
             .pop_front()
@@ -361,13 +367,12 @@ where
         self.leader_context.advance_round();
 
         // Update the round
-        self.round_context.advance_round(
-            &mut self.timer, 
-            &mut self.timer_enabled,
-        )?;
+        self.round_context
+            .advance_round(&mut self.timer, &mut self.timer_enabled)?;
 
         // Clear the waiting_hashes for the relay messages
-        self.synchronizer.advance_round(self.round_context.round())?;
+        self.synchronizer
+            .advance_round(self.round_context.round())?;
 
         // Try committing
         self.try_commit().await?;
@@ -383,4 +388,3 @@ where
         Ok(())
     }
 }
-

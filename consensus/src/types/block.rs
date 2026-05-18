@@ -27,5 +27,5 @@ impl<Id, Tx, Round> Block<Id, Tx, Round> {
 
     pub fn batch_hash(&self) -> &BatchHash<Tx> {
         &self.batch_hash
-    } 
+    }
 }

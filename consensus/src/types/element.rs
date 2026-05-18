@@ -1,8 +1,8 @@
-use std::marker::PhantomData;
 use super::{Block, Proposal, Signature};
 use crypto::hash::Hash;
 use mempool::Batch;
 use serde::{Deserialize, Serialize};
+use std::marker::PhantomData;
 
 /// This is an element of the chain
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -28,18 +28,15 @@ impl<Id, Tx, Round> Element<Id, Tx, Round> {
         }
     }
 
-    pub fn genesis(initial_leader: Id) -> Self 
-    where 
+    pub fn genesis(initial_leader: Id) -> Self
+    where
         Round: mempool::Round,
         Id: std::fmt::Debug + Clone + Eq + std::hash::Hash + Send + Sync + 'static,
     {
         // let
         Self {
             proposal: Proposal {
-                block: Block::new(
-                    Hash::EMPTY_HASH, 
-                    Hash::EMPTY_HASH,
-                ),
+                block: Block::new(Hash::EMPTY_HASH, Hash::EMPTY_HASH),
                 qc: None,
                 round: Round::MIN,
             },

@@ -1,24 +1,29 @@
-use std::net::SocketAddr;
-use fnv::{FnvHashMap, FnvHashSet};
-use futures_util::{stream::FuturesUnordered, StreamExt, FutureExt};
-use mempool::{BatchHash, Batch};
-use tcp_sender::TcpSimpleSender;
-use serde::de::DeserializeOwned;
-use storage::rocksdb::Storage;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use crate::{types::{ProtocolMsg, Transaction, Request, Proposal, Signature, Element}, Round, Id, server::{ChainDB, Leto}};
 use super::SyncMsg;
-use anyhow::{Result, Context};
-use log::*;
+use crate::{
+    server::{ChainDB, Leto},
+    types::{Element, Proposal, ProtocolMsg, Request, Signature, Transaction},
+    Id, Round,
+};
+use anyhow::{Context, Result};
 use crypto::hash::Hash;
+use fnv::{FnvHashMap, FnvHashSet};
+use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
+use log::*;
+use mempool::{Batch, BatchHash};
+use serde::de::DeserializeOwned;
+use std::net::SocketAddr;
+use storage::rocksdb::Storage;
+use tcp_sender::TcpSimpleSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 pub struct SyncHelper<Tx> {
-    my_id: Id, 
+    my_id: Id,
     /// A channel to receive messages from the outside
-    rx_from_out: UnboundedReceiver<SyncMsg<Tx>>, 
+    rx_from_out: UnboundedReceiver<SyncMsg<Tx>>,
     /// Our storage
-    db: ChainDB, 
-    /// A channel to tell the outside world that this message is synced and ready
+    db: ChainDB,
+    /// A channel to tell the outside world that this message is synced and
+    /// ready
     tx_outer: UnboundedSender<ProtocolMsg<Id, Tx, Round>>,
     /// Networking
     network: TcpSimpleSender<Id, ProtocolMsg<Id, Tx, Round>>,
@@ -31,21 +36,21 @@ pub struct SyncHelper<Tx> {
     pending_elements: FnvHashMap<(Round, Id), FnvHashSet<Hash<Element<Id, Tx, Round>>>>,
 }
 
-impl<Tx> SyncHelper<Tx> 
-where 
+impl<Tx> SyncHelper<Tx>
+where
     Tx: Transaction,
 {
     pub fn new(
-        my_id: usize, 
-        rx_from_out: UnboundedReceiver<SyncMsg<Tx>>, 
-        store: Storage, 
-        consensus_peers: FnvHashMap<Id, SocketAddr>, 
-        tx_outer: UnboundedSender<ProtocolMsg<Id, Tx, Round>>
+        my_id: usize,
+        rx_from_out: UnboundedReceiver<SyncMsg<Tx>>,
+        store: Storage,
+        consensus_peers: FnvHashMap<Id, SocketAddr>,
+        tx_outer: UnboundedSender<ProtocolMsg<Id, Tx, Round>>,
     ) -> Self {
         let network = TcpSimpleSender::with_peers(consensus_peers);
         Self {
             rx_from_out,
-            my_id, 
+            my_id,
             db: ChainDB::new(store),
             tx_outer,
             network,
@@ -66,9 +71,9 @@ where
                     let start = tokio::time::Instant::now();
                     match request {
                         SyncMsg::DeliverBatchOnly(
-                            req_hash, 
-                            sender, 
-                            proposal, 
+                            req_hash,
+                            sender,
+                            proposal,
                             auth
                         ) => {
 
@@ -80,7 +85,7 @@ where
                                 continue;
                             }
                             round_map.insert(req_hash.clone());
-                            
+
                             // Request batch from the sender
                             let req_msg: ProtocolMsg<Id, Tx, Round> = ProtocolMsg::BatchRequest{
                                 source: self.my_id,
@@ -144,7 +149,7 @@ where
                         },
                         SyncMsg::DeliverParentAndBatch(
                             batch_hash,
-                            sender, 
+                            sender,
                             proposal,
                             auth,
                         ) => {
@@ -241,21 +246,21 @@ where
         let batch = db.notify_read(batch_hash).await?;
 
         // Now write this proposal so its children can be delivered
-        db.write(Element::new(
-            proposal.clone(), 
-            auth.clone(), 
-            batch.clone(),
-        )).await?;
+        db.write(Element::new(proposal.clone(), auth.clone(), batch.clone()))
+            .await?;
 
         #[cfg(feature = "microbench")]
-        println!("Time spent in on_deliver_batch is {}", start.elapsed().as_micros());
+        println!(
+            "Time spent in on_deliver_batch is {}",
+            start.elapsed().as_micros()
+        );
 
         // Deliver message
-        Ok(ProtocolMsg::Propose{ 
-            proposal, 
-            auth, 
-            batch, 
-            sender
+        Ok(ProtocolMsg::Propose {
+            proposal,
+            auth,
+            batch,
+            sender,
         })
     }
 
@@ -276,24 +281,23 @@ where
         let _ = db.notify_read(proposal.block().parent_hash()).await?;
 
         // Now write this proposal so its children can be delivered
-        db.write(Element::new(
-            proposal.clone(), 
-            auth.clone(), 
-            batch.clone(),
-        )).await?;
-        
+        db.write(Element::new(proposal.clone(), auth.clone(), batch.clone()))
+            .await?;
+
         #[cfg(feature = "microbench")]
-        println!("Time spent in on_deliver_parent_and_batch is {}", start.elapsed().as_micros());
+        println!(
+            "Time spent in on_deliver_parent_and_batch is {}",
+            start.elapsed().as_micros()
+        );
 
         // Deliver message
-        Ok(ProtocolMsg::Propose{ 
-            proposal, 
-            auth, 
-            batch, 
-            sender
+        Ok(ProtocolMsg::Propose {
+            proposal,
+            auth,
+            batch,
+            sender,
         })
     }
-
 
     async fn on_deliver_parent(
         mut db: ChainDB,
@@ -311,21 +315,21 @@ where
         let _ = db.notify_read(proposal.block().parent_hash()).await?;
 
         // Now write this proposal so its children can be delivered
-        db.write(Element::new(
-            proposal.clone(), 
-            auth.clone(), 
-            batch.clone(),
-        )).await?;
+        db.write(Element::new(proposal.clone(), auth.clone(), batch.clone()))
+            .await?;
 
         #[cfg(feature = "microbench")]
-        println!("Time spent in on_deliver_parent is {}", start.elapsed().as_micros());
+        println!(
+            "Time spent in on_deliver_parent is {}",
+            start.elapsed().as_micros()
+        );
 
         // Deliver message
-        Ok(ProtocolMsg::Propose{ 
-            proposal, 
-            auth, 
-            batch, 
-            sender
+        Ok(ProtocolMsg::Propose {
+            proposal,
+            auth,
+            batch,
+            sender,
         })
     }
 }

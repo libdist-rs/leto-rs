@@ -58,8 +58,7 @@ where
         prop: Proposal<Id, Tx, Round>,
         auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch: Batch<Tx>,
-    ) -> Result<()>
-    {
+    ) -> Result<()> {
         let chain_element = Arc::new(Element::new(prop, auth, batch));
 
         // Serialize once
@@ -67,7 +66,9 @@ where
         let element_hash = Hash::do_hash(&serialized);
 
         // Write to DB using pre-serialized bytes
-        self.db.write_serialized(element_hash.clone(), serialized).await?;
+        self.db
+            .write_serialized(element_hash.clone(), serialized)
+            .await?;
 
         // Update in-memory state
         self.highest_chain_hash = element_hash;
@@ -122,10 +123,7 @@ where
         // Write the genesis elements
         self.write_element(self.highest_chain_element.clone())
             .await?;
-        self
-            .db
-            .notify_read(self.highest_chain_hash.clone())
-            .await?;
+        self.db.notify_read(self.highest_chain_hash.clone()).await?;
         Ok(())
     }
 }

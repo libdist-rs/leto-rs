@@ -15,3 +15,6 @@ pub use tx_pool::*;
 
 mod leto;
 pub use leto::*;
+
+pub mod zeus;
+pub use zeus::{Zeus, ZeusServer};

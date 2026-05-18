@@ -24,7 +24,10 @@ pub enum Status {
 }
 
 impl std::fmt::Display for Status {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(
+        &self,
+        f: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
         match self {
             Status::Ok => write!(f, "OK"),
             Status::Degraded => write!(f, "DEGRADED"),
@@ -81,7 +84,10 @@ impl MetricsCollector {
     }
 
     /// Snapshot the current metrics for the just-finished level.
-    pub fn snapshot(&self, target_rate: u64) -> LevelMetrics {
+    pub fn snapshot(
+        &self,
+        target_rate: u64,
+    ) -> LevelMetrics {
         let state = self.inner.lock().unwrap();
         let elapsed = state
             .level_start

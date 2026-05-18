@@ -36,10 +36,7 @@ impl KeyConfig {
                 Algorithm::ED25519 => Keypair::generate_ed25519()?,
                 Algorithm::SECP256K1 => Keypair::generate_secp256k1(),
             };
-            let (sk, pk) = (
-                kpair.private(), 
-                kpair.public(),
-            );
+            let (sk, pk) = (kpair.private(), kpair.public());
             sks.insert(id, sk);
             system.insert(id, pk);
         }
@@ -60,8 +57,7 @@ impl TryFrom<RawKeyConfig> for KeyConfig {
     fn try_from(mut raw: RawKeyConfig) -> anyhow::Result<Self> {
         let sk = match raw.alg {
             Algorithm::ED25519 => {
-                let skey: crypto::ed25519::SecretKey =
-                    bincode::deserialize(&raw.secret_bytes)?;
+                let skey: crypto::ed25519::SecretKey = bincode::deserialize(&raw.secret_bytes)?;
                 crypto::SecretKey::Ed25519(skey)
             }
             Algorithm::SECP256K1 => {
@@ -137,7 +133,8 @@ impl Serialize for KeyConfig {
     where
         S: serde::Serializer,
     {
-        let raw: RawKeyConfig = self.try_into()
+        let raw: RawKeyConfig = self
+            .try_into()
             .expect("Failed to serialize key config into raw key config");
         raw.serialize(serializer)
     }
@@ -149,7 +146,8 @@ impl<'de> Deserialize<'de> for KeyConfig {
         D: serde::Deserializer<'de>,
     {
         let raw = RawKeyConfig::deserialize(deserializer)?;
-        let key_config: Self = raw.try_into()
+        let key_config: Self = raw
+            .try_into()
             .expect("Failed to deserialize key config from raw key config");
         Ok(key_config)
     }

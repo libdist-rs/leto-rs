@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use consensus::{
-    client,
+    client::{self, ClientMode},
     server::{self, BenchConfig, StorageConfig},
     Id, Round,
 };
@@ -70,6 +70,21 @@ pub struct StressTestConfig {
     /// Base port for client network
     #[arg(long, default_value_t = 20000)]
     pub base_client_port: u16,
+
+    /// Zeus eleader data-block pipeline depth (max in-flight blocks).
+    ///
+    /// Allows the eleader to have up to W data blocks proposed but not yet
+    /// locally admitted, keeping the network pipeline full.  Set to 1 to
+    /// replicate the old one-in-flight behaviour.
+    #[arg(long, default_value_t = 16)]
+    pub eleader_pipeline_depth: usize,
+
+    /// Zeus TimerData duration in milliseconds (Def 8.4).
+    ///
+    /// How long each sig-chain round waits for a fresh eleader block before
+    /// emitting a would-be-blame warning.
+    #[arg(long, default_value_t = 1000)]
+    pub data_timer_duration_ms: u64,
 }
 
 impl StressTestConfig {
@@ -116,6 +131,8 @@ pub fn build_server_settings(
         batch_size: config.batch_size,
         batch_timeout: Duration::from_millis(config.batch_timeout_ms),
         delay_in_ms: config.delay_in_ms,
+        eleader_pipeline_depth: config.eleader_pipeline_depth,
+        data_timer_duration_ms: config.data_timer_duration_ms,
     };
 
     Ok(server::Settings {
@@ -129,6 +146,7 @@ pub fn build_server_settings(
 pub fn build_client_settings(
     config: &StressTestConfig,
     target_rate: u64,
+    client_mode: ClientMode,
 ) -> client::Settings {
     let rate_per_client = target_rate / config.num_clients.max(1) as u64;
     let burst_interval_ms: u64 = 50;
@@ -155,5 +173,6 @@ pub fn build_client_settings(
         consensus_config: client::Config {
             parties: client_parties,
         },
+        client_mode,
     }
 }

@@ -1,6 +1,9 @@
-use super::{Leto, Settings};
-use crate::{to_socket_address, Id, KeyConfig};
-use anyhow::anyhow;
+/// Zeus top-level server (full mempool + Zeus consensus).
+///
+/// Mirrors `consensus/src/server/core.rs` (`Server<Tx>`) but wires
+/// `Zeus::spawn` instead of `Leto::spawn`.
+use crate::{server::Settings, to_socket_address, Id, KeyConfig};
+use anyhow::{anyhow, Result};
 use log::info;
 use mempool::{Batch, MempoolMsg};
 use std::{marker::PhantomData, path::PathBuf, sync::Arc};
@@ -11,12 +14,13 @@ use tokio::sync::{
     oneshot,
 };
 
-/// This is the server that runs the protocol
-pub struct Server<Tx> {
+use super::Zeus;
+
+pub struct ZeusServer<Tx> {
     _x: PhantomData<Tx>,
 }
 
-impl<Tx> Server<Tx>
+impl<Tx> ZeusServer<Tx>
 where
     Tx: crate::types::Transaction,
 {
@@ -26,10 +30,10 @@ where
         crypto_system: KeyConfig,
         settings: Settings,
         tx_commit: UnboundedSender<Arc<Batch<Tx>>>,
-    ) -> anyhow::Result<oneshot::Sender<()>> {
-        #[cfg(feature = "benchmark")]
-        settings.bench_log();
-
+    ) -> Result<oneshot::Sender<()>>
+    where
+        Tx: Clone + serde::Serialize + PartialEq + std::fmt::Debug + 'static,
+    {
         // Create the DB
         let path = {
             let mut path = PathBuf::new();
@@ -41,29 +45,23 @@ where
         };
         let store = Storage::new(
             path.to_str()
-                .ok_or_else(|| anyhow!("Invalid path [{}] for storage", path.display()))?,
+                .ok_or_else(|| anyhow!("Invalid path for storage"))?,
         )?;
 
-        // Create the mempool
         let me = settings
             .committee_config
             .get(&my_id)
-            .ok_or_else(|| anyhow!("My Id {} is not present in the config", my_id))?;
+            .ok_or_else(|| anyhow!("My Id {} not in config", my_id))?;
         let mempool_peers = settings.get_mempool_peers(my_id)?;
         let mempool_net = TcpSimpleSender::<Id, MempoolMsg<Id, Tx>>::with_peers(mempool_peers);
         let mempool_addr = to_socket_address("0.0.0.0", me.mempool_port)?;
         let client_addr = to_socket_address("0.0.0.0", me.client_port)?;
-        info!("Server booted on {}", me.mempool_address);
+        info!("ZeusServer booted on {}", me.mempool_address);
 
-        // A channel for the consensus to communicate with the mempool
-        let (tx_consensus_to_mem, rx_consensus_to_mem) = unbounded_channel();
-        // A channel for the mempool to communicate with the consensus
-        let (tx_mem_to_consensus, rx_mem_to_consensus) = unbounded_channel();
-        // A channel for the mempool to communicate with the batcher
+        let (_tx_consensus_to_mem, rx_consensus_to_mem) = unbounded_channel();
+        let (tx_mem_to_consensus, _rx_mem_to_consensus) = unbounded_channel();
+        // Eleader batcher receives raw (Tx, size) pairs from the mempool
         let (tx_mem_to_batcher, rx_mem_to_batcher) = unbounded_channel();
-        // The mempool creates a processor
-        // The tx_processor is used so that the consensus can send to the processor
-        // The rx_processor is used by the mempool to hand-over to the processor
         let (tx_processor, rx_processor) = unbounded_channel();
 
         // Start the mempool
@@ -75,26 +73,23 @@ where
             mempool_net,
             rx_consensus_to_mem,
             tx_mem_to_batcher,
-            tx_processor.clone(), // A channel to send to the processor
-            rx_processor,         // Because the mempool spawns the processor
+            tx_processor.clone(),
+            rx_processor,
             tx_mem_to_consensus,
             mempool_addr,
             client_addr,
         );
 
-        // Start the Leto consensus protocol
+        // Start Zeus
         let (exit_tx, exit_rx) = oneshot::channel();
-        Leto::<Tx>::spawn(
+        Zeus::<Tx>::spawn(
             my_id,
             crypto_system,
             all_ids,
             settings,
             store,
             exit_rx,
-            rx_mem_to_consensus,
             rx_mem_to_batcher,
-            tx_processor,
-            tx_consensus_to_mem,
             tx_commit,
         )?;
 

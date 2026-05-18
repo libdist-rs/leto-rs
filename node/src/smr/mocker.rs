@@ -17,7 +17,12 @@ impl ExtraData {
         sample: bool,
         sample_id: u64,
     ) -> Self {
-        Self { source, sample, sample_id, tag }
+        Self {
+            source,
+            sample,
+            sample_id,
+            tag,
+        }
     }
 }
 
@@ -35,13 +40,8 @@ where
         sample: bool,
         sample_id: u64,
     ) -> Self {
-        let data = Data::with_payload(&vec![0; tx_size-Self::HEADER_SIZE]);
-        let extra_data = ExtraData::new(
-            tx_id, 
-            client_id,
-            sample,
-            sample_id,
-        );
+        let data = Data::with_payload(&vec![0; tx_size - Self::HEADER_SIZE]);
+        let extra_data = ExtraData::new(tx_id, client_id, sample, sample_id);
         SimpleTx {
             data,
             extra: bincode::serialize(&extra_data).unwrap(),

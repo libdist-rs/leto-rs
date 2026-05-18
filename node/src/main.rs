@@ -32,11 +32,7 @@ const DEFAULT_LOG_LEVEL: Level = Level::Info;
 #[cfg(test)]
 mod test;
 
-mod cli;
-pub use cli::*;
-
-mod smr;
-pub use smr::*;
+use node::*;
 
 // Generate a default stdout logger
 fn default_logger(
@@ -175,6 +171,8 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
         batch_size: config.batch_size,
         batch_timeout: Duration::from_millis(config.max_batch_delay),
         delay_in_ms: config.network_delay,
+        eleader_pipeline_depth: 16,
+        data_timer_duration_ms: 1000,
     };
 
     // Create server settings from this information
@@ -195,6 +193,7 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
         consensus_config: client::Config {
             parties: client_parties.clone(),
         },
+        client_mode: client::ClientMode::LetoBroadcast,
     };
     Ok((server_settings, client_settings))
 }

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use base64::{Engine as _, engine::general_purpose};
+use base64::{engine::general_purpose, Engine as _};
 use crypto::hash::Hash;
 use crypto::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
@@ -90,8 +90,7 @@ where
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        let encoded = general_purpose::STANDARD
-            .encode(&self.raw);
+        let encoded = general_purpose::STANDARD.encode(&self.raw);
         f.debug_struct("Signature")
             .field("sig", &encoded)
             .field("id", &self.id)
@@ -107,8 +106,7 @@ where
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        let encoded = general_purpose::STANDARD
-            .encode(&self.raw);
+        let encoded = general_purpose::STANDARD.encode(&self.raw);
         f.debug_struct("Signature")
             .field("sig", &encoded)
             .field("id", &self.id)

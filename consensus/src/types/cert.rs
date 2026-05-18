@@ -1,10 +1,10 @@
-use std::fmt::Debug;
 use super::Signature;
 use anyhow::{anyhow, Result};
 use crypto::hash::Hash;
 use crypto::PublicKey;
 use fnv::{FnvHashMap, FnvHashSet};
 use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Certificate<Id, T> {

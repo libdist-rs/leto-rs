@@ -1,7 +1,7 @@
-use serde::{Serialize, de::DeserializeOwned};
-use storage::rocksdb::Storage;
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use crypto::hash::Hash;
+use serde::{de::DeserializeOwned, Serialize};
+use storage::rocksdb::Storage;
 
 #[derive(Clone)]
 pub struct ChainDB {
@@ -9,13 +9,15 @@ pub struct ChainDB {
 }
 
 impl ChainDB {
-    pub fn new(store: Storage) -> Self { Self { store } }
+    pub fn new(store: Storage) -> Self {
+        Self { store }
+    }
 
     pub async fn read<T>(
         &mut self,
         hash: Hash<T>,
     ) -> Result<Option<T>>
-    where 
+    where
         T: DeserializeOwned,
     {
         match self.store.read(hash.to_vec()).await? {
@@ -30,15 +32,14 @@ impl ChainDB {
         &mut self,
         hash: Hash<T>,
     ) -> Result<T>
-    where 
+    where
         T: Serialize + DeserializeOwned,
     {
         self.store
             .notify_read(hash.to_vec())
             .await
             .and_then(|serialized| {
-                bincode::deserialize::<T>(&serialized)
-                    .map_err(anyhow::Error::new)
+                bincode::deserialize::<T>(&serialized).map_err(anyhow::Error::new)
             })
     }
 
@@ -46,7 +47,7 @@ impl ChainDB {
         &mut self,
         val: T,
     ) -> Result<()>
-    where 
+    where
         T: Serialize,
     {
         let serialized = bincode::serialize(&val)?;
@@ -60,14 +61,10 @@ impl ChainDB {
         hash: Hash<T>,
         serialized: Vec<u8>,
     ) -> Result<()>
-    where 
+    where
         T: Serialize,
     {
-        self.store.write(
-            hash.to_vec(), 
-            serialized,
-        ).await;
+        self.store.write(hash.to_vec(), serialized).await;
         Ok(())
     }
 }
-

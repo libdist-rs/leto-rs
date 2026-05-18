@@ -1,5 +1,5 @@
 use crate::{
-    server::{BatcherConsensusMsg as BCM,Leto},
+    server::{BatcherConsensusMsg as BCM, Leto},
     types::{self, Block, Proposal, ProtocolMsg, Signature},
     Id, Round,
 };
@@ -28,8 +28,8 @@ where
         let start = tokio::time::Instant::now();
 
         debug!(
-            "Got a proposal: {:?} in round {}", 
-            proposal, 
+            "Got a proposal: {:?} in round {}",
+            proposal,
             self.round_context.round(),
         );
 
@@ -39,12 +39,9 @@ where
         let parent = if parent_hash == self.chain_state.highest_hash() {
             (*self.chain_state.highest_chain()).clone()
         } else {
-            self.chain_state
-                .get_element(parent_hash)
-                .await?
-                .unwrap()
+            self.chain_state.get_element(parent_hash).await?.unwrap()
         };
-        
+
         // Check proposal validity
         let is_proposal_valid = {
             let mut start = parent.proposal.round() + 1;
@@ -114,9 +111,12 @@ where
 
         /* WE NOW HAVE A CORRECT PROPOSAL */
         self.on_correct_proposal(proposal, auth, batch).await?;
-        
+
         #[cfg(feature = "microbench")]
-        println!("Time spent in handle_proposal is {}", start.elapsed().as_micros());
+        println!(
+            "Time spent in handle_proposal is {}",
+            start.elapsed().as_micros()
+        );
 
         Ok(())
     }
@@ -155,7 +155,10 @@ where
         self.advance_round().await?;
 
         #[cfg(feature = "microbench")]
-        println!("Time spent in on_correct_proposal is {}", start.elapsed().as_micros());
+        println!(
+            "Time spent in on_correct_proposal is {}",
+            start.elapsed().as_micros()
+        );
 
         Ok(())
     }
@@ -181,10 +184,7 @@ where
 
         // Create proposal
         let prev_hash = self.chain_state.highest_hash();
-        let block = Block::new(
-            batch_hash.clone(), 
-            prev_hash,
-        );
+        let block = Block::new(batch_hash.clone(), prev_hash);
         let qc = {
             let end = self.chain_state.highest_chain().proposal.round();
             let mut start = self.round_context.round() - 1;
@@ -204,17 +204,14 @@ where
             }
         };
         let round = self.round_context.round();
-        let proposal = Proposal::new(
-            block, 
-            round, 
-            qc,
-        );
+        let proposal = Proposal::new(block, round, qc);
 
         #[cfg(feature = "benchmark")]
         {
             // NOTE: This log entry is used to compute performance.
-            info!("Created B{} -> {:?}", 
-                proposal.round(), 
+            info!(
+                "Created B{} -> {:?}",
+                proposal.round(),
                 proposal.block().batch_hash(),
             );
         }
@@ -252,8 +249,7 @@ where
             .broadcast(&self.broadcast_peers, bytes)
             .await;
         let handlers: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
-        self.round_context
-            .add_handlers(handlers);
+        self.round_context.add_handlers(handlers);
 
         // Loopback: pass ownership to avoid cloning batch again
         if let Err(e) = self.handle_proposal(proposal, auth, batch).await {
@@ -261,7 +257,10 @@ where
         }
 
         #[cfg(feature = "microbench")]
-        println!("Time spent in handle_new_batch is {}", start.elapsed().as_micros());
+        println!(
+            "Time spent in handle_new_batch is {}",
+            start.elapsed().as_micros()
+        );
         Ok(())
     }
 }

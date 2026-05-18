@@ -7,6 +7,10 @@ edition = "2021"
 name = "stress-test"
 path = "src/main.rs"
 
+[[bin]]
+name = "stress-test-zeus"
+path = "src/bin/zeus.rs"
+
 [dependencies]
 log = "0"
 env_logger = "0"

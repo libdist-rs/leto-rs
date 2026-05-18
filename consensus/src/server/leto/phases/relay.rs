@@ -29,7 +29,10 @@ where
         if next_leader == self.my_id {
             debug!("Returning because I am the next leader");
             #[cfg(feature = "microbench")]
-            println!("Time spent in relay_proposal is {}", start.elapsed().as_micros());
+            println!(
+                "Time spent in relay_proposal is {}",
+                start.elapsed().as_micros()
+            );
             return Ok(());
         }
 
@@ -44,12 +47,14 @@ where
         // If I am not the next leader, send real message
         let bytes = bytes::Bytes::from(bincode::serialize(&relay_msg).unwrap());
         if let Ok(handler) = self.consensus_net.send(next_leader, bytes).await {
-            self.round_context
-                .add_handler(handler);
+            self.round_context.add_handler(handler);
         }
 
         #[cfg(feature = "microbench")]
-        println!("Time spent in relay_proposal is {}", start.elapsed().as_micros());
+        println!(
+            "Time spent in relay_proposal is {}",
+            start.elapsed().as_micros()
+        );
 
         Ok(())
     }

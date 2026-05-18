@@ -3,6 +3,27 @@ use fnv::FnvHashMap as HashMap;
 use serde::{Deserialize, Serialize};
 use std::env;
 
+/// Controls how the `Stressor` routes transactions to server nodes.
+///
+/// `LetoBroadcast` replicates the original Leto behaviour: every tx is fanned
+/// out to all servers and each server runs its own mempool/batcher.
+///
+/// `ZeusEleaderOnly` implements the correct Zeus client model (zeus.tex §8.1):
+/// the client sends all txs only to the eleader.  The eleader id is provided
+/// directly (harness fast-path) or resolved via a `WhoIsEleader` request on
+/// startup.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub enum ClientMode {
+    /// Fan-out to all servers (Leto default).
+    LetoBroadcast,
+    /// Send only to the eleader for the given epoch (Zeus).
+    ///
+    /// `eleader_id` is `Some(id)` when the harness already knows the eleader
+    /// (fast-path; no query needed), or `None` when the stressor should resolve
+    /// it via `WhoIsEleader` at startup.
+    ZeusEleaderOnly { eleader_id: Option<Id> },
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Party {
     pub id: Id,
@@ -56,6 +77,18 @@ impl Config {
 pub struct Settings {
     pub consensus_config: Config,
     pub bench_config: Bench,
+    /// Controls how this stressor routes transactions.
+    ///
+    /// Defaults to `LetoBroadcast` so that existing Leto harness code requires
+    /// no change.
+    #[serde(default = "Settings::default_client_mode")]
+    pub client_mode: ClientMode,
+}
+
+impl Settings {
+    fn default_client_mode() -> ClientMode {
+        ClientMode::LetoBroadcast
+    }
 }
 
 impl Settings {

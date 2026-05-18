@@ -1,7 +1,10 @@
 use crate::config::StressTestConfig;
 use crate::metrics::{LevelMetrics, Status};
 
-pub fn print_report(config: &StressTestConfig, results: &[LevelMetrics]) {
+pub fn print_report(
+    config: &StressTestConfig,
+    results: &[LevelMetrics],
+) {
     println!();
     println!("===============================================================");
     println!("  LETO BFT STRESS TEST RESULTS");

@@ -11,7 +11,10 @@ impl<Id, Tx, Round> Handler<Id, Tx, Round> {
         Self { consensus_tx }
     }
 
-    pub fn dispatch(&self, msg: ProtocolMsg<Id, Tx, Round>) {
+    pub fn dispatch(
+        &self,
+        msg: ProtocolMsg<Id, Tx, Round>,
+    ) {
         self.consensus_tx
             .send(msg)
             .expect("Failed to send message to the consensus channel");

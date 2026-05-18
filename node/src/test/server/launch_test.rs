@@ -34,7 +34,7 @@ fn _dummy_settings(
             id,
             Party {
                 id,
-                consensus_address: "127.0.0.1".to_string(), 
+                consensus_address: "127.0.0.1".to_string(),
                 consensus_port: 6000 + (id as u16),
                 mempool_address: "127.0.0.1".to_string(),
                 mempool_port: 7000 + (id as u16),
@@ -59,12 +59,9 @@ async fn test_one() -> Result<()> {
 
     // Build the ids
     let ids = dummy_ids(num_nodes);
-    
+
     // Build the cryptosystem
-    let crypto_system = KeyConfig::generate(
-        Algorithm::ED25519, 
-        num_nodes,
-    )?;
+    let crypto_system = KeyConfig::generate(Algorithm::ED25519, num_nodes)?;
 
     // Spawn the server
     const TEST_ID: Id = 0;

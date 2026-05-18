@@ -1,8 +1,8 @@
-use crate::{Id, Round, to_socket_address};
+use crate::{to_socket_address, Id, Round};
+use anyhow::{anyhow, Result};
 use fnv::FnvHashMap as HashMap;
 use serde::{Deserialize, Serialize};
-use std::{env, fmt, time::Duration, net::SocketAddr};
-use anyhow::{Result, anyhow};
+use std::{env, fmt, net::SocketAddr, time::Duration};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct StorageConfig {
@@ -89,6 +89,25 @@ pub struct BenchConfig {
     pub batch_size: usize,
     pub batch_timeout: Duration,
     pub delay_in_ms: u64,
+    /// Zeus eleader data-block pipeline depth.
+    ///
+    /// Maximum number of data blocks the eleader may have proposed but not yet
+    /// admitted locally.  Blocks [admitted+1 .. admitted+W] are all in-flight
+    /// simultaneously, keeping the network pipeline full.  Non-eleader nodes
+    /// are unaffected; they still admit one block at a time per the chain rule.
+    ///
+    /// Default: 16.  Set to 1 to restore the old one-in-flight behaviour.
+    pub eleader_pipeline_depth: usize,
+
+    /// Zeus TimerData duration in milliseconds (Def 8.4).
+    ///
+    /// Each sig-chain round arms this timer on every node.  If no fresh
+    /// eleader data block is admitted before it fires, a would-be-blame warn
+    /// is emitted.  The rleader also uses this timer when waiting for a fresh
+    /// block before proposing.
+    ///
+    /// Default: 1000.
+    pub data_timer_duration_ms: u64,
 }
 
 impl Default for BenchConfig {
@@ -97,6 +116,8 @@ impl Default for BenchConfig {
             batch_size: 1_000,
             batch_timeout: Duration::from_millis(1_000),
             delay_in_ms: 500,
+            eleader_pipeline_depth: 16,
+            data_timer_duration_ms: 1000,
         }
     }
 }
@@ -115,8 +136,7 @@ pub struct Settings {
 impl Settings {
     pub fn new<T: ToString>(config_file_name: T) -> anyhow::Result<Self> {
         let config_file_name = config_file_name.to_string();
-        let run_mode = env::var("RUN_MODE")
-            .unwrap_or_else(|_| "development".into());
+        let run_mode = env::var("RUN_MODE").unwrap_or_else(|_| "development".into());
         let conf = config::Config::builder()
             // DEFAULT settings Add in `./Settings.json`
             .add_source(config::File::with_name(&config_file_name).required(true))
@@ -136,9 +156,10 @@ impl Settings {
         conf.try_deserialize().map_err(anyhow::Error::new)
     }
 
-    pub fn get_mempool_peers(&self, my_id: Id) 
-        -> Result<HashMap<Id, SocketAddr>> 
-    {
+    pub fn get_mempool_peers(
+        &self,
+        my_id: Id,
+    ) -> Result<HashMap<Id, SocketAddr>> {
         let mut map = HashMap::default();
         for id in 0..self.committee_config.num_nodes() {
             if id != my_id {
@@ -177,28 +198,22 @@ impl Settings {
     pub fn bench_log(&self) {
         use log::info;
 
-        info!(
-            "Timeout delay is {}",
-            self.bench_config.delay_in_ms,
-        );
+        info!("Timeout delay is {}", self.bench_config.delay_in_ms,);
         info!(
             "Garbage collection depth is {}",
             self.mempool_config.gc_depth,
         );
         info!(
-            "Sync retry delay is {}", 
+            "Sync retry delay is {}",
             self.mempool_config.sync_retry_delay.as_millis(),
         );
         info!(
-            "Sync retry nodes is {}", 
+            "Sync retry nodes is {}",
             self.mempool_config.sync_retry_nodes,
         );
+        info!("Batch size is {}", self.bench_config.batch_size,);
         info!(
-            "Batch size is {}", 
-            self.bench_config.batch_size,
-        );
-        info!(
-            "Max batch delay is {}", 
+            "Max batch delay is {}",
             self.bench_config.batch_timeout.as_millis(),
         );
     }

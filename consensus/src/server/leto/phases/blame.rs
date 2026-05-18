@@ -1,6 +1,7 @@
 use crate::{
+    server::Leto,
     types::{Certificate, ProtocolMsg, Signature, Transaction},
-    Id, Round, server::Leto,
+    Id, Round,
 };
 use anyhow::{anyhow, Result};
 use crypto::hash::Hash;
@@ -15,7 +16,8 @@ impl<Tx> Leto<Tx> {
         let start = tokio::time::Instant::now();
 
         // Disable more timeouts for the same round until we advance
-        self.round_context.disable_blame_timers(&mut self.timer_enabled);
+        self.round_context
+            .disable_blame_timers(&mut self.timer_enabled);
 
         // Construct blame message
         let blame_msg = self.round_context.round();
@@ -41,7 +43,10 @@ impl<Tx> Leto<Tx> {
             .map_err(anyhow::Error::new)?;
 
         #[cfg(feature = "microbench")]
-        println!("Time spent in on_round_timeout is {}", start.elapsed().as_micros());
+        println!(
+            "Time spent in on_round_timeout is {}",
+            start.elapsed().as_micros()
+        );
         Ok(())
     }
 
@@ -111,7 +116,10 @@ impl<Tx> Leto<Tx> {
         self.handle_blame_qc(blame_round, qc).await?;
 
         #[cfg(feature = "microbench")]
-        println!("Time spent in handle_blame is {}", start.elapsed().as_micros());
+        println!(
+            "Time spent in handle_blame is {}",
+            start.elapsed().as_micros()
+        );
 
         Ok(())
     }

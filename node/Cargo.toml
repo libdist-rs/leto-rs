@@ -4,6 +4,14 @@ version = "0.2.0"
 edition = "2021"
 authors = ["Adithya Bhat <dth.bht@gmail.com>"]
 
+[[bin]]
+name = "node"
+path = "src/main.rs"
+
+[[bin]]
+name = "node-zeus"
+path = "src/bin/zeus.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

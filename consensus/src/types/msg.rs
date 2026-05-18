@@ -1,4 +1,5 @@
-use super::{Certificate, Proposal, Request, Response, Signature, Element};
+use super::{Certificate, Element, Proposal, Request, Response, Signature};
+use crate::Id;
 use crypto::hash::Hash;
 use mempool::{Batch, BatchHash};
 use net_common::Message;
@@ -50,6 +51,24 @@ pub enum ClientMsg<Tx> {
     Confirmation(Hash<Tx>),
 }
 
+/// `ZeusClientMsg` are messages between clients and Zeus servers.
+///
+/// Parallel to `ClientMsg` but carries the Zeus-specific `WhoIsEleader` /
+/// `EleaderIs` discovery round-trip.  Zeus and Leto share the stressor but
+/// use distinct client-message types, mirroring how `ZeusMsg` / `ProtocolMsg`
+/// diverge on the server side.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum ZeusClientMsg<Tx> {
+    /// Client → any server: "who is the current eleader?"
+    WhoIsEleader,
+    /// Server → client: "the current eleader for epoch `epoch` is `id`".
+    EleaderIs { id: Id, epoch: u64 },
+    /// Client → eleader: submit a new transaction.
+    NewTx(Tx),
+    /// Eleader → client: confirmation that a transaction was committed.
+    Confirmation(Hash<Tx>),
+}
+
 impl<Id, Tx, Round> Message for ProtocolMsg<Id, Tx, Round>
 where
     Self: serde::de::DeserializeOwned,
@@ -61,6 +80,16 @@ where
 }
 
 impl<Tx> Message for ClientMsg<Tx>
+where
+    Self: serde::de::DeserializeOwned,
+{
+    type DeserializationError = Box<bincode::ErrorKind>;
+    fn from_bytes(bytes: &[u8]) -> Result<Self, Self::DeserializationError> {
+        bincode::deserialize(bytes)
+    }
+}
+
+impl<Tx> Message for ZeusClientMsg<Tx>
 where
     Self: serde::de::DeserializeOwned,
 {

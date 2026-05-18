@@ -1,17 +1,17 @@
+use super::ChainDB;
 use crate::{
-    types::{ProtocolMsg, Request, Response, Transaction, Element},
+    types::{Element, ProtocolMsg, Request, Response, Transaction},
     Id, Round,
 };
 use anyhow::Result;
 use fnv::FnvHashMap;
 use futures_util::{stream::FuturesUnordered, StreamExt};
 use mempool::Batch;
-use tcp_sender::TcpSimpleSender;
 use serde::de::DeserializeOwned;
 use std::net::SocketAddr;
 use storage::rocksdb::Storage;
+use tcp_sender::TcpSimpleSender;
 use tokio::sync::mpsc::UnboundedReceiver;
-use super::ChainDB;
 
 #[derive(Debug)]
 pub enum HelperRequest<Tx> {
@@ -62,8 +62,8 @@ impl<Tx> Helper<Tx> {
                         HelperRequest::BatchRequest(source, req) => {
                             batch_read_queue.push(
                                 Self::handle_request(
-                                    self.db.clone(), 
-                                    source, 
+                                    self.db.clone(),
+                                    source,
                                     req,
                                 )
                             );
@@ -71,15 +71,15 @@ impl<Tx> Helper<Tx> {
                         HelperRequest::ElementRequest(source, req) => {
                             element_read_queue.push(
                                 Self::handle_request(
-                                    self.db.clone(), 
-                                    source, 
+                                    self.db.clone(),
+                                    source,
                                     req,
                                 )
                             );
                         }
                     }
                 },
-                Some(Ok(Some((source, req, batch)))) = batch_read_queue.next(), 
+                Some(Ok(Some((source, req, batch)))) = batch_read_queue.next(),
                     if !batch_read_queue.is_empty() => {
                     let response_msg: ProtocolMsg<Id, Tx, Round> = ProtocolMsg::BatchResponse{
                         response: Response::new(
@@ -101,7 +101,7 @@ impl<Tx> Helper<Tx> {
                     let bytes = bytes::Bytes::from(bincode::serialize(&response_msg).unwrap());
                     let _ = self.network.send(source, bytes).await;
                 }
-            } 
+            }
         }
     }
 
@@ -109,15 +109,12 @@ impl<Tx> Helper<Tx> {
         mut db: ChainDB,
         source: Id,
         req: Request<T>,
-    ) -> Result<Option<(Id, Request<T>, T)>> 
-    where 
+    ) -> Result<Option<(Id, Request<T>, T)>>
+    where
         T: DeserializeOwned,
     {
-        let req_hash = req
-            .request_hash()
-            .clone();
-        db
-            .read(req_hash)
+        let req_hash = req.request_hash().clone();
+        db.read(req_hash)
             .await
             .map(|opt| opt.map(|v| (source, req, v)))
     }

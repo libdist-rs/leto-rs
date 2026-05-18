@@ -1,13 +1,15 @@
+use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug, Display};
-use base64::{Engine as _, engine::general_purpose};
 
-pub trait Data: Serialize + serde::de::DeserializeOwned + Send + Sync + Debug + Clone + Unpin + 'static {
+pub trait Data:
+    Serialize + serde::de::DeserializeOwned + Send + Sync + Debug + Clone + Unpin + 'static
+{
     fn with_payload(data: &[u8]) -> Self;
 }
 
 /// Naive implementation of data
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct SimpleData {
     tx: Vec<u8>,
 }
@@ -23,8 +25,7 @@ impl Debug for SimpleData {
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        let encoded = general_purpose::STANDARD
-            .encode(&self.tx);
+        let encoded = general_purpose::STANDARD.encode(&self.tx);
         write!(f, "{}", encoded)
     }
 }
@@ -34,8 +35,7 @@ impl Display for SimpleData {
         &self,
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
-        let encoded = general_purpose::STANDARD
-            .encode(&self.tx);
+        let encoded = general_purpose::STANDARD.encode(&self.tx);
         write!(f, "{}", &encoded)
     }
 }

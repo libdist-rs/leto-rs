@@ -1,7 +1,7 @@
 use crate::config::{build_client_settings, StressTestConfig};
 use crate::smr::{SimpleData, SimpleTx};
 use anyhow::Result;
-use consensus::client::Stressor;
+use consensus::client::{ClientMode, Stressor};
 use tokio::sync::oneshot;
 
 pub struct LoadDriver {
@@ -12,17 +12,16 @@ impl LoadDriver {
     pub fn start_load(
         config: &StressTestConfig,
         target_rate: u64,
+        client_mode: ClientMode,
     ) -> Result<Self> {
-        let client_settings = build_client_settings(config, target_rate);
+        let client_settings = build_client_settings(config, target_rate, client_mode);
         let mut exits = Vec::new();
 
         for client_idx in 0..config.num_clients {
             // Client IDs start after server IDs to avoid collision
             let client_id = config.num_nodes + client_idx;
-            let exit_tx = Stressor::<SimpleTx<SimpleData>>::spawn(
-                client_id,
-                client_settings.clone(),
-            )?;
+            let exit_tx =
+                Stressor::<SimpleTx<SimpleData>>::spawn(client_id, client_settings.clone())?;
             exits.push(exit_tx);
         }
 

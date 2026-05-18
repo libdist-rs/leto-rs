@@ -1,6 +1,8 @@
+use super::SyncHelper;
 use crate::{
-    types::{Proposal, ProtocolMsg, Response, Signature, Transaction, Element},
-    Id, Round, server::{HelperRequest, ChainDB},
+    server::{ChainDB, HelperRequest},
+    types::{Element, Proposal, ProtocolMsg, Response, Signature, Transaction},
+    Id, Round,
 };
 use anyhow::{Context, Result};
 use crypto::hash::Hash;
@@ -8,10 +10,14 @@ use fnv::FnvHashMap;
 use futures_util::Stream;
 use mempool::{Batch, BatchHash};
 use serde::Serialize;
-use std::{fmt::Debug, net::SocketAddr, pin::Pin, task::{self, Poll}};
+use std::{
+    fmt::Debug,
+    net::SocketAddr,
+    pin::Pin,
+    task::{self, Poll},
+};
 use storage::rocksdb::Storage;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use super::SyncHelper;
 
 pub(super) type SyncMsg<Tx> = SynchronizerMsg<Tx>;
 
@@ -20,9 +26,9 @@ pub enum SynchronizerMsg<Tx> {
     /// Sending this variant signals that only the batch needs syncing
     DeliverBatchOnly(
         /// Hash of the batch
-        BatchHash<Tx>, 
+        BatchHash<Tx>,
         /// The person who sent this unknown batch hash
-        Id, 
+        Id,
         // The message that needs this batch to be resolved
         Proposal<Id, Tx, Round>,
         Signature<Id, Proposal<Id, Tx, Round>>,
@@ -32,7 +38,7 @@ pub enum SynchronizerMsg<Tx> {
         /// Hash of the element
         Hash<Element<Id, Tx, Round>>,
         /// The person who sent this unknown batch hash
-        Id, 
+        Id,
         // The message that needs this batch to be resolved
         Proposal<Id, Tx, Round>,
         Signature<Id, Proposal<Id, Tx, Round>>,
@@ -40,9 +46,9 @@ pub enum SynchronizerMsg<Tx> {
     ),
     DeliverParentAndBatch(
         /// Hash of the batch
-        BatchHash<Tx>, 
+        BatchHash<Tx>,
         /// The person who sent this unknown batch hash
-        Id, 
+        Id,
         /// The message that needs this batch to be resolved
         Proposal<Id, Tx, Round>,
         Signature<Id, Proposal<Id, Tx, Round>>,
@@ -55,7 +61,8 @@ pub struct Synchronizer<Tx> {
     db: ChainDB,
     /// The channel used to communicate with the synchronizer thread
     inner_channel: UnboundedSender<SyncMsg<Tx>>,
-    /// The channel used to tell the caller that this message is synced and ready
+    /// The channel used to tell the caller that this message is synced and
+    /// ready
     tx_outer: UnboundedSender<ProtocolMsg<Id, Tx, Round>>,
     /// The channel used to forward requests to the helper
     tx_helper: UnboundedSender<HelperRequest<Tx>>,
@@ -86,7 +93,8 @@ impl<Tx> Synchronizer<Tx> {
                 store_clone,
                 consensus_peers,
                 tx_outer_clone,
-            ).run()
+            )
+            .run()
             .await
         });
 
@@ -108,15 +116,16 @@ impl<Tx> Synchronizer<Tx> {
     where
         T: Serialize,
     {
-        self.db
-            .write(response.response())
-            .await?;
+        self.db.write(response.response()).await?;
         Ok(())
     }
 
     /// Advance the round of the synchronizer
-    pub fn advance_round(&mut self, new_round: Round) -> Result<()> 
-    where 
+    pub fn advance_round(
+        &mut self,
+        new_round: Round,
+    ) -> Result<()>
+    where
         Tx: Transaction,
     {
         self.inner_channel
@@ -131,20 +140,16 @@ impl<Tx> Synchronizer<Tx> {
         auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch: Batch<Tx>,
         sender: Id,
-    ) -> Result<()> 
-    where 
+    ) -> Result<()>
+    where
         Tx: Transaction,
     {
         // Write the batch, so that some messages can be resolved
         self.db.write(batch.clone()).await?;
 
         // Check if we know the parent
-        let parent_hash = proposal
-            .block()
-            .parent_hash(); 
-        match self.db
-            .read(parent_hash.clone())
-            .await? {
+        let parent_hash = proposal.block().parent_hash();
+        match self.db.read(parent_hash.clone()).await? {
             Some(..) => {
                 // Element write is handled by chain_state.update_highest_chain
                 // to avoid duplicate ~500KB serialization
@@ -157,149 +162,138 @@ impl<Tx> Synchronizer<Tx> {
                 self.tx_outer
                     .send(msg)
                     .context("Failed to send synced propose")
-            },
-            None => {
-                self.inner_channel.send(SyncMsg::DeliverParentOnly(
-                    parent_hash, 
+            }
+            None => self
+                .inner_channel
+                .send(SyncMsg::DeliverParentOnly(
+                    parent_hash,
                     sender,
-                    proposal, 
-                    auth, 
+                    proposal,
+                    auth,
                     batch,
-                )).context("Failed to send sync request")
-            },
+                ))
+                .context("Failed to send sync request"),
         }
     }
 
-    /// This function synchronizes the relay message and converts it into a propose message
+    /// This function synchronizes the relay message and converts it into a
+    /// propose message
     async fn sync_relay_msg(
         &mut self,
         proposal: Proposal<Id, Tx, Round>,
         auth: Signature<Id, Proposal<Id, Tx, Round>>,
         batch_hash: BatchHash<Tx>,
         sender: Id,
-    ) -> Result<()> 
-    where   
+    ) -> Result<()>
+    where
         Tx: Transaction,
     {
         // Check if we know the batch
-        let batch_opt = self.db
-            .read(batch_hash.clone())
-            .await?;
+        let batch_opt = self.db.read(batch_hash.clone()).await?;
         // if batch_opt.is_none() {
         // }
-        let parent_hash = proposal.block().parent_hash(); 
-        let parent_opt = self.db
-            .read(parent_hash.clone())
-            .await?;
+        let parent_hash = proposal.block().parent_hash();
+        let parent_opt = self.db.read(parent_hash.clone()).await?;
         if batch_opt.is_none() && parent_opt.is_none() {
-            self.inner_channel.send(SyncMsg::DeliverParentAndBatch(
-                batch_hash, 
-                sender, 
-                proposal.clone(), 
-                auth.clone(),
-            )).context("Failed to send to sync helper")
+            self.inner_channel
+                .send(SyncMsg::DeliverParentAndBatch(
+                    batch_hash,
+                    sender,
+                    proposal.clone(),
+                    auth.clone(),
+                ))
+                .context("Failed to send to sync helper")
         } else if parent_opt.is_none() {
             self.inner_channel
                 .send(SyncMsg::DeliverParentOnly(
-                    parent_hash, 
-                    sender, 
+                    parent_hash,
+                    sender,
                     proposal,
                     auth,
                     batch_opt.unwrap(),
-                )).context("Failed to send to sync helper")
+                ))
+                .context("Failed to send to sync helper")
         } else if batch_opt.is_none() {
-            self.inner_channel.send(SyncMsg::DeliverBatchOnly(
-                batch_hash, 
-                sender, 
-                proposal.clone(), 
-                auth.clone(),
-            )).context("Failed to send to sync helper")
+            self.inner_channel
+                .send(SyncMsg::DeliverBatchOnly(
+                    batch_hash,
+                    sender,
+                    proposal.clone(),
+                    auth.clone(),
+                ))
+                .context("Failed to send to sync helper")
         } else {
             self.tx_outer
-                .send(ProtocolMsg::Propose { 
-                    proposal, 
-                    auth, 
-                    batch: batch_opt.unwrap(), 
+                .send(ProtocolMsg::Propose {
+                    proposal,
+                    auth,
+                    batch: batch_opt.unwrap(),
                     sender,
-                }).context("Failed to send synced propose to tx outer")
+                })
+                .context("Failed to send synced propose to tx outer")
         }
     }
 
-    /// This function takes a message and returns it after ensuring that all the hashes are available
+    /// This function takes a message and returns it after ensuring that all the
+    /// hashes are available
     pub async fn sync_msg(
-        &mut self, 
-        msg: ProtocolMsg<Id, Tx, Round>
+        &mut self,
+        msg: ProtocolMsg<Id, Tx, Round>,
     ) -> Result<()>
-    where 
+    where
         Tx: Transaction,
     {
         match msg {
-            ProtocolMsg::Propose { 
-                proposal, 
-                auth, 
-                batch ,
-                sender
-            } => self.sync_propose_msg(
-                proposal, 
-                auth, 
+            ProtocolMsg::Propose {
+                proposal,
+                auth,
                 batch,
                 sender,
-            ).await,
-            ProtocolMsg::Relay { 
-                proposal, 
-                auth, 
-                batch_hash, 
-                sender 
-            } => self.sync_relay_msg(
+            } => self.sync_propose_msg(proposal, auth, batch, sender).await,
+            ProtocolMsg::Relay {
                 proposal,
                 auth,
                 batch_hash,
                 sender,
-            ).await,
+            } => {
+                self.sync_relay_msg(proposal, auth, batch_hash, sender)
+                    .await
+            }
             // Synchronizer messages
-            ProtocolMsg::BatchRequest { 
-                source, 
-                request 
-            } => self.tx_helper
-                .send(HelperRequest::BatchRequest(
-                    source, 
-                    request
-                )).context("Error sending request batch"),
-            ProtocolMsg::BatchResponse { 
-                response 
-            } => self.on_response(response).await,
-            ProtocolMsg::ElementRequest { 
-                source, 
-                request 
-            } => self.tx_helper
-                .send(HelperRequest::ElementRequest(
-                    source,
-                    request,
-                )).context("Error sending request element"),
-            ProtocolMsg::ElementResponse { 
-                response 
-            } => self.on_response(response).await,
+            ProtocolMsg::BatchRequest { source, request } => self
+                .tx_helper
+                .send(HelperRequest::BatchRequest(source, request))
+                .context("Error sending request batch"),
+            ProtocolMsg::BatchResponse { response } => self.on_response(response).await,
+            ProtocolMsg::ElementRequest { source, request } => self
+                .tx_helper
+                .send(HelperRequest::ElementRequest(source, request))
+                .context("Error sending request element"),
+            ProtocolMsg::ElementResponse { response } => self.on_response(response).await,
             // By-pass all the remaining messages
-            ProtocolMsg::Blame {..} => self.tx_outer
+            ProtocolMsg::Blame { .. } => self
+                .tx_outer
                 .send(msg)
                 .context("Error by-passing blame in synchronizer"),
-            ProtocolMsg::BlameQC {..} => self.tx_outer
+            ProtocolMsg::BlameQC { .. } => self
+                .tx_outer
                 .send(msg)
                 .context("Error by-passing blameQC in synchronizer"),
         }
     }
 }
 
-/// Implement stream so we can just call `synchronizer.next()` instead of exposing the internals using channels
-impl<Tx> Stream for Synchronizer<Tx> 
+/// Implement stream so we can just call `synchronizer.next()` instead of
+/// exposing the internals using channels
+impl<Tx> Stream for Synchronizer<Tx>
 where
     Tx: Transaction,
 {
     type Item = ProtocolMsg<Id, Tx, Round>;
 
     fn poll_next(
-        mut self: Pin<&mut Self>, 
-        cx: &mut task::Context<'_>
+        mut self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
     ) -> Poll<Option<Self::Item>> {
         self.rx_outer.poll_recv(cx)
     }

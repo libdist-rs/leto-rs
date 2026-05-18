@@ -1,18 +1,26 @@
+/// Zeus stress-test binary.
+///
+/// Shares all modules with the Leto stress-test via path-referenced includes.
+#[path = "../config.rs"]
 mod config;
-mod harness;
+#[path = "../load_driver.rs"]
 mod load_driver;
+#[path = "../metrics.rs"]
 mod metrics;
+#[path = "../report.rs"]
 mod report;
+#[path = "../smr.rs"]
 mod smr;
+#[path = "../zeus_harness.rs"]
 mod zeus_harness;
 
 use anyhow::Result;
 use clap::Parser;
 use config::StressTestConfig;
-use harness::NodeHarness;
 use load_driver::LoadDriver;
 use metrics::{LevelMetrics, MetricsCollector, Status};
 use std::time::Duration;
+use zeus_harness::ZeusNodeHarness;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
@@ -24,7 +32,7 @@ async fn main() -> Result<()> {
     let load_levels = config.load_levels();
 
     println!("===============================================================");
-    println!("  LETO BFT STRESS TEST");
+    println!("  ZEUS BFT STRESS TEST");
     println!("===============================================================");
     println!(
         "  Nodes: {}, Faults: {}",
@@ -41,22 +49,19 @@ async fn main() -> Result<()> {
     println!("===============================================================");
     println!();
 
-    // 1. Spawn consensus nodes
     println!(
-        "[*] Spawning {} consensus nodes...",
+        "[*] Spawning {} Zeus consensus nodes...",
         config.num_nodes - config.num_crash_faults
     );
     let metrics = MetricsCollector::new();
-    let harness = NodeHarness::spawn_nodes(&config, &metrics)?;
+    let harness = ZeusNodeHarness::spawn_nodes(&config, &metrics)?;
 
-    // 2. Wait for nodes to connect
     let convergence_secs = (config.num_nodes as u64).max(5);
     println!("[*] Waiting {}s for node convergence...", convergence_secs);
     tokio::time::sleep(Duration::from_secs(convergence_secs)).await;
     println!("[*] Convergence period complete.");
     println!();
 
-    // 3. Run load levels
     let mut results: Vec<LevelMetrics> = Vec::new();
     let mut consecutive_saturated = 0u32;
 
@@ -68,25 +73,23 @@ async fn main() -> Result<()> {
             target_rate,
         );
 
-        // Start stressors (Leto: broadcast to all servers)
-        let driver = LoadDriver::start_load(
-            &config,
-            target_rate,
-            consensus::client::ClientMode::LetoBroadcast,
-        )?;
+        // Zeus: pre-seed the eleader id so the stressor skips the WhoIsEleader query.
+        // eleader(epoch=1, n) = 1 % n.
+        let eleader_id = (1usize % config.num_nodes) as consensus::Id;
+        let client_mode = consensus::client::ClientMode::ZeusEleaderOnly {
+            eleader_id: Some(eleader_id),
+        };
+        let driver = LoadDriver::start_load(&config, target_rate, client_mode)?;
 
-        // Warmup
         if config.warmup_secs > 0 {
             println!("    Warming up for {}s...", config.warmup_secs);
             tokio::time::sleep(Duration::from_secs(config.warmup_secs)).await;
         }
 
-        // Reset metrics and measure
         metrics.reset_level();
         println!("    Measuring for {}s...", config.duration_per_level_secs);
         tokio::time::sleep(Duration::from_secs(config.duration_per_level_secs)).await;
 
-        // Snapshot metrics
         let level_metrics = metrics.snapshot(target_rate);
         println!(
             "    Result: {:.0} tx/s ({:.0} B/s), {} batches, status: {}",
@@ -96,21 +99,16 @@ async fn main() -> Result<()> {
             level_metrics.status,
         );
 
-        // Stop stressors
         driver.stop();
-        // Brief pause between levels for cleanup
         tokio::time::sleep(Duration::from_secs(2)).await;
 
-        // Track saturation
         if level_metrics.status == Status::Saturated {
             consecutive_saturated += 1;
         } else {
             consecutive_saturated = 0;
         }
-
         results.push(level_metrics);
 
-        // Early exit if saturated for 2 consecutive levels
         if consecutive_saturated >= 2 {
             println!();
             println!("[!] System saturated for 2 consecutive levels. Stopping early.");
@@ -118,13 +116,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 4. Shutdown
     println!();
-    println!("[*] Shutting down nodes...");
+    println!("[*] Shutting down Zeus nodes...");
     harness.shutdown();
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // 5. Print report
     report::print_report(&config, &results);
 
     Ok(())

@@ -1,23 +1,24 @@
+/// Zeus node harness — parallel to `harness.rs` for Leto.
+///
+/// Spawns Zeus servers for in-process stress testing.
 use crate::config::{build_server_settings, StressTestConfig};
 use crate::metrics::MetricsCollector;
 use crate::smr::{SimpleData, SimpleTx};
 use anyhow::Result;
-use consensus::{server::Server, Id, KeyConfig};
+use consensus::{server::ZeusServer, Id, KeyConfig};
 use crypto::Algorithm;
 use mempool::Batch;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 
-pub struct NodeHarness {
+pub struct ZeusNodeHarness {
     exit_senders: Vec<oneshot::Sender<()>>,
-    /// Extra commit receivers for non-metrics nodes (kept alive so channels
-    /// don't close)
     _drain_tasks: Vec<tokio::task::JoinHandle<()>>,
     pub temp_dir: TempDir,
 }
 
-impl NodeHarness {
+impl ZeusNodeHarness {
     pub fn spawn_nodes(
         config: &StressTestConfig,
         metrics: &MetricsCollector,
@@ -35,10 +36,8 @@ impl NodeHarness {
             let (tx_commit, rx_commit) = unbounded_channel::<Arc<Batch<SimpleTx<SimpleData>>>>();
 
             if id == 0 {
-                // Node 0's commits feed the metrics collector
                 metrics.register_commit_receiver(rx_commit);
             } else {
-                // Drain other nodes' commit channels to prevent backpressure
                 let handle = tokio::spawn(async move {
                     let mut rx = rx_commit;
                     while rx.recv().await.is_some() {}
@@ -46,7 +45,7 @@ impl NodeHarness {
                 drain_tasks.push(handle);
             }
 
-            let exit_tx = Server::<SimpleTx<SimpleData>>::spawn(
+            let exit_tx = ZeusServer::<SimpleTx<SimpleData>>::spawn(
                 id,
                 all_ids.clone(),
                 crypto_keys[id].clone(),
@@ -67,6 +66,5 @@ impl NodeHarness {
         for sender in self.exit_senders {
             let _ = sender.send(());
         }
-        // temp_dir is dropped here, cleaning up RocksDB files
     }
 }
