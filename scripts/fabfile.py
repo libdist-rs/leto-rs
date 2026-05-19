@@ -113,25 +113,29 @@ def smoke(c, target="local", protocol="leto", num_nodes=4, num_clients=2,
 
 
 @task
-def bench(c, runs=3, t="1", protocols="apollo,artemis,leto,zeus,mysticeti",
+def bench(c, runs=3, faults_t="1", protocols="apollo,artemis,leto,zeus,mysticeti",
           loads=None, load_mode="ramp", faults="none", tag="untagged",
-          target="aws", ssh_key_path=None):
+          target="aws", ssh_key_path=None,
+          warmup_secs=60, measure_secs=120):
     """Run a sweep matrix: protocols × scales × loads × trials.
 
     AWS mode requires `--ssh-key-path /path/to/keypair.pem`.
+    Default window: 60s warmup + 120s measure = 180s per run.
     """
     from orchestrator.bench import SweepConfig, run_sweep
-    t_values = [int(x) for x in str(t).split(",") if x]
+    t_values = [int(x) for x in str(faults_t).split(",") if x]
     if loads is None:
         # Default ramp; adjust per --load-mode in a future iteration.
         loads_list = [1000, 2500, 5000, 10000, 25000, 50000, 100000, 200000]
     else:
-        loads_list = [int(x.replace("k", "000")) for x in str(loads).split(",") if x]
+        loads_list = [int(float(x.replace("k", "")) * 1000) for x in str(loads).split(",") if x]
     cfg = SweepConfig(
         protocols=[p.strip() for p in protocols.split(",") if p.strip()],
         t_values=t_values,
         loads=loads_list,
         trials=int(runs),
+        warmup_secs=int(warmup_secs),
+        measure_secs=int(measure_secs),
         target=target,
         tag=tag,
         ssh_key_path=ssh_key_path,

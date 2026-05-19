@@ -117,7 +117,12 @@ def translate(committee: Committee, out_dir: Path, protocol: str = "leto") -> di
                 "emit_dp": True,
             },
             "client_mode": client_mode,
-            "my_confirmation_address": "0.0.0.0",
+            # my_confirmation_address must be the client's routable IP (or
+            # 0.0.0.0 for local runs where server+client share a host).  For
+            # AWS, the committee sets endpoint.host to the instance's private
+            # IP; use it so servers can route BatchConfirmation back to the
+            # correct client machine.
+            "my_confirmation_address": client.endpoint.host,
             "my_confirmation_port": client.endpoint.client_port,
         }
         client_path = out_dir / f"{protocol}-client-{client.id}.json"

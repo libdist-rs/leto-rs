@@ -62,17 +62,41 @@ def run_sweep(cfg: SweepConfig, total_txs: int = 0, window: int = 0) -> Path:
     }
     samples: list[parse.Sample] = []
 
+    # For AWS runs, load the instance list once so every iteration can
+    # build a real-IP committee without re-reading state.json each time.
+    _aws_state: dict | None = None
+    if cfg.target == "aws":
+        from orchestrator import aws as _aws_mod
+        _aws_state = _aws_mod.load_state()
+
     for protocol_name, t, load, trial in product(
         cfg.protocols, cfg.t_values, cfg.loads, range(cfg.trials)
     ):
         protocol = REGISTRY[protocol_name]
         n = 3 * t + 1
         num_clients = cfg.num_clients_for(n)
-        run_id = f"{protocol_name}-n{n}-f{t}/run-{trial}"
-        run_dir = out_root / f"{protocol_name}-n{n}-f{t}" / f"run-{trial}"
-        config_dir = state_root() / "configs" / stamp / f"{protocol_name}-n{n}-f{t}-trial{trial}"
+        run_id = f"{protocol_name}-n{n}-f{t}-r{load}/run-{trial}"
+        run_dir = out_root / f"{protocol_name}-n{n}-f{t}" / f"load-{load}" / f"run-{trial}"
+        config_dir = state_root() / "configs" / stamp / f"{protocol_name}-n{n}-f{t}-load{load}-trial{trial}"
 
-        committee = genconfig.generate_local(n=n, f=t, num_clients=num_clients)
+        if cfg.target == "aws" and _aws_state is not None:
+            # Build a committee using the actual private IPs of provisioned
+            # instances — nodes first (ordered by aws.json), then clients.
+            instances = _aws_state.get("instances", [])
+            node_hosts = [i["private_ip"] for i in instances if i.get("role") == "node"][:n]
+            client_hosts = [i["private_ip"] for i in instances if i.get("role") == "client"][:num_clients]
+            if len(node_hosts) < n or len(client_hosts) < num_clients:
+                raise RuntimeError(
+                    f"need {n} node hosts + {num_clients} client hosts; "
+                    f"provisioned {len(node_hosts)} nodes + {len(client_hosts)} clients"
+                )
+            committee = genconfig.generate_aws(
+                node_hosts=node_hosts,
+                client_hosts=client_hosts,
+                f=t,
+            )
+        else:
+            committee = genconfig.generate_local(n=n, f=t, num_clients=num_clients)
         genconfig.write_committee(committee, config_dir)
 
         translator = _import_translator(protocol.translator_module)

@@ -235,7 +235,7 @@ def launch_local(
 # ---------------------------------------------------------------------------
 
 
-REMOTE_ROOT = "$HOME/leto-bench"
+REMOTE_ROOT = "/home/ec2-user/leto-bench"
 REMOTE_USER = "ec2-user"         # Amazon Linux 2023 arm64 default
 TMUX_SESSION = "leto-bench"
 
@@ -483,51 +483,127 @@ def launch_remote(
         f"mkdir -p {run_dir} {log_remote}",
     )
 
-    # --- distribute config + key files ---
-    server_config = config_dir / f"{protocol.name}-server.json"
-    if not server_config.exists():
-        raise FileNotFoundError(f"missing server config: {server_config}")
-    keys_dir = config_dir / "keys"  # optional; leto-rs translator may emit here
-    fallback_keys = Path(__file__).resolve().parent.parent.parent / "examples"
-
     _, cf = _fabric_imports()
-    def _push_node_files(idx_and_conn):
-        i, c = idx_and_conn
-        # Server config
-        c.put(str(server_config), f"{run_dir}/{protocol.name}-server.json")
-        # Per-node key file (leto/zeus). Apollo+Artemis ship keys via their
-        # own genconfig; for those, this put is a no-op if the file
-        # doesn't exist locally.
-        for cand in (
-            keys_dir / f"keys-{i}.json",
-            fallback_keys / f"keys-{i}.json",
-        ):
-            if cand.exists():
-                c.put(str(cand), f"{run_dir}/keys-{i}.json")
-                break
 
-    def _push_client_files(idx_and_conn):
-        i, c = idx_and_conn
-        client_id = n + i
-        client_config = config_dir / f"{protocol.name}-client-{client_id}.json"
-        if client_config.exists():
-            c.put(str(client_config), f"{run_dir}/{protocol.name}-client-{client_id}.json")
+    # --- protocol-specific config distribution ---
+    # leto/zeus: server.json + per-node keys-{i}.json
+    # apollo/artemis: entire genconfig output dir (nodes-*.json, ip_file,
+    #   cli_ip_file, client.json, *.pem, …)
+    # mysticeti: self-contained dry-run; nothing to push.
+    if protocol.name in ("leto", "zeus"):
+        server_config = config_dir / f"{protocol.name}-server.json"
+        if not server_config.exists():
+            raise FileNotFoundError(f"missing server config: {server_config}")
 
-    print("[launch] distributing config + keys")
-    with cf.ThreadPoolExecutor(max_workers=max(1, len(conns))) as ex:
-        list(ex.map(_push_node_files, enumerate(node_conns)))
-        list(ex.map(_push_client_files, enumerate(client_conns)))
+        # Key files: prefer config_dir/keys/, then fall back to the
+        # examples/ dir in the local workspace root.
+        keys_dir = config_dir / "keys"
+        fallback_keys = Path(__file__).resolve().parent.parent.parent / "examples"
+
+        # For n>4 we need more keys than examples/ ships (which has 0-3 only).
+        # Generate them on node-0 via the remote binary and pull back.
+        max_fallback_key = 3
+        if n - 1 > max_fallback_key:
+            # Generate keys remotely on node-0, then pull them down.
+            keygen_dir = f"{run_dir}/genkeys"
+            node_conns[0].run(
+                f"mkdir -p {keygen_dir} && "
+                f"{bin_dir}/node keys -n {n} -o {keygen_dir}",
+                hide=True,
+            )
+            keys_dir.mkdir(parents=True, exist_ok=True)
+            for ki in range(n):
+                node_conns[0].get(
+                    f"{keygen_dir}/keys-{ki}.json",
+                    str(keys_dir / f"keys-{ki}.json"),
+                )
+            # Also update fallback so the loop below finds them.
+            fallback_keys = keys_dir
+
+        def _push_node_files(idx_and_conn):
+            i, c = idx_and_conn
+            c.put(str(server_config), f"{run_dir}/{protocol.name}-server.json")
+            for cand in (
+                keys_dir / f"keys-{i}.json",
+                fallback_keys / f"keys-{i}.json",
+            ):
+                if cand.exists():
+                    c.put(str(cand), f"{run_dir}/keys-{i}.json")
+                    break
+
+        def _push_client_files(idx_and_conn):
+            i, c = idx_and_conn
+            client_id = n + i
+            client_config = config_dir / f"{protocol.name}-client-{client_id}.json"
+            if client_config.exists():
+                c.put(str(client_config), f"{run_dir}/{protocol.name}-client-{client_id}.json")
+
+        print("[launch] distributing leto/zeus config + keys")
+        with cf.ThreadPoolExecutor(max_workers=max(1, len(conns))) as ex:
+            list(ex.map(_push_node_files, enumerate(node_conns)))
+            list(ex.map(_push_client_files, enumerate(client_conns)))
+
+    elif protocol.name in ("apollo", "artemis"):
+        # Push every file genconfig emitted under config_dir to each
+        # relevant host:
+        #  - nodes-{i}.json + node-{i}.*.pem → node i only
+        #  - ip_file, cli_ip_file, root-cert.pem → all nodes + all clients
+        #  - client.json + client-0.*.pem → all client hosts
+        ip_file = config_dir / "ip_file"
+        cli_ip_file = config_dir / "cli_ip_file"
+        root_cert = config_dir / "root-cert.pem"
+        shared_files = [f for f in (ip_file, cli_ip_file, root_cert) if f.exists()]
+
+        def _push_apollo_node(idx_and_conn):
+            i, c = idx_and_conn
+            for sf in shared_files:
+                c.put(str(sf), f"{run_dir}/{sf.name}")
+            node_cfg = config_dir / f"nodes-{i}.json"
+            if node_cfg.exists():
+                c.put(str(node_cfg), f"{run_dir}/nodes-{i}.json")
+            for ext in ("chain.pem", "key.pem"):
+                pem = config_dir / f"node-{i}.{ext}"
+                if pem.exists():
+                    c.put(str(pem), f"{run_dir}/node-{i}.{ext}")
+
+        def _push_apollo_client(idx_and_conn):
+            _i, c = idx_and_conn
+            for sf in shared_files:
+                c.put(str(sf), f"{run_dir}/{sf.name}")
+            client_cfg = config_dir / "client.json"
+            if client_cfg.exists():
+                c.put(str(client_cfg), f"{run_dir}/client.json")
+            for ext in ("chain.pem", "key.pem"):
+                pem = config_dir / f"client-0.{ext}"
+                if pem.exists():
+                    c.put(str(pem), f"{run_dir}/client-0.{ext}")
+
+        print("[launch] distributing apollo/artemis genconfig files")
+        with cf.ThreadPoolExecutor(max_workers=max(1, len(conns))) as ex:
+            list(ex.map(_push_apollo_node, enumerate(node_conns)))
+            list(ex.map(_push_apollo_client, enumerate(client_conns)))
+    else:
+        # mysticeti dry-run: no config files needed.
+        print(f"[launch] {protocol.name} is self-contained (no config push)")
 
     # --- launch nodes in detached tmux ---
     print(f"[launch] starting {n} {protocol.name} nodes")
     for i, c in enumerate(node_conns):
-        node_cmd = protocol.node_run_cmd.format(
+        # Build per-protocol substitution dict with ALL keys that any
+        # node_run_cmd template may reference (missing keys surface as
+        # KeyError at format time — preferable to silent wrong output).
+        node_subs = dict(
             bin_dir=bin_dir,
             config=f"{run_dir}/{protocol.name}-server.json",
+            node_config=f"{run_dir}/nodes-{i}.json",
+            ip_file=f"{run_dir}/ip_file",
             id=i,
+            n=n,
+            rate=rate,
             key_file=f"{run_dir}/keys-{i}.json",
             extra=protocol.node_extra_args,
         )
+        node_cmd = protocol.node_run_cmd.format(**node_subs)
         log_path = f"{log_remote}/node-{i}.log"
         # tmux -d detaches; the inner bash -c wrap keeps the pipe redirect.
         cmd = (
@@ -548,6 +624,8 @@ def launch_remote(
         client_cmd = protocol.client_run_cmd.format(
             bin_dir=bin_dir,
             config=f"{run_dir}/{protocol.name}-client-{client_id}.json",
+            client_config=f"{run_dir}/client.json",
+            cli_ip_file=f"{run_dir}/cli_ip_file",
             id=client_id,
             rate=rate,
             total_txs=total_txs,
@@ -565,9 +643,16 @@ def launch_remote(
 
     # --- optional sidecar (Mysticeti dpbridge) on node 0 ---
     if protocol.sidecar_run_cmd:
+        sidecar_max_secs = warmup_secs + measure_secs + 60   # grace period
+        # Mysticeti dry-run port layout (mysticeti-core/src/config.rs):
+        #   network_port  = BENCHMARK_PORT_OFFSET + authority_id   (1500 + i)
+        #   metrics_port  = n + network_port                       (n + 1500 + i)
+        # For authority 0 with n nodes: metrics_port = 1500 + n.
+        mysticeti_metrics_port = 1500 + n
         sidecar_cmd = protocol.sidecar_run_cmd.format(
             bridges_dir=f"{REMOTE_ROOT}/bin/{protocol.name}_dpbridge",
-            metrics_url="http://127.0.0.1:1500/metrics",
+            metrics_url=f"http://127.0.0.1:{mysticeti_metrics_port}/metrics",
+            max_secs=sidecar_max_secs,
             extra="",
         )
         sidecar_log = f"{log_remote}/sidecar.log"
