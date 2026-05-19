@@ -78,7 +78,7 @@ class Protocol:
 APOLLO = Protocol(
     name="apollo",
     git_url="https://github.com/libdist-rs/libapollo-rs.git",
-    git_sha="PINME",
+    git_sha="932046693448deb7e26085db864d5670f858522c",
     build_cmd="cargo build --release --bin node-apollo --bin client-apollo --bin genconfig",
     # libapollo-rs node-apollo CLI: `-c nodes-<i>.json -i ip_file -s --sleep N --delta MS`.
     # {node_config} and {ip_file} are substituted by deploy.launch_*.
@@ -98,7 +98,7 @@ APOLLO = Protocol(
 ARTEMIS = Protocol(
     name="artemis",
     git_url="https://github.com/libdist-rs/libapollo-rs.git",
-    git_sha="PINME",
+    git_sha="932046693448deb7e26085db864d5670f858522c",
     build_cmd="cargo build --release --bin node-artemis --bin client-artemis --bin genconfig",
     node_run_cmd=(
         "{bin_dir}/node-artemis -c {node_config} -i {ip_file} "
@@ -114,7 +114,7 @@ ARTEMIS = Protocol(
 LETO = Protocol(
     name="leto",
     git_url="https://github.com/libdist-rs/leto-rs.git",
-    git_sha="PINME",
+    git_sha="f2d9db96a7a5e6a3213a83a96ad192dcb0b842b8",
     build_cmd="cargo build --release --bin node",
     # `node` + `node server --id N --config <cfg> --key-file <key>` —
     # client mode reuses the same binary's `client` subcommand which
@@ -132,7 +132,7 @@ LETO = Protocol(
 ZEUS = Protocol(
     name="zeus",
     git_url="https://github.com/libdist-rs/leto-rs.git",
-    git_sha="PINME",
+    git_sha="f2d9db96a7a5e6a3213a83a96ad192dcb0b842b8",
     build_cmd="cargo build --release --bin node-zeus --bin node",
     node_run_cmd=(
         "{bin_dir}/node-zeus server --id {id} --config {config} "
@@ -149,7 +149,7 @@ ZEUS = Protocol(
 MYSTICETI = Protocol(
     name="mysticeti",
     git_url="https://github.com/MystenLabs/mysticeti.git",
-    git_sha="PINME",
+    git_sha="3b78b12af94986abbced89e662eedf157248b465",
     build_cmd="cargo build --release --bin mysticeti",
     # Mysticeti's single binary; `dry-run` self-generates committee +
     # keys + load (no separate client binary). TPS env controls the
