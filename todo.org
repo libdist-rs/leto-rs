@@ -1,6 +1,77 @@
 #+title: leto-rs local todo
 #+tags: { Layer : Zeus Leto Crypto Net } { Kind : Perf Correctness Refactor Test }
 
+* Leto view-change test findings (2026-05-18)                        :Leto:Test:
+
+** DONE Crash-fault smoke: blame→BlameQC→advance_round path verified :Leto:Correctness:Test:
+   CLOSED: [2026-05-18]
+   Test path: Option B (in-process Rust test).
+   File: node/src/test/server/crash_fault_test.rs (test_crash_fault_view_change).
+
+   4 nodes spawned in-process, 1 Stressor client.  Node 1 killed after 6s
+   warmup (node 0 is metrics node, stays up).  Results across 2 runs:
+   - Pre-kill commits (node 0, 6s): 44–46
+   - Post-kill commits (node 0, 25s window): 73–74
+   Protocol recovered cleanly.  No panics.  No bugs found in blame.rs or
+   round_context.rs.
+
+** TODO examples/server.json stale — missing new BenchConfig fields  :Leto:Refactor:
+   :PROPERTIES:
+   :Location: examples/server.json, examples/client.json
+   :END:
+
+   The examples config was missing eleader_pipeline_depth,
+   data_timer_duration_ms, bench_emit_window_secs, bench_metrics_node, and
+   consensus_client_port on all Party entries.  Running
+   `./target/debug/node config -n 4 -o examples` regenerated them; the old
+   scripts/local/test4nodes.sh uses `cargo r -p node` without `--bin node`
+   and fails now that node-zeus was added as a second binary in the package.
+
+   Fix: add `--bin node` to the cargo r calls in test4nodes.sh, or add a
+   `default-run = "node"` key to node/Cargo.toml.
+
+** TODO scripts/local/test4nodes.sh: cargo r ambiguous (node vs node-zeus) :Leto:Refactor:
+   :PROPERTIES:
+   :Location: scripts/local/test4nodes.sh, node/Cargo.toml
+   :END:
+
+   `cargo r -p node` fails with "could not determine which binary to run"
+   because node-zeus was added.  Add --bin node or set default-run in
+   node/Cargo.toml.
+
+* Known regressions (2026-05-18) [0/1]                              :Zeus:
+** TODO Zeus commit-stall in orchestrator local smoke               :Zeus:Correctness:
+   :PROPERTIES:
+   :Location: consensus/src/server/zeus/phases/commit.rs (ZeusCommitContext)
+   :END:
+
+   4-node Zeus run via the new orchestrator (scripts/orchestrator/)
+   admits ~11 data blocks/sec and advances sig-chain ~45 rounds/sec
+   but **zero** Zeus-committed lines fire across 600+ sig rounds.
+   `on_committed_attestation` is never called → no DP[Throughput] /
+   DP[Latency], so Zeus rows in any sweep are empty.
+
+   Leto through the same orchestrator hits ~39k tx/s, so the
+   orchestrator wiring is fine.  This is Zeus-protocol-internal,
+   introduced by the recent freshness rule + eleader-change landings
+   (Tasks 13 + 27 in the session).
+
+   Working hypothesis: most sig-rounds advance via BlameQC (timeout
+   path) rather than via a real proposal, because the freshness rule
+   makes the rleader wait and the round-timer fires first.  Without a
+   real proposal, `update_highest_chain` doesn't run, so the
+   ZeusCommitContext's `unique_proposers` count never reaches
+   `commit_len = (n+f+1)/2 = 3`.
+
+   Try: instrument `update_highest_chain` and the commit-context's
+   `unique_proposers` accumulation; raise sig Δ to >> data_timer to
+   give the freshness path room; alternatively reconsider whether
+   BlameQC-driven round advances should count toward commit progress.
+
+   Also: investigate whether `try_form_change_qc` is firing
+   constantly under the freshness load and short-circuiting the
+   honest commit path.
+
 * Zeus perf findings (2026-05-18) [0/3]
 
   Source: profile pass against Zeus at 5k tx/s offered (in-process 4-node
