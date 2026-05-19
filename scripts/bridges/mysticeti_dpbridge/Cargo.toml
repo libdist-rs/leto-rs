@@ -1,0 +1,26 @@
+[workspace]
+# Standalone — not part of the leto-rs workspace; deliberately
+# decoupled so the bridge can be built/shipped independently of the
+# main consensus stack.
+
+[package]
+name = "mysticeti_dpbridge"
+version = "0.1.0"
+edition = "2021"
+description = "Scrapes Mysticeti's Prometheus /metrics endpoint, emits DP[Throughput]/DP[Latency] on stderr for the leto-rs orchestrator's parser"
+license = "MIT"
+
+[[bin]]
+name = "mysticeti-dpbridge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+prometheus-parse = "0.2"
+tokio = { version = "1", features = ["rt", "macros", "time", "signal"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,24 @@
+[project]
+name = "leto-orchestrator"
+version = "0.1.0"
+description = "Multi-protocol BFT-SMR benchmark orchestrator (Apollo, Artemis, Leto, Zeus, Mysticeti)"
+requires-python = ">=3.10"
+dependencies = [
+    "fabric>=3.2",
+    "paramiko>=3.4",
+    "boto3>=1.34",
+    "matplotlib>=3.8",
+    "pyyaml>=6.0",
+    "tomli-w>=1.0",
+]
+
+[project.scripts]
+leto-bench = "orchestrator.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["orchestrator*"]
