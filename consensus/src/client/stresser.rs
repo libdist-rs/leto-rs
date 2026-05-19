@@ -23,9 +23,10 @@ pub struct Stressor<Tx> {
     /// `Vec<u8>` because we serialize `ClientMsg`/`ZeusClientMsg` manually and
     /// pass raw `Bytes` — the phantom is not used on the wire.
     consensus_sender: TcpSimpleSender<Id, Vec<u8>>,
-    /// Receives confirmed `Hash<Vec<Tx>>` from the confirmation listener task.
+    /// Receives committed per-tx hash `Hash<Tx>` from the confirmation listener
+    /// task (server emits `Confirmation(Hash<Tx>)` per committed tx).
     /// The listener deserializes the server reply and forwards the hash here.
-    confirmation_rx: UnboundedReceiver<Hash<Vec<Tx>>>,
+    confirmation_rx: UnboundedReceiver<Hash<Tx>>,
     _x: PhantomData<Tx>,
 }
 
@@ -71,10 +72,13 @@ where
             &settings.my_confirmation_address,
             settings.my_confirmation_port,
         )?;
-        let (confirmation_tx, confirmation_rx) = unbounded_channel::<Hash<Vec<Tx>>>();
+        let (confirmation_tx, confirmation_rx) = unbounded_channel::<Hash<Tx>>();
 
         // Spawn a mode-aware confirmation listener task.
         // The listener knows the client mode and uses the correct message type.
+        // Confirmation listener: server emits `Confirmation(Hash<Tx>)` per
+        // committed tx (not per batch — libmempool re-batches across NewBatch
+        // boundaries so per-batch hashes never match server-side).
         match &settings.client_mode {
             ClientMode::LetoBroadcast => {
                 let tx = confirmation_tx;
@@ -82,14 +86,13 @@ where
                     let mut receiver = tcp_receiver::TcpReceiver::<ClientMsg<Tx>>::spawn(my_addr);
                     while let Some(result) = receiver.next().await {
                         match result {
-                            Ok(ClientMsg::BatchConfirmation(h)) => {
+                            Ok(ClientMsg::Confirmation(h)) => {
                                 if tx.send(h).is_err() {
                                     break;
                                 }
                             }
-                            Ok(ClientMsg::Confirmation(_)) => {
-                                // Legacy single-tx confirmation — ignore for latency.
-                                info!("Received legacy single-tx Confirmation");
+                            Ok(ClientMsg::BatchConfirmation(_)) => {
+                                // Legacy per-batch path — unused; ignore.
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -106,13 +109,13 @@ where
                         tcp_receiver::TcpReceiver::<ZeusClientMsg<Tx>>::spawn(my_addr);
                     while let Some(result) = receiver.next().await {
                         match result {
-                            Ok(ZeusClientMsg::BatchConfirmation(h)) => {
+                            Ok(ZeusClientMsg::Confirmation(h)) => {
                                 if tx.send(h).is_err() {
                                     break;
                                 }
                             }
-                            Ok(ZeusClientMsg::Confirmation(_)) => {
-                                info!("Received legacy single-tx ZeusConfirmation");
+                            Ok(ZeusClientMsg::BatchConfirmation(_)) => {
+                                // Legacy per-batch path — unused; ignore.
                             }
                             Ok(_) => {}
                             Err(e) => {
@@ -187,7 +190,7 @@ where
         let mut sample_id: u64 = thread_rng().gen();
 
         // DP[Latency] state: batch_hash → send Instant.
-        let mut send_ts: FnvHashMap<Hash<Vec<Tx>>, Instant> = FnvHashMap::default();
+        let mut send_ts: FnvHashMap<Hash<Tx>, Instant> = FnvHashMap::default();
         // Latency samples (microseconds) collected in the current window.
         let mut latency_hist: Vec<u64> = Vec::new();
         let mut emit_interval = tokio::time::interval(Duration::from_secs(window_secs));
@@ -231,8 +234,16 @@ where
                         tx_id += 1;
                     }
 
-                    // Compute batch hash before moving the Vec into the message.
-                    let batch_hash: Hash<Vec<Tx>> = Hash::ser_and_hash(&batch);
+                    // Per-tx send-time tracking — server emits a Confirmation
+                    // per committed tx, looked up against this map.  All txs
+                    // in a burst share the same Instant; resolution loss is
+                    // bounded by the OS clock granularity (negligible vs.
+                    // network/commit latency).
+                    let now = Instant::now();
+                    for tx in &batch {
+                        let h: Hash<Tx> = Hash::ser_and_hash(tx);
+                        send_ts.insert(h, now);
+                    }
 
                     match &self.settings.client_mode {
                         ClientMode::LetoBroadcast => {
@@ -263,12 +274,10 @@ where
                         }
                     }
 
-                    // Record send timestamp keyed by batch hash.
-                    send_ts.insert(batch_hash, Instant::now());
                     sample_id += 1;
                 }
-                batch_hash = self.confirmation_rx.recv() => {
-                    let h = match batch_hash {
+                tx_hash = self.confirmation_rx.recv() => {
+                    let h = match tx_hash {
                         Some(h) => h,
                         None => break,
                     };

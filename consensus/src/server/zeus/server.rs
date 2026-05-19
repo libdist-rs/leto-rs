@@ -89,13 +89,16 @@ where
             }
         });
 
-        // (batch_hash, reply_to) registration channel.
-        let (tx_batch_sender_map, mut rx_batch_sender_map) =
-            unbounded_channel::<(Hash<Vec<Tx>>, SocketAddr)>();
+        // (tx_hash, reply_to) per-tx registration channel.  See Leto
+        // server's matching comment: libmempool re-batches across NewBatch
+        // boundaries, so the confirmation roundtrip must be per-tx not
+        // per-batch.
+        let (tx_tx_sender_map, mut rx_tx_sender_map) =
+            unbounded_channel::<(Hash<Tx>, SocketAddr)>();
 
         // Confirmation router (same logic as Leto Server).
         tokio::spawn(async move {
-            Self::run_confirmation_router(&mut rx_batch_sender_map, &mut rx_commit_for_confirm)
+            Self::run_confirmation_router(&mut rx_tx_sender_map, &mut rx_commit_for_confirm)
                 .await;
         });
 
@@ -109,7 +112,7 @@ where
             Self::run_zeus_client_batch_listener(
                 consensus_client_addr,
                 tx_batcher_for_client,
-                tx_batch_sender_map,
+                tx_tx_sender_map,
                 num_nodes,
                 initial_epoch,
             )
@@ -153,20 +156,20 @@ where
     /// Cancel-handler note: `TcpSimpleSender::send` returns
     /// `Result<(), TcpSimpleSenderError>` — no `CancelHandler` emitted.
     async fn run_confirmation_router(
-        rx_batch_sender_map: &mut tokio::sync::mpsc::UnboundedReceiver<(Hash<Vec<Tx>>, SocketAddr)>,
+        rx_tx_sender_map: &mut tokio::sync::mpsc::UnboundedReceiver<(Hash<Tx>, SocketAddr)>,
         rx_commit_for_confirm: &mut tokio::sync::mpsc::UnboundedReceiver<Arc<Batch<Tx>>>,
     ) where
         Tx: Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
     {
-        let mut pending: FnvHashMap<Hash<Vec<Tx>>, SocketAddr> = FnvHashMap::default();
+        let mut pending: FnvHashMap<Hash<Tx>, SocketAddr> = FnvHashMap::default();
         let mut reply_sender: TcpSimpleSender<SocketAddr, ZeusClientMsg<Tx>> =
             TcpSimpleSender::with_peers(FnvHashMap::default());
 
         loop {
             tokio::select! {
-                reg = rx_batch_sender_map.recv() => {
+                reg = rx_tx_sender_map.recv() => {
                     match reg {
-                        Some((hash, addr)) => { pending.insert(hash, addr); }
+                        Some((tx_hash, addr)) => { pending.insert(tx_hash, addr); }
                         None => break,
                     }
                 }
@@ -175,19 +178,21 @@ where
                         Some(b) => b,
                         None => break,
                     };
-                    let batch_hash: Hash<Vec<Tx>> =
-                        Hash::ser_and_hash(&batch.payload);
-                    if let Some(addr) = pending.remove(&batch_hash) {
-                        let msg = ZeusClientMsg::<Tx>::BatchConfirmation(batch_hash);
-                        if let Ok(bytes) = bincode::serialize(&msg) {
-                            if !reply_sender.get_peers().contains_key(&addr) {
-                                let mut new_peers = reply_sender.get_peers().clone();
-                                new_peers.insert(addr, addr);
-                                reply_sender = TcpSimpleSender::with_peers(new_peers);
+                    for tx in batch.payload.iter() {
+                        let tx_hash: Hash<Tx> = Hash::ser_and_hash(tx);
+                        if let Some(addr) = pending.remove(&tx_hash) {
+                            let msg = ZeusClientMsg::<Tx>::Confirmation(tx_hash);
+                            if let Ok(bytes) = bincode::serialize(&msg) {
+                                if !reply_sender.get_peers().contains_key(&addr) {
+                                    let mut new_peers = reply_sender.get_peers().clone();
+                                    new_peers.insert(addr, addr);
+                                    reply_sender =
+                                        TcpSimpleSender::with_peers(new_peers);
+                                }
+                                let _ = reply_sender
+                                    .send(addr, bytes::Bytes::from(bytes))
+                                    .await;
                             }
-                            let _ = reply_sender
-                                .send(addr, bytes::Bytes::from(bytes))
-                                .await;
                         }
                     }
                 }
@@ -212,7 +217,7 @@ where
     async fn run_zeus_client_batch_listener(
         addr: SocketAddr,
         tx_batcher: tokio::sync::mpsc::UnboundedSender<(Tx, usize)>,
-        tx_batch_sender_map: tokio::sync::mpsc::UnboundedSender<(Hash<Vec<Tx>>, SocketAddr)>,
+        tx_tx_sender_map: tokio::sync::mpsc::UnboundedSender<(Hash<Tx>, SocketAddr)>,
         num_nodes: usize,
         initial_epoch: u64,
     ) where
@@ -225,9 +230,12 @@ where
         while let Some(result) = receiver.next().await {
             match result {
                 Ok(ZeusClientMsg::NewBatch { batch, reply_to }) => {
-                    let batch_hash: Hash<Vec<Tx>> = Hash::ser_and_hash(&batch);
-                    let _ = tx_batch_sender_map.send((batch_hash, reply_to));
+                    // Per-tx registration — libmempool re-batches across
+                    // NewBatch boundaries so the confirmation roundtrip
+                    // must be per-tx, not per-batch.
                     for tx in batch {
+                        let tx_hash: Hash<Tx> = Hash::ser_and_hash(&tx);
+                        let _ = tx_tx_sender_map.send((tx_hash, reply_to));
                         let size = bincode::serialized_size(&tx).unwrap_or(0) as usize;
                         let _ = tx_batcher.send((tx, size));
                     }

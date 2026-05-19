@@ -86,8 +86,8 @@ where
 
         // Channel: client-batch-listener → confirmation router maps.
         // Carries (batch_hash, reply_to_addr) inserted by the batch listener.
-        let (tx_batch_sender_map, mut rx_batch_sender_map) =
-            unbounded_channel::<(Hash<Vec<Tx>>, SocketAddr)>();
+        let (tx_tx_sender_map, mut rx_tx_sender_map) =
+            unbounded_channel::<(Hash<Tx>, SocketAddr)>();
 
         // Fan-out channel: sit between CommitContext and the two downstream
         // consumers (tx_commit and tx_commit_for_confirm).
@@ -103,10 +103,10 @@ where
         });
 
         // Spawn the confirmation router.
-        // Receives committed batches and (batch_hash → SocketAddr) registrations;
-        // sends BatchConfirmation back to the client.
+        // Receives committed batches and (tx_hash → SocketAddr) per-tx
+        // registrations; sends Confirmation(Hash<Tx>) back per committed tx.
         tokio::spawn(async move {
-            Self::run_confirmation_router(&mut rx_batch_sender_map, &mut rx_commit_for_confirm)
+            Self::run_confirmation_router(&mut rx_tx_sender_map, &mut rx_commit_for_confirm)
                 .await;
         });
 
@@ -115,7 +115,7 @@ where
             Self::run_client_batch_listener::<Tx>(
                 consensus_client_addr,
                 tx_batcher_for_client,
-                tx_batch_sender_map,
+                tx_tx_sender_map,
             )
             .await;
         });
@@ -157,28 +157,34 @@ where
 
     /// Receive `(batch_hash, reply_to)` registrations from the batch listener
     /// and committed-batch notifications from the commit fan-out.  On a match,
-    /// send `BatchConfirmation` to the recorded client address.
+    /// send a per-tx `Confirmation(Hash<Tx>)` to each originating client
+    /// for every committed transaction.
+    ///
+    /// Per-tx (not per-batch) because libmempool's batcher re-groups txs
+    /// across NewBatch boundaries — the committed batch's hash never
+    /// matches the client's original NewBatch hash.  Per-tx confirmations
+    /// let the Stressor compute latency from `tx_hash → send_ts`.
     ///
     /// Cancel-handler note: `TcpSimpleSender::send` returns
     /// `Result<(), TcpSimpleSenderError>` (not a `CancelHandler`), so no
     /// handler tracking is required here.
     async fn run_confirmation_router(
-        rx_batch_sender_map: &mut tokio::sync::mpsc::UnboundedReceiver<(Hash<Vec<Tx>>, SocketAddr)>,
+        rx_tx_sender_map: &mut tokio::sync::mpsc::UnboundedReceiver<(Hash<Tx>, SocketAddr)>,
         rx_commit_for_confirm: &mut tokio::sync::mpsc::UnboundedReceiver<Arc<Batch<Tx>>>,
     ) where
         Tx: Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
     {
-        // Map: batch_hash → client SocketAddr
-        let mut pending: FnvHashMap<Hash<Vec<Tx>>, SocketAddr> = FnvHashMap::default();
+        // Map: per-tx hash → originating client SocketAddr.
+        let mut pending: FnvHashMap<Hash<Tx>, SocketAddr> = FnvHashMap::default();
         // TcpSimpleSender keyed by SocketAddr for unreliable one-shot replies.
         let mut reply_sender: TcpSimpleSender<SocketAddr, ClientMsg<Tx>> =
             TcpSimpleSender::with_peers(FnvHashMap::default());
 
         loop {
             tokio::select! {
-                reg = rx_batch_sender_map.recv() => {
+                reg = rx_tx_sender_map.recv() => {
                     match reg {
-                        Some((hash, addr)) => { pending.insert(hash, addr); }
+                        Some((tx_hash, addr)) => { pending.insert(tx_hash, addr); }
                         None => break,
                     }
                 }
@@ -187,21 +193,24 @@ where
                         Some(b) => b,
                         None => break,
                     };
-                    let batch_hash: Hash<Vec<Tx>> =
-                        Hash::ser_and_hash(&batch.payload);
-                    if let Some(addr) = pending.remove(&batch_hash) {
-                        let msg = ClientMsg::<Tx>::BatchConfirmation(batch_hash);
-                        if let Ok(bytes) = bincode::serialize(&msg) {
-                            // Ensure the peer map knows this address.
-                            if !reply_sender.get_peers().contains_key(&addr) {
-                                let mut new_peers = reply_sender.get_peers().clone();
-                                new_peers.insert(addr, addr);
-                                reply_sender = TcpSimpleSender::with_peers(new_peers);
+                    // For each committed tx, look up its originating client
+                    // and send a per-tx Confirmation.
+                    for tx in batch.payload.iter() {
+                        let tx_hash: Hash<Tx> = Hash::ser_and_hash(tx);
+                        if let Some(addr) = pending.remove(&tx_hash) {
+                            let msg = ClientMsg::<Tx>::Confirmation(tx_hash);
+                            if let Ok(bytes) = bincode::serialize(&msg) {
+                                if !reply_sender.get_peers().contains_key(&addr) {
+                                    let mut new_peers = reply_sender.get_peers().clone();
+                                    new_peers.insert(addr, addr);
+                                    reply_sender =
+                                        TcpSimpleSender::with_peers(new_peers);
+                                }
+                                // Unreliable send — drop errors (confirmation loss tolerable).
+                                let _ = reply_sender
+                                    .send(addr, bytes::Bytes::from(bytes))
+                                    .await;
                             }
-                            // Unreliable send — drop errors (confirmation loss tolerable).
-                            let _ = reply_sender
-                                .send(addr, bytes::Bytes::from(bytes))
-                                .await;
                         }
                     }
                 }
@@ -215,7 +224,7 @@ where
     async fn run_client_batch_listener<T>(
         addr: SocketAddr,
         tx_batcher: tokio::sync::mpsc::UnboundedSender<(T, usize)>,
-        tx_batch_sender_map: tokio::sync::mpsc::UnboundedSender<(Hash<Vec<T>>, SocketAddr)>,
+        tx_tx_sender_map: tokio::sync::mpsc::UnboundedSender<(Hash<T>, SocketAddr)>,
     ) where
         T: Transaction,
     {
@@ -223,17 +232,20 @@ where
         while let Some(result) = receiver.next().await {
             match result {
                 Ok(ClientMsg::NewBatch { batch, reply_to }) => {
-                    let batch_hash: Hash<Vec<T>> = Hash::ser_and_hash(&batch);
-                    // Register hash → reply_to before forwarding txs.
-                    let _ = tx_batch_sender_map.send((batch_hash, reply_to));
-                    // Inject each tx into the batcher.
+                    // Per-tx registration so confirmation_router can route a
+                    // Confirmation(Hash<Tx>) back to each tx's originating
+                    // client.  libmempool re-batches across NewBatch
+                    // boundaries, so per-batch hash mapping would never hit.
                     for tx in batch {
+                        let tx_hash: Hash<T> = Hash::ser_and_hash(&tx);
+                        let _ = tx_tx_sender_map.send((tx_hash, reply_to));
                         let size = bincode::serialized_size(&tx).unwrap_or(0) as usize;
                         let _ = tx_batcher.send((tx, size));
                     }
                 }
-                Ok(ClientMsg::NewTx { tx, reply_to: _ }) => {
-                    // Legacy single-tx path — forward to batcher only.
+                Ok(ClientMsg::NewTx { tx, reply_to }) => {
+                    let tx_hash: Hash<T> = Hash::ser_and_hash(&tx);
+                    let _ = tx_tx_sender_map.send((tx_hash, reply_to));
                     let size = bincode::serialized_size(&tx).unwrap_or(0) as usize;
                     let _ = tx_batcher.send((tx, size));
                 }
