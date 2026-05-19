@@ -4,8 +4,8 @@
 /// attestations instead of raw batches).  Data-plane adds `DataPropose`,
 /// `DataRequest`, `DataResponse`.  `ProtocolMsg` is kept untouched.
 use super::{
-    Attestation, AttestationEnvelope, Certificate, DataBlock, DataBlockEnvelope, Proposal, Request,
-    Response, Signature,
+    Attestation, AttestationEnvelope, Certificate, DataBlock, DataBlockEnvelope, EleaderBlame,
+    EleaderChangeQC, Proposal, Request, Response, Signature,
 };
 use crate::{Id, Round};
 use crypto::hash::Hash;
@@ -89,7 +89,17 @@ pub enum ZeusMsg<Tx> {
     DataResponse {
         block: DataBlock<Tx>,
     },
-    // TODO(zeus-view-change): EleaderBlame, EleaderChangeQC variants go here.
+
+    // -----------------------------------------------------------------------
+    // Data-plane eleader-change messages
+    // -----------------------------------------------------------------------
+    /// Zeus: OnEleaderBlame — a node blames the current eleader for silence
+    /// or equivocation.
+    EleaderBlame(EleaderBlame<Tx>),
+
+    /// Zeus: OnEleaderChangeQC — a node multicasts a formed eleader-change QC
+    /// (t+1 distinct-signer blames).
+    EleaderChangeQC(EleaderChangeQC<Tx>),
 }
 
 impl<Tx> Message for ZeusMsg<Tx>

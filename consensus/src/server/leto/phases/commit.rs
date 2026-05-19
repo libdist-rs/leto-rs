@@ -9,6 +9,7 @@ use linked_hash_map::LinkedHashMap;
 use log::*;
 use mempool::Batch;
 use std::sync::Arc;
+use std::time::Duration;
 use storage::rocksdb::Storage;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -32,13 +33,27 @@ impl<Tx> CommitContext<Tx> {
         tx_commit: UnboundedSender<Arc<Batch<Tx>>>,
         num_nodes: usize,
         num_faults: usize,
+        my_id: Id,
+        metrics_node: Id,
+        bench_emit_window_secs: u64,
     ) -> Self
     where
         Tx: Transaction,
     {
         let (tx_inner, rx_inner) = unbounded_channel();
         tokio::spawn(async move {
-            if let Err(e) = Self::run(store, tx_commit, rx_inner, num_nodes, num_faults).await {
+            if let Err(e) = Self::run(
+                store,
+                tx_commit,
+                rx_inner,
+                num_nodes,
+                num_faults,
+                my_id,
+                metrics_node,
+                bench_emit_window_secs,
+            )
+            .await
+            {
                 error!("Commit Helper shut down: {}", e);
             }
         });
@@ -50,12 +65,16 @@ impl<Tx> CommitContext<Tx> {
     /// satisfies all the properties of chain validity We just need to
     /// - go back up to last committed block,
     /// - on the way check if any block got (n+t+1)/2 UCR votes
+    #[allow(clippy::too_many_arguments)]
     async fn run(
         store: Storage,
         tx_commit: UnboundedSender<Arc<Batch<Tx>>>,
         mut rx_inner: UnboundedReceiver<CommitMsg<Tx>>,
         num_nodes: usize,
         num_faults: usize,
+        my_id: Id,
+        metrics_node: Id,
+        bench_emit_window_secs: u64,
     ) -> Result<()>
     where
         Tx: Transaction,
@@ -69,6 +88,7 @@ impl<Tx> CommitContext<Tx> {
         let genesis_element_hash = Hash::ser_and_hash(genesis_element.as_ref());
 
         // Commit Length
+        #[allow(clippy::manual_div_ceil)]
         let commit_len = (num_nodes + num_faults + 1) / 2;
 
         // Tracking variables
@@ -81,6 +101,16 @@ impl<Tx> CommitContext<Tx> {
             Arc<Element<Id, Tx, Round>>,
         >::with_capacity(commit_len);
         commit_queue.insert(genesis_element_hash.clone(), genesis_element);
+
+        // DP[Throughput] emission state — only active on the metrics node.
+        let emit_dp = my_id == metrics_node;
+        let window_secs = bench_emit_window_secs.max(1) as f64;
+        let mut committed_tx_count: u64 = 0;
+        let mut bench_interval =
+            tokio::time::interval(Duration::from_secs(bench_emit_window_secs.max(1)));
+        // Consume the immediate first tick so the interval fires after one full window.
+        bench_interval.tick().await;
+
         loop {
             tokio::select! {
                 msg = rx_inner.recv() => {
@@ -225,6 +255,12 @@ impl<Tx> CommitContext<Tx> {
                                     );
                                 }
 
+                                // Accumulate for DP[Throughput].
+                                if emit_dp {
+                                    committed_tx_count +=
+                                        element.batch.payload.len() as u64;
+                                }
+
                                 tx_commit.send(
                                     Arc::new(element.batch.clone())
                                 ).map_err(anyhow::Error::new)?;
@@ -236,6 +272,13 @@ impl<Tx> CommitContext<Tx> {
                     #[cfg(feature = "microbench")]
                     println!("Time spent in commit_loop is {}", bench_start.elapsed().as_micros());
                 },
+                _ = bench_interval.tick(), if emit_dp => {
+                    eprintln!(
+                        "DP[Throughput]: {}",
+                        committed_tx_count as f64 / window_secs
+                    );
+                    committed_tx_count = 0;
+                }
             }
         }
     }

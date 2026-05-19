@@ -2,11 +2,20 @@
 ///
 /// Mirrors `consensus/src/server/core.rs` (`Server<Tx>`) but wires
 /// `Zeus::spawn` instead of `Leto::spawn`.
-use crate::{server::Settings, to_socket_address, Id, KeyConfig};
+use crate::{
+    server::Settings,
+    to_socket_address,
+    types::{Transaction, ZeusClientMsg},
+    Id, KeyConfig,
+};
 use anyhow::{anyhow, Result};
+use crypto::hash::Hash;
+use fnv::FnvHashMap;
+use futures_util::StreamExt;
 use log::info;
 use mempool::{Batch, MempoolMsg};
-use std::{marker::PhantomData, path::PathBuf, sync::Arc};
+use serde::Serialize;
+use std::{marker::PhantomData, net::SocketAddr, path::PathBuf, sync::Arc};
 use storage::rocksdb::Storage;
 use tcp_sender::TcpSimpleSender;
 use tokio::sync::{
@@ -22,7 +31,7 @@ pub struct ZeusServer<Tx> {
 
 impl<Tx> ZeusServer<Tx>
 where
-    Tx: crate::types::Transaction,
+    Tx: Transaction,
 {
     pub fn spawn(
         my_id: Id,
@@ -32,7 +41,7 @@ where
         tx_commit: UnboundedSender<Arc<Batch<Tx>>>,
     ) -> Result<oneshot::Sender<()>>
     where
-        Tx: Clone + serde::Serialize + PartialEq + std::fmt::Debug + 'static,
+        Tx: Clone + Serialize + PartialEq + std::fmt::Debug + 'static,
     {
         // Create the DB
         let path = {
@@ -56,13 +65,56 @@ where
         let mempool_net = TcpSimpleSender::<Id, MempoolMsg<Id, Tx>>::with_peers(mempool_peers);
         let mempool_addr = to_socket_address("0.0.0.0", me.mempool_port)?;
         let client_addr = to_socket_address("0.0.0.0", me.client_port)?;
+        let consensus_client_addr = to_socket_address("0.0.0.0", me.consensus_client_port)?;
         info!("ZeusServer booted on {}", me.mempool_address);
 
         let (_tx_consensus_to_mem, rx_consensus_to_mem) = unbounded_channel();
         let (tx_mem_to_consensus, _rx_mem_to_consensus) = unbounded_channel();
         // Eleader batcher receives raw (Tx, size) pairs from the mempool
-        let (tx_mem_to_batcher, rx_mem_to_batcher) = unbounded_channel();
+        let (tx_mem_to_batcher, rx_mem_to_batcher) = unbounded_channel::<(Tx, usize)>();
         let (tx_processor, rx_processor) = unbounded_channel();
+
+        // Clone batcher sender for the client batch listener.
+        let tx_batcher_for_client = tx_mem_to_batcher.clone();
+
+        // Fan-out: committed batch → app sink + confirmation router.
+        let (tx_commit_fanout, mut rx_commit_fanout) = unbounded_channel::<Arc<Batch<Tx>>>();
+        let (tx_commit_for_confirm, mut rx_commit_for_confirm) =
+            unbounded_channel::<Arc<Batch<Tx>>>();
+        let tx_commit_clone = tx_commit.clone();
+        tokio::spawn(async move {
+            while let Some(batch) = rx_commit_fanout.recv().await {
+                let _ = tx_commit_clone.send(Arc::clone(&batch));
+                let _ = tx_commit_for_confirm.send(batch);
+            }
+        });
+
+        // (batch_hash, reply_to) registration channel.
+        let (tx_batch_sender_map, mut rx_batch_sender_map) =
+            unbounded_channel::<(Hash<Vec<Tx>>, SocketAddr)>();
+
+        // Confirmation router (same logic as Leto Server).
+        tokio::spawn(async move {
+            Self::run_confirmation_router(&mut rx_batch_sender_map, &mut rx_commit_for_confirm)
+                .await;
+        });
+
+        // Client batch listener on consensus_client_port.
+        // This also handles WhoIsEleader from the Zeus stressor.
+        // eleader resolution state is read-only from settings; we capture
+        // num_nodes and a clone for the listener closure.
+        let num_nodes = settings.committee_config.num_nodes();
+        let initial_epoch = Zeus::<Tx>::INITIAL_DATA_EPOCH;
+        tokio::spawn(async move {
+            Self::run_zeus_client_batch_listener(
+                consensus_client_addr,
+                tx_batcher_for_client,
+                tx_batch_sender_map,
+                num_nodes,
+                initial_epoch,
+            )
+            .await;
+        });
 
         // Start the mempool
         mempool::Mempool::spawn(
@@ -80,7 +132,7 @@ where
             client_addr,
         );
 
-        // Start Zeus
+        // Start Zeus; pass tx_commit_fanout so confirmation router sees commits.
         let (exit_tx, exit_rx) = oneshot::channel();
         Zeus::<Tx>::spawn(
             my_id,
@@ -90,9 +142,124 @@ where
             store,
             exit_rx,
             rx_mem_to_batcher,
-            tx_commit,
+            tx_commit_fanout,
         )?;
 
         Ok(exit_tx)
+    }
+
+    /// Confirmation router for Zeus: same as Leto's.
+    ///
+    /// Cancel-handler note: `TcpSimpleSender::send` returns
+    /// `Result<(), TcpSimpleSenderError>` — no `CancelHandler` emitted.
+    async fn run_confirmation_router(
+        rx_batch_sender_map: &mut tokio::sync::mpsc::UnboundedReceiver<(Hash<Vec<Tx>>, SocketAddr)>,
+        rx_commit_for_confirm: &mut tokio::sync::mpsc::UnboundedReceiver<Arc<Batch<Tx>>>,
+    ) where
+        Tx: Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
+    {
+        let mut pending: FnvHashMap<Hash<Vec<Tx>>, SocketAddr> = FnvHashMap::default();
+        let mut reply_sender: TcpSimpleSender<SocketAddr, ZeusClientMsg<Tx>> =
+            TcpSimpleSender::with_peers(FnvHashMap::default());
+
+        loop {
+            tokio::select! {
+                reg = rx_batch_sender_map.recv() => {
+                    match reg {
+                        Some((hash, addr)) => { pending.insert(hash, addr); }
+                        None => break,
+                    }
+                }
+                batch = rx_commit_for_confirm.recv() => {
+                    let batch = match batch {
+                        Some(b) => b,
+                        None => break,
+                    };
+                    let batch_hash: Hash<Vec<Tx>> =
+                        Hash::ser_and_hash(&batch.payload);
+                    if let Some(addr) = pending.remove(&batch_hash) {
+                        let msg = ZeusClientMsg::<Tx>::BatchConfirmation(batch_hash);
+                        if let Ok(bytes) = bincode::serialize(&msg) {
+                            if !reply_sender.get_peers().contains_key(&addr) {
+                                let mut new_peers = reply_sender.get_peers().clone();
+                                new_peers.insert(addr, addr);
+                                reply_sender = TcpSimpleSender::with_peers(new_peers);
+                            }
+                            let _ = reply_sender
+                                .send(addr, bytes::Bytes::from(bytes))
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Zeus client batch listener.
+    ///
+    /// Handles:
+    /// - `NewBatch`: forward txs to batcher, register batch_hash → reply_to.
+    /// - `WhoIsEleader`: respond with `EleaderIs { id, epoch }` using the
+    ///   current epoch formula `eleader(epoch, n)`.  The response goes via a
+    ///   one-shot `TcpSimpleSender` back to `reply_to`. NOTE: This listener
+    ///   does not have live access to `current_epoch` on the Zeus task (which
+    ///   lives in a separate tokio task).  For steady state (epoch =
+    ///   INITIAL_DATA_EPOCH) this is correct; for post-view-change epochs, the
+    ///   eleader returned may be stale.  A proper fix requires an
+    ///   `Arc<AtomicU64>` shared between Zeus's main task and this listener, or
+    ///   an mpsc query channel — flagged for follow-up.
+    /// - `NewTx` (legacy): forward to batcher only.
+    async fn run_zeus_client_batch_listener(
+        addr: SocketAddr,
+        tx_batcher: tokio::sync::mpsc::UnboundedSender<(Tx, usize)>,
+        tx_batch_sender_map: tokio::sync::mpsc::UnboundedSender<(Hash<Vec<Tx>>, SocketAddr)>,
+        num_nodes: usize,
+        initial_epoch: u64,
+    ) where
+        Tx: Transaction,
+    {
+        use super::chain_state::eleader as eleader_fn;
+
+        let mut receiver = tcp_receiver::TcpReceiver::<ZeusClientMsg<Tx>>::spawn(addr);
+
+        while let Some(result) = receiver.next().await {
+            match result {
+                Ok(ZeusClientMsg::NewBatch { batch, reply_to }) => {
+                    let batch_hash: Hash<Vec<Tx>> = Hash::ser_and_hash(&batch);
+                    let _ = tx_batch_sender_map.send((batch_hash, reply_to));
+                    for tx in batch {
+                        let size = bincode::serialized_size(&tx).unwrap_or(0) as usize;
+                        let _ = tx_batcher.send((tx, size));
+                    }
+                }
+                Ok(ZeusClientMsg::WhoIsEleader) => {
+                    // NOTE: This listener does not have the client's reply_to
+                    // address in this variant — the stressor would need to send
+                    // it.  The current ZeusClientMsg::WhoIsEleader carries no
+                    // reply_to field.  We log and skip; the stressor must use
+                    // its pre-seeded eleader_id for now.
+                    //
+                    // The eleader formula for reference (not sent here):
+                    // eleader(initial_epoch, num_nodes)
+                    log::warn!(
+                        "Zeus client listener: WhoIsEleader received but no reply_to \
+                         field in the message — cannot respond (use pre-seeded eleader_id). \
+                         eleader(epoch={}, n={})={}",
+                        initial_epoch,
+                        num_nodes,
+                        eleader_fn(initial_epoch, num_nodes),
+                    );
+                }
+                Ok(ZeusClientMsg::NewTx { tx, reply_to: _ }) => {
+                    let size = bincode::serialized_size(&tx).unwrap_or(0) as usize;
+                    let _ = tx_batcher.send((tx, size));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::error!("Zeus client batch listener: deserialize error: {:?}", e);
+                }
+            }
+        }
+        log::warn!("Zeus client batch listener: stream ended");
     }
 }

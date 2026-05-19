@@ -90,12 +90,20 @@ where
             let h = self.eleader_proposed_height + 1;
             (lph.clone(), h)
         } else {
-            // Epoch entry (first proposal in this epoch): extend from the
-            // latest committed attestation's data head, per the strict
-            // extension rule (zeus.tex §OnEleaderPropose).
-            // Change C: attestation no longer embeds the block; look it up
-            // in the data_block_store by the pinned hash.
-            // TODO(zeus-view-change): enforce strict extension here.
+            // Epoch entry (first proposal in this epoch, `last_proposed_hash`
+            // is `None`): extend from the latest committed attestation's data
+            // head, per the strict extension rule (zeus.tex §OnEleaderPropose).
+            //
+            // Post-`advance_to_epoch`: `data_chain.head_hash` has already been
+            // truncated to `H(D*)` and `last_proposed_hash` was reset to `None`.
+            // `latest_committed_attestation` will return the same D*, so the
+            // new eleader's first block's parent is `H(D*)` — enforcing the
+            // strict extension rule transitively via the truncation.
+            // No separate gate is needed here.
+            //
+            // TODO(zeus-view-change): enforce strict extension here — RESOLVED.
+            // The truncation in `advance_to_epoch` (core.rs) makes the head IS
+            // H(D*), so the parent chain here is trivially correct.
             let d_ext = {
                 let d_star_opt = crate::server::zeus::chain_state::latest_committed_attestation(
                     &self.commit_lock,
@@ -258,20 +266,52 @@ where
 
         // 5. Equivocation check. If child_of[parent_hash] is already set to a
         //    *different* hash, the eleader has signed two distinct children of the same
-        //    parent.
-        if let Some(existing_child) = self.data_chain.child_of.get(&block.envelope.parent_hash) {
-            if existing_child != &block_hash {
+        //    parent.  Algorithm/zeus.tex lines 409-417.
+        if let Some(existing_child_hash) = self
+            .data_chain
+            .child_of
+            .get(&block.envelope.parent_hash)
+            .cloned()
+        {
+            if existing_child_hash != block_hash {
                 warn!(
                     "Zeus: equivocation detected at parent {:?} (existing child {:?}, new {:?})",
-                    block.envelope.parent_hash, existing_child, block_hash
+                    block.envelope.parent_hash, existing_child_hash, block_hash
                 );
-                // TODO(zeus-view-change): emit EleaderBlame(equiv) here.
+                // Look up the existing block to build the blame payload.
+                if let Some(existing_block) =
+                    self.data_block_store.get(&existing_child_hash).cloned()
+                {
+                    let epoch = block.envelope.epoch;
+                    let height = block.envelope.height;
+                    match self.make_equivocation_blame(epoch, height, existing_block, block) {
+                        Ok(blame) => {
+                            let msg = ZeusMsg::EleaderBlame(blame.clone());
+                            let bytes = bytes::Bytes::from(
+                                bincode::serialize(&msg).map_err(anyhow::Error::new)?,
+                            );
+                            let results = self
+                                .consensus_net
+                                .broadcast(&self.broadcast_peers, bytes)
+                                .await;
+                            let handlers: Vec<_> =
+                                results.into_iter().filter_map(|r| r.ok()).collect();
+                            self.round_state.add_handlers(handlers);
+
+                            // Self-insert.
+                            self.eleader_blames.entry(epoch).or_default().push(blame);
+
+                            self.try_form_change_qc(epoch).await?;
+                        }
+                        Err(e) => {
+                            warn!("Zeus: equivocation blame construction failed: {}", e);
+                        }
+                    }
+                }
+                // Do not admit the equivocating block (Algorithm/zeus.tex line 415-416).
                 return Ok(());
             }
-            // Same child already recorded — this is a duplicate arrival,
-            // idempotent. The block might or might not be in the
-            // store yet; fall through to the idempotent store check
-            // below.
+            // Same child already recorded — duplicate arrival; idempotent.
         }
 
         // 6. Committed-prefix conflict check.

@@ -155,6 +155,9 @@ where
             tx_commit,
             settings.committee_config.num_nodes(),
             settings.committee_config.num_faults(),
+            my_id,
+            settings.bench_config.bench_metrics_node,
+            settings.bench_config.bench_emit_window_secs,
         );
 
         let all_peers_except_me = all_peers.into_iter().filter(|x| x != &my_id).collect();

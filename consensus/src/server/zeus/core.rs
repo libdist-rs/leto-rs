@@ -26,8 +26,12 @@ use tokio::sync::{
 };
 use tokio::time::{interval, sleep, Interval, Sleep};
 
-use super::chain_state::{AdmittedChangeQCs, DataBlockStore, DataChainState, PendingAttestations};
+use super::chain_state::{
+    blame_signed_bytes, eleader_change_qc_valid, AdmittedChangeQCs, DataBlockStore, DataChainState,
+    PendingAttestations,
+};
 use super::phases::ZeusCommitContext;
+use crate::types::{BlamePayload, BlameReason, EleaderBlame, EleaderChangeQC};
 
 // ---------------------------------------------------------------------------
 // Type aliases for the sig-plane
@@ -224,9 +228,10 @@ pub struct Zeus<Tx> {
     pub(crate) data_block_store: DataBlockStore<Tx>,
     /// Park map for attestations awaiting a missing data block.
     pub(crate) pending_attestations: PendingAttestations<Tx>,
-    /// Admitted eleader-change QCs.
-    /// TODO(zeus-view-change): replace bool value with actual QC type.
-    pub(crate) admitted_change_qcs: AdmittedChangeQCs,
+    /// Admitted eleader-change QCs (epoch → QC).
+    pub(crate) admitted_change_qcs: AdmittedChangeQCs<Tx>,
+    /// Collected eleader-blame messages per epoch.
+    pub(crate) eleader_blames: FnvHashMap<u64, Vec<EleaderBlame<Tx>>>,
     /// Most-recently admitted data block.
     pub(crate) last_seen_data_block: DataBlock<Tx>,
     /// Committed attestations (sig_round, Attestation).
@@ -263,6 +268,18 @@ pub struct Zeus<Tx> {
     /// Monotonically increasing.  The prefix-commit walk (zeus.tex Def 8.7)
     /// emits heights `(zeus_committed_high, H]` and updates this watermark.
     pub(crate) zeus_committed_high: u64,
+
+    // ------------------------------------------------------------------
+    // DP[Throughput] emission state
+    // ------------------------------------------------------------------
+    /// Accumulated committed-tx count since the last emission window tick.
+    pub(crate) committed_tx_count: u64,
+    /// Interval that triggers DP[Throughput] emission.
+    pub(crate) bench_emit_interval: tokio::time::Interval,
+    /// True iff this node is the metrics-emission node.
+    pub(crate) emit_dp: bool,
+    /// Window duration in seconds (for the rate calculation).
+    pub(crate) bench_emit_window_secs: f64,
     /// Highest height that the eleader has proposed.
     ///
     /// In-flight count = `eleader_proposed_height − data_chain.head_height`.
@@ -390,6 +407,12 @@ where
         let num_nodes = settings.committee_config.num_nodes();
         let num_faults = settings.committee_config.num_faults();
 
+        let emit_dp = my_id == settings.bench_config.bench_metrics_node;
+        let bench_emit_window_secs = settings.bench_config.bench_emit_window_secs.max(1) as f64;
+        let bench_emit_interval = interval(std::time::Duration::from_secs(
+            settings.bench_config.bench_emit_window_secs.max(1),
+        ));
+
         let protocol = Zeus::<Tx> {
             my_id,
             crypto_system,
@@ -419,15 +442,23 @@ where
             data_block_store,
             pending_attestations: FnvHashMap::default(),
             admitted_change_qcs: {
-                // Pre-admit the epoch 0 → epoch 1 transition.
-                // Epoch 1 is the initial data-plane epoch; it does not require
-                // an eleader-change QC because the genesis is the neutral state.
-                // TODO(zeus-view-change): subsequent epoch transitions (e → e+1 for e >= 1)
-                // require an actual eleader-change QC before being admitted.
-                let mut m = FnvHashMap::default();
-                m.insert(0u64, true);
+                // Pre-admit the epoch 0 → epoch 1 transition via a sentinel QC
+                // with an empty blames vec.  Epoch 1 is the initial data-plane
+                // epoch; it does not require a real eleader-change QC because
+                // genesis is the neutral starting state.  Subsequent transitions
+                // (e → e+1 for e >= 1) require a real QC before blocks at epoch
+                // e+1 are admitted.
+                let mut m: AdmittedChangeQCs<Tx> = FnvHashMap::default();
+                m.insert(
+                    0u64,
+                    EleaderChangeQC {
+                        epoch: 0,
+                        blames: Vec::new(),
+                    },
+                );
                 m
             },
+            eleader_blames: FnvHashMap::default(),
             last_seen_data_block: genesis_data_block,
             commit_lock: Vec::new(),
             latest_eleader_block: None,
@@ -439,6 +470,10 @@ where
             eleader_proposed_height: 0,
             last_proposed_hash: None,
             eleader_pipeline_depth: settings.bench_config.eleader_pipeline_depth,
+            committed_tx_count: 0,
+            bench_emit_interval,
+            emit_dp,
+            bench_emit_window_secs,
             settings,
         };
 
@@ -459,6 +494,8 @@ where
         info!("Zeus: starting (node {})", self.my_id);
         self.sig_chain_state.genesis_setup().await?;
         self.timer.reset();
+        // Drop the immediate first tick so the emission window starts cleanly.
+        self.bench_emit_interval.tick().await;
 
         // Arm the eleader's batcher with the correct initial eleader identity.
         // The batcher is constructed with initial_leader=0; the actual eleader
@@ -555,6 +592,15 @@ where
                         error!("Zeus: on_data_timer_expired: {}", e);
                     }
                 }
+
+                // DP[Throughput] emission
+                _ = self.bench_emit_interval.tick(), if self.emit_dp => {
+                    eprintln!(
+                        "DP[Throughput]: {}",
+                        self.committed_tx_count as f64 / self.bench_emit_window_secs
+                    );
+                    self.committed_tx_count = 0;
+                }
             }
         }
         info!("Zeus: shut down.");
@@ -582,6 +628,10 @@ where
                 source,
             } => self.on_data_request(target_hash, source).await,
             ZeusMsg::DataResponse { block } => self.on_data_response(block).await,
+
+            // Data-plane eleader-change — direct (no round ordering needed)
+            ZeusMsg::EleaderBlame(b) => self.on_eleader_blame(b).await,
+            ZeusMsg::EleaderChangeQC(qc) => self.on_eleader_change_qc(qc).await,
 
             // Sig-plane — route through round ordering
             ZeusMsg::SigPropose { ref proposal, .. } => {
@@ -662,9 +712,9 @@ where
 
     /// Called when the data-side timer fires.
     ///
-    /// For `TimerDataRoundEntry`: any node — emit would-be-blame warn.
-    /// For `RleaderWaitingFresh`: rleader — emit would-be-blame warn, stay
-    /// waiting.
+    /// For `TimerDataRoundEntry`: broadcast `EleaderBlame(Silence)` and
+    ///   attempt to form a change QC.
+    /// For `RleaderWaitingFresh`: log warn, stay waiting (re-arm timer).
     pub(crate) async fn on_data_timer_expired(&mut self) -> anyhow::Result<()>
     where
         Tx: Clone + serde::Serialize + PartialEq + std::fmt::Debug,
@@ -680,21 +730,237 @@ where
 
         match kind {
             DataTimerKind::TimerDataRoundEntry => {
-                warn!(
-                    "Zeus: TimerData expired in sig round {}; would-be-blame eleader {}",
-                    r, eleader_id
+                // Algorithm/zeus.tex §OnEleaderTimeout (line 442-452):
+                // Broadcast a Silence blame for the current epoch and self-insert.
+                let last_seen_height = self
+                    .latest_eleader_block
+                    .as_ref()
+                    .map(|b| b.envelope.height)
+                    .unwrap_or(0);
+                let epoch = self.current_epoch;
+                let payload = BlamePayload::Silence { last_seen_height };
+                let digest = blame_signed_bytes(epoch, &BlameReason::Silence, &payload);
+                let sig_raw = self.crypto_system.secret.sign(&digest)?;
+                let blame = EleaderBlame::<Tx> {
+                    epoch,
+                    reason: BlameReason::Silence,
+                    payload,
+                    signer: self.my_id,
+                    sig_raw,
+                };
+
+                info!(
+                    "Zeus: TimerData expired sig_round={} epoch={}; blaming eleader {} (silence, \
+                     last_seen_height={})",
+                    r, epoch, eleader_id, last_seen_height
                 );
+
+                let msg = crate::types::ZeusMsg::EleaderBlame(blame.clone());
+                let bytes =
+                    bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
+                let results = self
+                    .consensus_net
+                    .broadcast(&self.broadcast_peers, bytes)
+                    .await;
+                let handlers: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
+                self.round_state.add_handlers(handlers);
+
+                // Self-insert (Algorithm/zeus.tex line 449).
+                self.eleader_blames.entry(epoch).or_default().push(blame);
+
+                self.try_form_change_qc(epoch).await?;
             }
             DataTimerKind::RleaderWaitingFresh => {
                 warn!(
-                    "Zeus: TimerData expired in sig round {}; would-be-blame eleader {} \
+                    "Zeus: TimerData expired sig_round={} epoch={}; would-be-blame eleader {} \
                      (rleader waiting for fresh block)",
-                    r, eleader_id
+                    r, self.current_epoch, eleader_id
                 );
                 // Stay in waiting state — re-arm so the timer can fire again if
                 // another duration passes with no fresh block.
                 self.arm_data_timer(DataTimerKind::RleaderWaitingFresh);
             }
+        }
+
+        Ok(())
+    }
+
+    /// Attempt to form and admit an `EleaderChangeQC` for `epoch`.
+    ///
+    /// Algorithm/zeus.tex lines 461-484: if `eleader_blames[epoch]` has
+    /// distinct-signer count >= `t + 1` and no QC has been admitted yet,
+    /// build and validate the QC, admit it, multicast it, and advance to
+    /// `epoch + 1` if we are at or behind `epoch`.
+    pub(crate) async fn try_form_change_qc(
+        &mut self,
+        epoch: u64,
+    ) -> anyhow::Result<()>
+    where
+        Tx: Clone + serde::Serialize + PartialEq + std::fmt::Debug,
+    {
+        // Idempotent: already admitted.
+        if self.admitted_change_qcs.contains_key(&epoch) {
+            return Ok(());
+        }
+
+        let num_faults = self.settings.committee_config.num_faults();
+        let n = self.settings.committee_config.num_nodes();
+
+        // Count distinct signers.
+        let distinct_count = {
+            let blames = match self.eleader_blames.get(&epoch) {
+                Some(v) => v,
+                None => return Ok(()),
+            };
+            let mut seen = std::collections::HashSet::new();
+            for b in blames {
+                seen.insert(b.signer);
+            }
+            seen.len()
+        };
+
+        if distinct_count < num_faults + 1 {
+            return Ok(());
+        }
+
+        // Build QC.
+        let blames = self.eleader_blames.get(&epoch).cloned().unwrap_or_default();
+        let qc = EleaderChangeQC { epoch, blames };
+
+        // Validate.
+        if !eleader_change_qc_valid(&qc, &self.crypto_system.system, num_faults, n) {
+            warn!(
+                "Zeus: try_form_change_qc: formed QC for epoch {} failed validation",
+                epoch
+            );
+            return Ok(());
+        }
+
+        // Admit.
+        self.admitted_change_qcs.insert(epoch, qc.clone());
+
+        // Multicast (Algorithm/zeus.tex line 466).
+        let msg = crate::types::ZeusMsg::EleaderChangeQC(qc.clone());
+        let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
+        let results = self
+            .consensus_net
+            .broadcast(&self.broadcast_peers, bytes)
+            .await;
+        let handlers: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
+        self.round_state.add_handlers(handlers);
+
+        // Advance epoch if needed (Algorithm/zeus.tex line 467-482).
+        if self.current_epoch <= epoch {
+            self.advance_to_epoch(epoch + 1).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Advance to a new data-plane epoch.
+    ///
+    /// Algorithm/zeus.tex lines 468-481 (OnEleaderBlame path) and
+    /// 494-517 (OnEleaderChangeQC path): truncate the data chain to the
+    /// latest committed attestation's pinned block (D*), reset eleader
+    /// state, re-arm `TimerDataRoundEntry`, and notify the batcher if this
+    /// node is the new eleader.
+    ///
+    /// PAPER-TODO(zeus-view-change): codify pending-purge rule in spec.
+    pub(crate) async fn advance_to_epoch(
+        &mut self,
+        new_epoch: u64,
+    ) -> anyhow::Result<()>
+    where
+        Tx: Clone + serde::Serialize + PartialEq + std::fmt::Debug,
+    {
+        use super::chain_state::{eleader as eleader_fn, latest_committed_attestation};
+        use crate::server::BatcherConsensusMsg;
+
+        info!(
+            "Zeus: advance_to_epoch {} → {}",
+            self.current_epoch, new_epoch
+        );
+        self.current_epoch = new_epoch;
+
+        // Determine D* = latest committed attestation's pinned block, or genesis.
+        let (d_star_hash, d_star_height) = {
+            match latest_committed_attestation(&self.commit_lock) {
+                Some(att) => (
+                    att.envelope.data_block_hash.clone(),
+                    att.envelope.data_block_height,
+                ),
+                None => {
+                    // No committed attestation — reset to genesis.
+                    let g = DataBlock::<Tx>::genesis();
+                    (g.hash().clone(), 0u64)
+                }
+            }
+        };
+
+        // Truncate data-chain head to D*.
+        self.data_chain.head_hash = d_star_hash;
+        self.data_chain.head_height = d_star_height;
+
+        // Reset eleader proposal state so new eleader starts from D*.
+        self.eleader_proposed_height = d_star_height;
+        self.last_proposed_hash = None;
+        self.rleader_waiting_fresh = false;
+        self.latest_eleader_block = None;
+
+        // Purge pending_data_blocks for blocks above D*.height.
+        // PAPER-TODO(zeus-view-change): codify pending-purge rule in spec.
+        // First pass: drop stale children within each pending vec.
+        for children in self.data_chain.pending_data_blocks.values_mut() {
+            children.retain(|b| b.envelope.height <= d_star_height);
+        }
+        // Second pass: drop parent keys whose children vec is now empty or
+        // whose parent is itself above d_star_height (orphan key).
+        let stale_parent_keys: Vec<_> = self
+            .data_chain
+            .pending_data_blocks
+            .iter()
+            .filter_map(|(parent_hash, children)| {
+                let keep = !children.is_empty()
+                    && self
+                        .data_block_store
+                        .get(parent_hash)
+                        .is_some_and(|b| b.envelope.height <= d_star_height);
+                if keep {
+                    None
+                } else {
+                    Some(parent_hash.clone())
+                }
+            })
+            .collect();
+        for k in stale_parent_keys {
+            self.data_chain.pending_data_blocks.remove(&k);
+        }
+
+        // Purge pending_attestations for blocks above D*.height.
+        // PAPER-TODO(zeus-view-change): codify pending-purge rule in spec.
+        let stale_att_keys: Vec<_> = self
+            .pending_attestations
+            .keys()
+            .filter(|h| {
+                self.data_block_store
+                    .get(*h)
+                    .is_none_or(|b| b.envelope.height > d_star_height)
+            })
+            .cloned()
+            .collect();
+        for k in stale_att_keys {
+            self.pending_attestations.remove(&k);
+        }
+
+        // Re-arm the round-entry data timer.
+        self.arm_data_timer(DataTimerKind::TimerDataRoundEntry);
+
+        // Notify batcher if this node is the new eleader.
+        let n = self.settings.committee_config.num_nodes();
+        if self.my_id == eleader_fn(new_epoch, n) {
+            let _ = self
+                .tx_consensus_to_batcher
+                .send(BatcherConsensusMsg::NewRound { leader: self.my_id });
         }
 
         Ok(())

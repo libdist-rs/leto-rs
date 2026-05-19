@@ -28,9 +28,15 @@ pub enum ClientMode {
 pub struct Party {
     pub id: Id,
     pub address: String,
-    /// Port for sending transactions, corresponds to the client_port of the
-    /// server
+    /// Port for `ClientMsg<Tx>` communication, corresponds to the
+    /// `consensus_client_port` of the server.
     pub port: u16,
+    /// Port on which this client's confirmation listener is bound.
+    ///
+    /// The stressor opens a `TcpReceiver<ClientMsg<Tx>>` on this port and
+    /// includes it in every `ClientMsg::NewTx { reply_to }` so that the
+    /// server can route `Confirmation` messages back.
+    pub confirmation_port: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -51,6 +57,19 @@ pub struct Bench {
     /// Every `burst_interval_ms`, `txs_per_burst` transactions are sent to all
     /// the servers
     pub txs_per_burst: usize,
+    /// DP[Latency] emission window in seconds.
+    ///
+    /// Every `bench_emit_window_secs` the stressor computes the median latency
+    /// over all confirmations received in the window and emits
+    /// `eprintln!("DP[Latency]: <f64>")`.
+    ///
+    /// Default: 5.
+    pub bench_emit_window_secs: u64,
+    /// Enable DP[…] metric emission.
+    ///
+    /// Default: true.  The in-process harness leaves this true; the value is
+    /// harmless (extra eprintln).
+    pub emit_dp: bool,
 }
 
 impl Config {
@@ -83,11 +102,28 @@ pub struct Settings {
     /// no change.
     #[serde(default = "Settings::default_client_mode")]
     pub client_mode: ClientMode,
+    /// Address this stressor binds its confirmation receiver to.
+    ///
+    /// Should be "0.0.0.0" for local harness; the port is
+    /// `my_confirmation_port`.
+    #[serde(default = "Settings::default_confirmation_address")]
+    pub my_confirmation_address: String,
+    /// Port this stressor's `TcpReceiver<ClientMsg<Tx>>` listens on.
+    ///
+    /// The stressor includes `my_confirmation_address:my_confirmation_port` in
+    /// every `ClientMsg::NewTx { reply_to }` so the server knows where to send
+    /// `Confirmation` messages.
+    #[serde(default)]
+    pub my_confirmation_port: u16,
 }
 
 impl Settings {
     fn default_client_mode() -> ClientMode {
         ClientMode::LetoBroadcast
+    }
+
+    fn default_confirmation_address() -> String {
+        "0.0.0.0".to_string()
     }
 }
 

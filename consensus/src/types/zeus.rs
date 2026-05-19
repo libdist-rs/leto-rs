@@ -18,6 +18,19 @@
 ///   - Genesis: `DataBlock` at height 0, epoch 0, all-zero parent hash.
 ///     `H(dataGenesis)` is a fixed sentinel computed at startup via
 ///     `DataBlock::genesis()`.
+///
+/// EleaderBlame signing convention (Algorithm/zeus.tex §FuncEleaderBlameValid,
+/// line 215):
+///   - The signed tuple is `(TAG_ELEADER_BLAME, epoch, reason_tag,
+///     payload_bytes)` where `reason_tag` is a stable u8 discriminant:
+///       - Silence:       `TAG_REASON_SILENCE      = 0u8`
+///       - Equivocation:  `TAG_REASON_EQUIVOCATION = 1u8`
+///   - Silence payload bytes = `last_seen_height: u64` (little-endian).
+///   - Equivocation payload bytes = `H(block_a.envelope) ||
+///     H(block_b.envelope)` (both are `[u8;32]`, total 64 bytes).
+///   - The outer tuple `(TAG_ELEADER_BLAME, epoch, reason_tag, payload_bytes)`
+///     is assembled and hashed with `Hash::ser_and_hash` before signing so that
+///     the hash type is `EleaderBlameSigned<Tx>` — a zero-size phantom marker.
 use crate::{Id, Round};
 use crypto::hash::Hash;
 use net_common::Message;
@@ -216,6 +229,89 @@ where
             cached_hash: OnceCell::new(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// EleaderBlame types (Algorithm/zeus.tex §FuncEleaderBlameValid, lines 213-237)
+// ---------------------------------------------------------------------------
+
+/// Tag byte prepended to the signed tuple for all eleader-blame messages.
+/// Provides domain separation from other signature contexts.
+pub const TAG_ELEADER_BLAME: u8 = 0x10;
+
+/// Reason discriminant for silence blames (no data block within timeout).
+pub const TAG_REASON_SILENCE: u8 = 0u8;
+
+/// Reason discriminant for equivocation blames (two distinct children of same
+/// parent).
+pub const TAG_REASON_EQUIVOCATION: u8 = 1u8;
+
+/// Human-readable blame reason (not signed directly; the `TAG_REASON_*` byte
+/// is what goes into the signature).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum BlameReason {
+    Silence,
+    Equivocation,
+}
+
+/// Payload carried by an eleader blame.
+///
+/// Algorithm/zeus.tex line 215 signs over
+/// `(TAG_ELEADER_BLAME, epoch, reason_tag, payload)`.  The payload itself is
+/// reason-specific.
+///
+/// The `Equivocation` variant is larger than `Silence` because it carries two
+/// `DataBlock<Tx>` values. The payload field inside `DataBlock` is an
+/// `Arc<Vec<Tx>>` (heap-allocated), so the on-stack size difference is bounded
+/// by the fixed-size envelope + metadata fields, not the transaction data.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum BlamePayload<Tx> {
+    /// Silence: the blamer's last seen height from the current eleader.
+    Silence { last_seen_height: u64 },
+    /// Equivocation: two distinct blocks at the same `(epoch, height)` signed
+    /// by the eleader.
+    Equivocation {
+        height: u64,
+        block_a: DataBlock<Tx>,
+        block_b: DataBlock<Tx>,
+    },
+}
+
+/// Phantom marker for the signed tuple of an eleader blame.
+///
+/// Used as the phantom type for `Hash<EleaderBlameSigned<Tx>>` to give
+/// the blame digest a distinct type from other hashes in the system.
+/// The blame sig is stored as raw bytes (see `EleaderBlame.sig_raw`) to
+/// avoid the `pub(super)` visibility restriction on `Signature::raw`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EleaderBlameSigned<Tx>(PhantomData<Tx>);
+
+/// A single eleader-blame message.
+///
+/// Algorithm/zeus.tex lines 446-451 (silence) and 411-415 (equivocation).
+///
+/// The signature covers `blame_signed_bytes(epoch, reason, payload)` —
+/// the 32-byte SHA-256 digest of `(TAG_ELEADER_BLAME, epoch, reason_tag,
+/// payload_bytes)`.  Stored as raw bytes so the chain_state module can
+/// verify without hitting `pub(super)` visibility on `Signature::raw`.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EleaderBlame<Tx> {
+    pub epoch: u64,
+    pub reason: BlameReason,
+    pub payload: BlamePayload<Tx>,
+    pub signer: Id,
+    /// Raw signature bytes over `blame_signed_bytes(epoch, reason, payload)`.
+    pub sig_raw: Vec<u8>,
+}
+
+/// An eleader-change QC: `t + 1` distinct-signer blames for the same epoch.
+///
+/// Algorithm/zeus.tex lines 463-465.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EleaderChangeQC<Tx> {
+    pub epoch: u64,
+    pub blames: Vec<EleaderBlame<Tx>>,
 }
 
 // ---------------------------------------------------------------------------

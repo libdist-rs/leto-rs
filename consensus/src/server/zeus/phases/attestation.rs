@@ -53,6 +53,16 @@ where
     /// than cloning the full head block.  `make_attestation` no longer needs
     /// the full block in scope.
     ///
+    /// Post-epoch-advance note: after `advance_to_epoch(e+1)` truncates
+    /// `data_chain.head_hash` to `H(D*)`, the new eleader's first attestation
+    /// pins `H(D*)`.  In-flight sig-chain proposals from epoch `e` that arrive
+    /// after the advance are rejected by `attestation_valid` →
+    /// `conflicts_data_prefix`: their pinned block is above `D*.h`, causing
+    /// `conflicts_data_prefix` to return `true`.  No separate purge of
+    /// prior-epoch attestations is needed.
+    // PAPER-TODO(zeus-view-change): confirm attestation-rejection semantics
+    // post-eleader-change in the paper's liveness argument.
+    ///
     /// Zeus: OnSignatureRoundPropose — replaces canonical Leto's mempool-pop.
     pub fn make_attestation(
         &self,

@@ -49,8 +49,14 @@ pub struct Party {
     pub consensus_address: String,
     /// Port for consensus communication
     pub consensus_port: u16,
-    /// Port for clients to communicate
+    /// Port for raw-Tx client communication (owned by libmempool-rs).
     pub client_port: u16,
+    /// Port for `ClientMsg<Tx>` client communication (owned by consensus).
+    ///
+    /// The DP-aware stressor sends `ClientMsg::NewTx` here; the consensus
+    /// server tracks `H(tx) → reply_to` and routes `Confirmation` messages
+    /// back to the client's confirmation listener.
+    pub consensus_client_port: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -108,6 +114,20 @@ pub struct BenchConfig {
     ///
     /// Default: 1000.
     pub data_timer_duration_ms: u64,
+
+    /// DP[Throughput] emission window in seconds.
+    ///
+    /// Every `bench_emit_window_secs` the commit path on `bench_metrics_node`
+    /// emits `eprintln!("DP[Throughput]: <f64>")` and resets the counter.
+    ///
+    /// Default: 5.
+    pub bench_emit_window_secs: u64,
+
+    /// Node id that emits DP metrics (throughput).
+    ///
+    /// Matches the node 0 convention in the stress-test harness.
+    /// Default: 0.
+    pub bench_metrics_node: Id,
 }
 
 impl Default for BenchConfig {
@@ -118,6 +138,8 @@ impl Default for BenchConfig {
             delay_in_ms: 500,
             eleader_pipeline_depth: 16,
             data_timer_duration_ms: 1000,
+            bench_emit_window_secs: 5,
+            bench_metrics_node: 0,
         }
     }
 }

@@ -39,6 +39,7 @@ fn _dummy_settings(
                 mempool_address: "127.0.0.1".to_string(),
                 mempool_port: 7000 + (id as u16),
                 client_port: 8000 + (id as u16),
+                consensus_client_port: 9000 + (id as u16),
             },
         );
     }

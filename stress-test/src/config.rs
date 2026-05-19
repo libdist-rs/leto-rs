@@ -67,9 +67,26 @@ pub struct StressTestConfig {
     #[arg(long, default_value_t = 19000)]
     pub base_mempool_port: u16,
 
-    /// Base port for client network
+    /// Base port for client network (raw-Tx, mempool-owned).
     #[arg(long, default_value_t = 20000)]
     pub base_client_port: u16,
+
+    /// Base port for consensus-client network (`ClientMsg<Tx>`,
+    /// consensus-owned).
+    #[arg(long, default_value_t = 21000)]
+    pub base_consensus_client_port: u16,
+
+    /// Base port for client confirmation listeners.
+    ///
+    /// Client `i` binds its `TcpReceiver<ClientMsg<Tx>>` (confirmation channel)
+    /// on `base_confirmation_port + i`.
+    #[arg(long, default_value_t = 22000)]
+    pub base_confirmation_port: u16,
+
+    /// DP metric emission window in seconds (server throughput + client
+    /// latency).
+    #[arg(long, default_value_t = 5)]
+    pub bench_emit_window_secs: u64,
 
     /// Zeus eleader data-block pipeline depth (max in-flight blocks).
     ///
@@ -118,6 +135,7 @@ pub fn build_server_settings(
                 mempool_address: "127.0.0.1".to_string(),
                 mempool_port: config.base_mempool_port + id as u16,
                 client_port: config.base_client_port + id as u16,
+                consensus_client_port: config.base_consensus_client_port + id as u16,
             },
         );
     }
@@ -133,6 +151,8 @@ pub fn build_server_settings(
         delay_in_ms: config.delay_in_ms,
         eleader_pipeline_depth: config.eleader_pipeline_depth,
         data_timer_duration_ms: config.data_timer_duration_ms,
+        bench_emit_window_secs: config.bench_emit_window_secs,
+        bench_metrics_node: 0,
     };
 
     Ok(server::Settings {
@@ -159,7 +179,9 @@ pub fn build_client_settings(
             client::Party {
                 id,
                 address: "127.0.0.1".to_string(),
-                port: config.base_client_port + id as u16,
+                // Stressor targets consensus_client_port (NewBatch listener).
+                port: config.base_consensus_client_port + id as u16,
+                confirmation_port: config.base_confirmation_port + id as u16,
             },
         );
     }
@@ -169,10 +191,17 @@ pub fn build_client_settings(
             burst_interval_ms,
             tx_size: config.tx_size,
             txs_per_burst,
+            bench_emit_window_secs: config.bench_emit_window_secs,
+            emit_dp: true,
         },
         consensus_config: client::Config {
             parties: client_parties,
         },
         client_mode,
+        // The stressor binds its confirmation receiver on 0.0.0.0.
+        // Each client uses a unique port so multiple stressors don't collide.
+        // The caller sets the correct port per client in load_driver.rs.
+        my_confirmation_address: "0.0.0.0".to_string(),
+        my_confirmation_port: 0,
     }
 }

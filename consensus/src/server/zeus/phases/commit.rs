@@ -365,6 +365,10 @@ where
             let payload = Arc::clone(&block.envelope.payload);
             if !payload.is_empty() {
                 info!("Zeus-committed height {} with {} txs", h, payload.len(),);
+                // Accumulate for DP[Throughput] emission.
+                if self.emit_dp {
+                    self.committed_tx_count += payload.len() as u64;
+                }
                 if self
                     .tx_data_commit
                     .send(Arc::new(Batch {

@@ -135,6 +135,14 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
         } else {
             config.client_port
         };
+        // consensus_client_port: immediately above the client_port range.
+        // For local mode: client_port_base + servers + i.
+        // For non-local: client_port + 1000 (arbitrary separation).
+        let consensus_client_port = if config.local {
+            config.client_port + config.servers as u16 + i as u16
+        } else {
+            config.client_port + 1000
+        };
         server_parties.insert(
             ids[i],
             server::Party {
@@ -144,6 +152,7 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
                 mempool_address: ips[i].clone(),
                 mempool_port,
                 client_port,
+                consensus_client_port,
             },
         );
         client_parties.insert(
@@ -151,7 +160,9 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
             client::Party {
                 id: ids[i],
                 address: ips[i].clone(),
-                port: client_port,
+                // Stressor targets consensus_client_port for NewBatch.
+                port: consensus_client_port,
+                confirmation_port: consensus_client_port + config.servers as u16,
             },
         );
     }
@@ -173,6 +184,8 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
         delay_in_ms: config.network_delay,
         eleader_pipeline_depth: 16,
         data_timer_duration_ms: 1000,
+        bench_emit_window_secs: 5,
+        bench_metrics_node: 0,
     };
 
     // Create server settings from this information
@@ -189,11 +202,15 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
             burst_interval_ms: config.burst_interval,
             tx_size: config.tx_size,
             txs_per_burst: config.txs_per_burst,
+            bench_emit_window_secs: 5,
+            emit_dp: true,
         },
         consensus_config: client::Config {
             parties: client_parties.clone(),
         },
         client_mode: client::ClientMode::LetoBroadcast,
+        my_confirmation_address: "0.0.0.0".to_string(),
+        my_confirmation_port: 0,
     };
     Ok((server_settings, client_settings))
 }

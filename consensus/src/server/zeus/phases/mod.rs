@@ -6,3 +6,5 @@ mod commit;
 pub use commit::{ZeusCommitContext, ZeusCommittedAttestation};
 
 mod sig;
+
+pub mod blame;

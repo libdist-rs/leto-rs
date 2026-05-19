@@ -11,7 +11,13 @@
 ///   - `conflicts_data_prefix(D, commit_lock, store)` — checks committed prefix
 ///     safety.
 ///   - `latest_committed_attestation(commit_lock)` — highest-height pinned A.
-use crate::types::{Attestation, DataBlock, DataBlockEnvelope, ZeusMsg};
+use crate::types::{
+    Attestation, BlamePayload, BlameReason, DataBlock, DataBlockEnvelope, EleaderBlame,
+    EleaderChangeQC, ZeusMsg, TAG_ELEADER_BLAME, TAG_REASON_EQUIVOCATION, TAG_REASON_SILENCE,
+};
+// EleaderBlameSigned is referenced only as a phantom type for Hash in
+// blame_signed_bytes. The actual Hash type used internally is Hash<BlameSigned>
+// (local struct).
 use crypto::hash::Hash;
 use fnv::FnvHashMap;
 use serde::Serialize;
@@ -55,9 +61,13 @@ pub type DataBlockStore<Tx> = FnvHashMap<DataBlockHash<Tx>, DataBlock<Tx>>;
 /// appropriate handler.
 pub type PendingAttestations<Tx> = FnvHashMap<DataBlockHash<Tx>, Vec<ZeusMsg<Tx>>>;
 
-/// Admitted eleader-change QC map (epoch → QC present flag for steady-state).
-/// TODO(zeus-view-change): replace bool with the actual QC type.
-pub type AdmittedChangeQCs = FnvHashMap<u64, bool>;
+/// Admitted eleader-change QC map (epoch → actual QC).
+///
+/// Keyed by epoch `e`.  A `Some(QC)` entry means the epoch-e eleader has been
+/// formally replaced; `epoch e+1` blocks are therefore admitted.
+/// The genesis pre-admission (epoch 0 → epoch 1) stores a sentinel with an
+/// empty blames vec — see `Zeus::spawn`.
+pub type AdmittedChangeQCs<Tx> = FnvHashMap<u64, EleaderChangeQC<Tx>>;
 
 impl<Tx> DataChainState<Tx>
 where
@@ -92,7 +102,7 @@ where
 pub fn epoch_gate_valid<Tx>(
     block: &DataBlock<Tx>,
     e_cur: u64,
-    admitted_change_qcs: &AdmittedChangeQCs,
+    admitted_change_qcs: &AdmittedChangeQCs<Tx>,
 ) -> bool
 where
     Tx: Serialize + Clone,
@@ -104,8 +114,6 @@ where
     }
     if block_epoch > e_cur && !admitted_change_qcs.contains_key(&(block_epoch - 1)) {
         // Future-epoch data block without an admitted eleader-change QC.
-        // TODO(zeus-view-change): admitted_change_qcs[block_epoch - 1] should be
-        // Some(QC).
         return false;
     }
     true
@@ -210,6 +218,187 @@ pub fn eleader(
     num_nodes: usize,
 ) -> crate::Id {
     (epoch as usize % num_nodes) as crate::Id
+}
+
+// ---------------------------------------------------------------------------
+// EleaderBlame / EleaderChangeQC validity
+// (Algorithm/zeus.tex §FuncEleaderBlameValid lines 213-237,
+//  §FuncEleaderChangeQCValid lines 239-250)
+// ---------------------------------------------------------------------------
+
+/// Serializable signing tuple for a blame message.
+///
+/// Signed content per Algorithm/zeus.tex line 215:
+///   `(TAG_ELEADER_BLAME, epoch, reason_tag, payload_bytes)`
+///
+/// We encode this as a 4-tuple of raw bytes so that bincode produces a
+/// deterministic, stable layout for signing/verification.
+#[derive(serde::Serialize)]
+struct BlameSigned {
+    tag: u8,
+    epoch: u64,
+    reason_tag: u8,
+    payload_bytes: Vec<u8>,
+}
+
+/// Encode the payload bytes for a silence blame: `last_seen_height` as
+/// little-endian u64.
+fn silence_payload_bytes(last_seen_height: u64) -> Vec<u8> {
+    last_seen_height.to_le_bytes().to_vec()
+}
+
+/// Encode the payload bytes for an equivocation blame:
+/// `H(block_a.envelope) || H(block_b.envelope)` (64 bytes total).
+fn equivocation_payload_bytes<Tx>(
+    block_a: &DataBlock<Tx>,
+    block_b: &DataBlock<Tx>,
+) -> Vec<u8>
+where
+    Tx: Serialize + Clone,
+{
+    let mut bytes = Vec::with_capacity(64);
+    bytes.extend_from_slice(block_a.hash().as_ref());
+    bytes.extend_from_slice(block_b.hash().as_ref());
+    bytes
+}
+
+/// Build the signed digest bytes for an eleader blame.
+///
+/// Returns the 32-byte hash digest as a `Vec<u8>` so callers can pass it to
+/// `pk.verify(digest, sig_bytes)` without any phantom-type friction.  The
+/// hash covers `(TAG_ELEADER_BLAME, epoch, reason_tag, payload_bytes)`.
+pub fn blame_signed_bytes<Tx>(
+    epoch: u64,
+    reason: &BlameReason,
+    payload: &BlamePayload<Tx>,
+) -> Vec<u8>
+where
+    Tx: Serialize + Clone,
+{
+    let (reason_tag, payload_bytes) = match reason {
+        BlameReason::Silence => {
+            let h = match payload {
+                BlamePayload::Silence { last_seen_height } => *last_seen_height,
+                _ => 0,
+            };
+            (TAG_REASON_SILENCE, silence_payload_bytes(h))
+        }
+        BlameReason::Equivocation => {
+            let (ba, bb) = match payload {
+                BlamePayload::Equivocation {
+                    block_a, block_b, ..
+                } => (block_a, block_b),
+                _ => panic!("mismatched BlameReason/BlamePayload"),
+            };
+            (TAG_REASON_EQUIVOCATION, equivocation_payload_bytes(ba, bb))
+        }
+    };
+    let signing_tuple = BlameSigned {
+        tag: TAG_ELEADER_BLAME,
+        epoch,
+        reason_tag,
+        payload_bytes,
+    };
+    Hash::<BlameSigned>::ser_and_hash(&signing_tuple)
+        .as_ref()
+        .to_vec()
+}
+
+/// Validates a single eleader blame per Algorithm/zeus.tex lines 213-237.
+///
+/// Checks:
+///   1. Signer's signature over `(TAG_ELEADER_BLAME, epoch, reason_tag,
+///      payload_bytes)`.
+///   2. For Silence: always true after sig check (threshold provides non-faulty
+///      guarantee).
+///   3. For Equivocation: both `block_a` and `block_b` are signed by the
+///      expected eleader at the same `(epoch, height)` and are distinct.
+pub fn eleader_blame_valid<Tx>(
+    blame: &EleaderBlame<Tx>,
+    pk_map: &fnv::FnvHashMap<crate::Id, crypto::PublicKey>,
+    expected_eleader_id: crate::Id,
+) -> bool
+where
+    Tx: Serialize + Clone,
+{
+    // 1. Verify the signer's sig over the blame tuple.
+    let signer_pk = match pk_map.get(&blame.signer) {
+        Some(pk) => pk,
+        None => return false,
+    };
+    let digest = blame_signed_bytes(blame.epoch, &blame.reason, &blame.payload);
+    if !signer_pk.verify(&digest, &blame.sig_raw) {
+        return false;
+    }
+
+    // 2/3. Reason-specific checks.
+    match &blame.reason {
+        BlameReason::Silence => {
+            // Silence is not self-verifying beyond the signature; threshold
+            // on QC formation provides the non-faulty-blamer guarantee.
+            true
+        }
+        BlameReason::Equivocation => {
+            let (height, block_a, block_b) = match &blame.payload {
+                BlamePayload::Equivocation {
+                    height,
+                    block_a,
+                    block_b,
+                } => (height, block_a, block_b),
+                _ => return false,
+            };
+            // Blocks must be distinct.
+            if block_a.hash() == block_b.hash() {
+                return false;
+            }
+            // Both must be at the claimed height.
+            if block_a.envelope.height != *height || block_b.envelope.height != *height {
+                return false;
+            }
+            // Both must carry valid eleader signatures on their envelopes.
+            let eleader_pk = match pk_map.get(&expected_eleader_id) {
+                Some(pk) => pk,
+                None => return false,
+            };
+            // DataBlock.hash() returns Hash<DataBlockEnvelope<Tx>>; as_ref() is &[u8].
+            if !eleader_pk.verify(block_a.hash().as_ref(), &block_a.sig.raw) {
+                return false;
+            }
+            if !eleader_pk.verify(block_b.hash().as_ref(), &block_b.sig.raw) {
+                return false;
+            }
+            true
+        }
+    }
+}
+
+/// Validates an eleader-change QC per Algorithm/zeus.tex lines 239-250.
+///
+/// Checks:
+///   1. Distinct signer count >= `num_faults + 1`.
+///   2. For each blame: `blame.epoch == qc.epoch` AND `eleader_blame_valid`.
+pub fn eleader_change_qc_valid<Tx>(
+    qc: &EleaderChangeQC<Tx>,
+    pk_map: &fnv::FnvHashMap<crate::Id, crypto::PublicKey>,
+    num_faults: usize,
+    num_nodes: usize,
+) -> bool
+where
+    Tx: Serialize + Clone,
+{
+    let expected_eleader_id = eleader(qc.epoch, num_nodes);
+    // Count distinct signers.
+    let mut seen: std::collections::HashSet<crate::Id> = std::collections::HashSet::new();
+    for blame in &qc.blames {
+        if blame.epoch != qc.epoch {
+            return false;
+        }
+        if !eleader_blame_valid(blame, pk_map, expected_eleader_id) {
+            return false;
+        }
+        seen.insert(blame.signer);
+    }
+    seen.len() > num_faults
 }
 
 // ---------------------------------------------------------------------------

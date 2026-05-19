@@ -1,24 +1,31 @@
 use super::{ClientMode, Settings};
 use crate::{to_socket_address, Id};
 use anyhow::{anyhow, Result};
+use crypto::hash::Hash;
 use fnv::FnvHashMap;
+use futures_util::StreamExt;
 use log::*;
 use rand::{thread_rng, Rng};
 use std::marker::PhantomData;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tcp_sender::TcpSimpleSender;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 
-use crate::types::ZeusClientMsg;
+use crate::types::{ClientMsg, ZeusClientMsg};
 
 /// This is a client implementation that stresses the BFT-system
 pub struct Stressor<Tx> {
     id: Id,
     exit_rx: oneshot::Receiver<()>,
     settings: Settings,
-    consensus_sender: TcpSimpleSender<Id, Tx>,
-    consensus_rx: UnboundedReceiver<Tx>,
+    /// Sends raw serialized message bytes to all servers.  The phantom type is
+    /// `Vec<u8>` because we serialize `ClientMsg`/`ZeusClientMsg` manually and
+    /// pass raw `Bytes` — the phantom is not used on the wire.
+    consensus_sender: TcpSimpleSender<Id, Vec<u8>>,
+    /// Receives confirmed `Hash<Vec<Tx>>` from the confirmation listener task.
+    /// The listener deserializes the server reply and forwards the hash here.
+    confirmation_rx: UnboundedReceiver<Hash<Vec<Tx>>>,
     _x: PhantomData<Tx>,
 }
 
@@ -40,8 +47,9 @@ where
 
         let (exit_tx, exit_rx) = oneshot::channel();
 
-        let mut peer_map = FnvHashMap::default();
-        // These are all server Ids
+        // Build the peer map: server Id → consensus_client_port address.
+        // The stressor sends `NewBatch` to the server's `consensus_client_port`.
+        let mut peer_map: FnvHashMap<Id, std::net::SocketAddr> = FnvHashMap::default();
         let all_ids = settings.consensus_config.get_all_ids();
         for id in &all_ids {
             let party = settings
@@ -52,21 +60,69 @@ where
             peer_map.insert(*id, consensus_addr);
         }
         debug!("Using servers: {:?}", peer_map);
-        let consensus_sender = TcpSimpleSender::<Id, Tx>::with_peers(peer_map);
 
-        // Networking setup
-        let (consensus_tx, consensus_rx) = unbounded_channel();
-        let my_addr = to_socket_address("0.0.0.0", 0)?; // Random available port
-        let mut receiver = tcp_receiver::TcpReceiver::<Tx>::spawn(my_addr);
-        // Spawn a forwarding task
-        tokio::spawn(async move {
-            use futures_util::StreamExt;
-            while let Some(Ok(msg)) = receiver.next().await {
-                if consensus_tx.send(msg).is_err() {
-                    break;
-                }
+        // `consensus_sender` is typed with `Vec<u8>` phantom — we serialize
+        // manually and pass raw `Bytes`.
+        let consensus_sender = TcpSimpleSender::<Id, Vec<u8>>::with_peers(peer_map);
+
+        // Bind confirmation listener on my_confirmation_address:my_confirmation_port.
+        // Port 0 lets the OS pick a free ephemeral port (for in-process harness).
+        let my_addr = to_socket_address(
+            &settings.my_confirmation_address,
+            settings.my_confirmation_port,
+        )?;
+        let (confirmation_tx, confirmation_rx) = unbounded_channel::<Hash<Vec<Tx>>>();
+
+        // Spawn a mode-aware confirmation listener task.
+        // The listener knows the client mode and uses the correct message type.
+        match &settings.client_mode {
+            ClientMode::LetoBroadcast => {
+                let tx = confirmation_tx;
+                tokio::spawn(async move {
+                    let mut receiver = tcp_receiver::TcpReceiver::<ClientMsg<Tx>>::spawn(my_addr);
+                    while let Some(result) = receiver.next().await {
+                        match result {
+                            Ok(ClientMsg::BatchConfirmation(h)) => {
+                                if tx.send(h).is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(ClientMsg::Confirmation(_)) => {
+                                // Legacy single-tx confirmation — ignore for latency.
+                                info!("Received legacy single-tx Confirmation");
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                debug!("Leto confirmation receiver: decode error: {:?}", e);
+                            }
+                        }
+                    }
+                });
             }
-        });
+            ClientMode::ZeusEleaderOnly { .. } => {
+                let tx = confirmation_tx;
+                tokio::spawn(async move {
+                    let mut receiver =
+                        tcp_receiver::TcpReceiver::<ZeusClientMsg<Tx>>::spawn(my_addr);
+                    while let Some(result) = receiver.next().await {
+                        match result {
+                            Ok(ZeusClientMsg::BatchConfirmation(h)) => {
+                                if tx.send(h).is_err() {
+                                    break;
+                                }
+                            }
+                            Ok(ZeusClientMsg::Confirmation(_)) => {
+                                info!("Received legacy single-tx ZeusConfirmation");
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                debug!("Zeus confirmation receiver: decode error: {:?}", e);
+                            }
+                        }
+                    }
+                });
+            }
+        }
 
         // Start the client
         tokio::spawn(async move {
@@ -75,7 +131,7 @@ where
                 exit_rx,
                 settings,
                 consensus_sender,
-                consensus_rx,
+                confirmation_rx,
                 _x: PhantomData,
             }
             .run()
@@ -89,15 +145,17 @@ where
         let burst_tx = self.settings.bench_config.txs_per_burst;
         let tx_size = self.settings.bench_config.tx_size;
         let all_ids = self.settings.consensus_config.get_all_ids();
+        let emit_dp = self.settings.bench_config.emit_dp;
+        let window_secs = self.settings.bench_config.bench_emit_window_secs.max(1);
+
+        // Confirmation listener address included in NewBatch so the server
+        // knows where to send BatchConfirmation.
+        let my_confirmation_addr: std::net::SocketAddr = to_socket_address(
+            &self.settings.my_confirmation_address,
+            self.settings.my_confirmation_port,
+        )?;
 
         // Resolve the eleader target for ZeusEleaderOnly mode.
-        //
-        // If `eleader_id` is pre-seeded by the harness we use it directly
-        // (fast-path; no network query).  If it is `None` we query
-        // `all_ids[0]` via a `WhoIsEleader` request and wait for
-        // `EleaderIs`.
-        //
-        // For LetoBroadcast the target is unused.
         let target_eleader: Option<Id> = match &self.settings.client_mode {
             ClientMode::LetoBroadcast => None,
             ClientMode::ZeusEleaderOnly {
@@ -107,30 +165,11 @@ where
                 Some(*id)
             }
             ClientMode::ZeusEleaderOnly { eleader_id: None } => {
-                // Query all_ids[0] for the current eleader.
-                let query_id = *all_ids.first().ok_or_else(|| anyhow!("no peers"))?;
-                debug!("Zeus stressor: querying node {} for eleader", query_id);
-                let who_msg = ZeusClientMsg::<Tx>::WhoIsEleader;
-                let bytes =
-                    bytes::Bytes::from(bincode::serialize(&who_msg).map_err(anyhow::Error::new)?);
-                let _ = self.consensus_sender.send(query_id, bytes).await;
-
-                // Wait up to 5 s for the EleaderIs reply.
-                // We receive raw Tx-typed bytes here; in the query path the
-                // server responds with ZeusClientMsg, which won't deserialise
-                // as Tx.  The `consensus_rx` channel carries deserialized Tx
-                // values, so we cannot receive ZeusClientMsg on it directly.
-                //
-                // For this pass the harness always pre-seeds `eleader_id`, so
-                // this branch is a debug-only fallback.  Return an error that
-                // prints clearly instead of blocking forever.
                 warn!(
                     "Zeus stressor: WhoIsEleader query sent but reply channel not wired \
                      (the in-process harness should always pre-seed eleader_id). \
                      Falling back to node 0 as eleader."
                 );
-                // eleader(epoch=1, n) = 1 % n — for n>=1 that is always id=1,
-                // but for n=1 id=0.  We don't have n here; fall back to 0.
                 Some(0)
             }
         };
@@ -147,6 +186,14 @@ where
         let mut first = true;
         let mut sample_id: u64 = thread_rng().gen();
 
+        // DP[Latency] state: batch_hash → send Instant.
+        let mut send_ts: FnvHashMap<Hash<Vec<Tx>>, Instant> = FnvHashMap::default();
+        // Latency samples (microseconds) collected in the current window.
+        let mut latency_hist: Vec<u64> = Vec::new();
+        let mut emit_interval = tokio::time::interval(Duration::from_secs(window_secs));
+        // Drop the immediate first tick so the first window is a full window.
+        emit_interval.tick().await;
+
         loop {
             tokio::select! {
                 _ = &mut self.exit_rx => {
@@ -154,7 +201,8 @@ where
                     break;
                 }
                 _ = burst_timer.tick() => {
-                    // Send `burst_tx` transactions every interval
+                    // Build one batch of `burst_tx` transactions.
+                    let mut batch: Vec<Tx> = Vec::with_capacity(burst_tx);
                     for i in 0..burst_tx {
                         let tx = Tx::mock_transaction(
                             tx_id,
@@ -179,30 +227,76 @@ where
                                 first = false;
                             }
                         }
-                        let bytes = bytes::Bytes::from(bincode::serialize(&tx).unwrap());
-                        match &self.settings.client_mode {
-                            ClientMode::LetoBroadcast => {
-                                let _ = self.consensus_sender.broadcast(
-                                    &all_ids,
-                                    bytes,
-                                ).await;
-                            }
-                            ClientMode::ZeusEleaderOnly { .. } => {
-                                // target_eleader is always Some in this branch
-                                let eleader = target_eleader.expect("eleader resolved above");
-                                let _ = self.consensus_sender.send(eleader, bytes).await;
-                            }
-                        }
+                        batch.push(tx);
                         tx_id += 1;
                     }
+
+                    // Compute batch hash before moving the Vec into the message.
+                    let batch_hash: Hash<Vec<Tx>> = Hash::ser_and_hash(&batch);
+
+                    match &self.settings.client_mode {
+                        ClientMode::LetoBroadcast => {
+                            let msg = ClientMsg::<Tx>::NewBatch {
+                                batch,
+                                reply_to: my_confirmation_addr,
+                            };
+                            let bytes = bytes::Bytes::from(
+                                bincode::serialize(&msg).map_err(anyhow::Error::new)?,
+                            );
+                            let _ = self.consensus_sender
+                                .broadcast(&all_ids, bytes)
+                                .await;
+                        }
+                        ClientMode::ZeusEleaderOnly { .. } => {
+                            let eleader =
+                                target_eleader.expect("eleader resolved above");
+                            let msg = ZeusClientMsg::<Tx>::NewBatch {
+                                batch,
+                                reply_to: my_confirmation_addr,
+                            };
+                            let bytes = bytes::Bytes::from(
+                                bincode::serialize(&msg).map_err(anyhow::Error::new)?,
+                            );
+                            let _ = self.consensus_sender
+                                .send(eleader, bytes)
+                                .await;
+                        }
+                    }
+
+                    // Record send timestamp keyed by batch hash.
+                    send_ts.insert(batch_hash, Instant::now());
                     sample_id += 1;
                 }
-                confirmation = self.consensus_rx.recv() => {
-                    info!("Received a confirmation message: {:?}", confirmation);
-                    // TODO: Handle tx confirmation
+                batch_hash = self.confirmation_rx.recv() => {
+                    let h = match batch_hash {
+                        Some(h) => h,
+                        None => break,
+                    };
+                    if let Some(sent) = send_ts.remove(&h) {
+                        latency_hist.push(sent.elapsed().as_micros() as u64);
+                    }
+                }
+                _ = emit_interval.tick(), if emit_dp => {
+                    if !latency_hist.is_empty() {
+                        let med = median_us(&latency_hist) as f64 / 1000.0;
+                        eprintln!("DP[Latency]: {}", med);
+                        latency_hist.clear();
+                    }
                 }
             }
         }
         Ok(())
+    }
+}
+
+/// Returns the median of a non-empty slice of microsecond values.
+fn median_us(hist: &[u64]) -> u64 {
+    let mut v = hist.to_vec();
+    v.sort_unstable();
+    let mid = v.len() / 2;
+    if v.len().is_multiple_of(2) {
+        (v[mid - 1] + v[mid]) / 2
+    } else {
+        v[mid]
     }
 }
