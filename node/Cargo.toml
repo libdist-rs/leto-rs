@@ -25,6 +25,7 @@ fnv = "1"
 serde = "1"
 bincode = "1"
 base64 = "0"
+fdlimit = "0.3"
 
 [dependencies.clap]
 version = "4"

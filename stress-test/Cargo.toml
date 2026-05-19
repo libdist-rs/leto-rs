@@ -22,6 +22,7 @@ base64 = "0"
 fnv = "1"
 tempfile = "3"
 rand = "0.8"
+fdlimit = "0.3"
 
 [dependencies.clap]
 version = "4"

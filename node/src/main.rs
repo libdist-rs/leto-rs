@@ -261,6 +261,23 @@ type TestTx = SimpleTx<SimpleData>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Raise the per-process file-descriptor soft limit to the hard cap
+    // (or libc::FD_SETSIZE on macOS, whichever is smaller).  Required for
+    // n=61 scalability sweeps where each node opens (n-1) reliable-sender
+    // sockets + (n-1) receiver sockets + mempool + RocksDB FDs ≈ 200+ FDs
+    // per process; the default macOS soft limit of 256 is not enough.
+    match fdlimit::raise_fd_limit() {
+        Ok(fdlimit::Outcome::LimitRaised { from, to }) => {
+            println!("Raised FD limit: {} → {}", from, to);
+        }
+        Ok(fdlimit::Outcome::Unsupported) => {
+            println!("FD limit raise: unsupported on this platform");
+        }
+        Err(e) => {
+            eprintln!("FD limit raise failed: {e}; continuing with current limit");
+        }
+    }
+
     println!("Starting {} with {:?}", APP_NAME, std::env::args());
 
     // Parse the args

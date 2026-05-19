@@ -16,6 +16,22 @@ use std::time::Duration;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    // Raise the per-process FD soft limit BEFORE spawning N in-process
+    // nodes.  Each node opens (n-1)*2 sockets + RocksDB FDs; at n=61
+    // the in-process harness needs >7,000 FDs.  macOS default soft
+    // limit is 256.
+    match fdlimit::raise_fd_limit() {
+        Ok(fdlimit::Outcome::LimitRaised { from, to }) => {
+            println!("Raised FD limit: {} → {}", from, to);
+        }
+        Ok(fdlimit::Outcome::Unsupported) => {
+            println!("FD limit raise: unsupported on this platform");
+        }
+        Err(e) => {
+            eprintln!("FD limit raise failed: {e}; continuing with current limit");
+        }
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();

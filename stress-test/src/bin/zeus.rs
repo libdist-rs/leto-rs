@@ -24,6 +24,20 @@ use zeus_harness::ZeusNodeHarness;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
+    // Raise the per-process FD soft limit BEFORE spawning N in-process
+    // Zeus servers.  See stress-test/src/main.rs for the rationale.
+    match fdlimit::raise_fd_limit() {
+        Ok(fdlimit::Outcome::LimitRaised { from, to }) => {
+            println!("Raised FD limit: {} → {}", from, to);
+        }
+        Ok(fdlimit::Outcome::Unsupported) => {
+            println!("FD limit raise: unsupported on this platform");
+        }
+        Err(e) => {
+            eprintln!("FD limit raise failed: {e}; continuing with current limit");
+        }
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_millis()
         .init();

@@ -48,6 +48,21 @@ fn default_logger(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Raise the per-process FD soft limit before opening any sockets.
+    // See `node/src/main.rs` for the rationale (n=61 scalability sweep
+    // needs ≥200 FDs per process; macOS default soft cap is 256).
+    match fdlimit::raise_fd_limit() {
+        Ok(fdlimit::Outcome::LimitRaised { from, to }) => {
+            println!("Raised FD limit: {} → {}", from, to);
+        }
+        Ok(fdlimit::Outcome::Unsupported) => {
+            println!("FD limit raise: unsupported on this platform");
+        }
+        Err(e) => {
+            eprintln!("FD limit raise failed: {e}; continuing with current limit");
+        }
+    }
+
     println!("Starting {} with {:?}", APP_NAME, std::env::args());
 
     let args = Cli::parse();
