@@ -39,8 +39,47 @@
    because node-zeus was added.  Add --bin node or set default-run in
    node/Cargo.toml.
 
-* Known regressions (2026-05-18) [0/1]                              :Zeus:
-** TODO Zeus commit-stall in orchestrator local smoke               :Zeus:Correctness:
+* Known regressions (2026-05-18) [1/2]                              :Zeus:
+** DONE Zeus commit-stall in orchestrator local smoke               :Zeus:Correctness:
+   CLOSED: [2026-05-18 Sun]
+   Root cause: eleader proposed empty data blocks on every batcher
+   tick (libmempool seals on batch_timeout even with no txs).  Every
+   committed payload was empty → counter stayed 0.  Sig-chain commit
+   machinery was working all along (~400 FIRING events confirmed via
+   instrumentation).  Fix: on_eleader_propose drops empty batches
+   before they reach the chain (consensus/src/server/zeus/phases/data.rs).
+   Verified: Zeus orchestrator smoke now produces 9.8k tx/s real
+   throughput.  No regression on Leto (still 39k tx/s).
+   Committed in 27e0f16.
+
+** TODO Zeus DP[Latency] still NaN — BatchConfirmation hash mismatch :Zeus:Net:
+   :PROPERTIES:
+   :Location: consensus/src/server/zeus/server.rs::run_confirmation_router
+   :END:
+
+   The Stressor sends NewBatch{batch: Vec<Tx>, reply_to: SocketAddr}
+   and registers Hash::ser_and_hash(&Vec<Tx>) → send_ts.  The server's
+   confirmation_router hashes the *committed* batch (post-libmempool
+   re-batching), which does NOT match the client's original NewBatch
+   hash because libmempool's batcher accumulates txs across multiple
+   NewBatch arrivals and seals batches at its own cadence.
+
+   Server-side `pending` lookup always misses → no BatchConfirmation
+   → Stressor's latency_hist stays empty → DP[Latency]: NaN.
+
+   Fix options:
+   1. Switch to per-tx Confirmation(Hash<Tx>) — high wire overhead
+      (one confirmation per tx).
+   2. Have libmempool preserve "client batch identity" — annotate each
+      tx with its source-batch hash so commits can map back.  Touches
+      libmempool-rs.
+   3. Bypass libmempool's re-batching: have NewBatch flow directly
+      into the consensus layer as a logical unit.  Bigger refactor.
+   4. Have the Stressor watch the server's commit channel instead of
+      Confirmation roundtrip — but requires a new subscribe protocol.
+
+   Throughput numbers unaffected; latency is purely the client-side
+   reading.  Option 1 is the simplest correct fix.
    :PROPERTIES:
    :Location: consensus/src/server/zeus/phases/commit.rs (ZeusCommitContext)
    :END:
