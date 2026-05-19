@@ -55,6 +55,8 @@ def kill_session(session: str = "leto-bench") -> None:
         "target/release/client-apollo ",
         "target/release/node-artemis ",
         "target/release/client-artemis ",
+        "target/release/mysticeti ",
+        "target/release/mysticeti-dpbridge ",
     ):
         subprocess.run(["pkill", "-9", "-f", pattern], check=False)
     time.sleep(0.5)
@@ -119,6 +121,8 @@ def launch_local(
         subs: dict[str, str] = {
             "bin_dir": str(bin_dir),
             "id": str(node_id),
+            "n": str(n),
+            "rate": str(rate),
             "extra": protocol.node_extra_args,
             "config": str(server_config) if server_config.exists() else "",
             "node_config": str(config_dir / f"nodes-{node_id}.json"),
@@ -148,8 +152,17 @@ def launch_local(
     # for leto the cost is just a few seconds of run time.
     time.sleep(8)
 
-    # Apollo/artemis are single-client; ignore num_clients for them.
-    effective_clients = 1 if protocol.name in ("apollo", "artemis") else num_clients
+    # Per-protocol client count:
+    # - apollo/artemis: single closed-loop client by design.
+    # - mysticeti: no separate client (node binary self-generates load
+    #   via the TPS env var); skip client launches entirely.
+    # - leto/zeus: orchestrator-defined num_clients.
+    if protocol.name in ("apollo", "artemis"):
+        effective_clients = 1
+    elif protocol.name == "mysticeti":
+        effective_clients = 0
+    else:
+        effective_clients = num_clients
 
     for cli_idx in range(effective_clients):
         client_id = n + cli_idx
@@ -175,22 +188,31 @@ def launch_local(
         _tmux(["send-keys", "-t", f"{session}:{window_name}", full, "C-m"])
         processes.append(LocalProcess(tmux_window=window_name, log_path=log_path))
 
-    # Optional sidecar (Mysticeti's dpbridge).
+    # Optional sidecar (Mysticeti's dpbridge).  Scrapes the metrics
+    # endpoint of authority 0 (matching the node-0 metrics convention
+    # for leto/zeus/apollo/artemis).  Mysticeti's Prometheus port
+    # follows: validator i binds 1500 + i for network, 1504 + i for
+    # metrics.  Authority 0 → metrics port 1504.
     if protocol.sidecar_run_cmd:
+        # Give the validator generators ~15s past their built-in 10s
+        # warmup so the histograms have populated bucket counts the
+        # bridge can usefully sample.  This roughly matches the
+        # orchestrator's warmup window for the chain-style protocols.
         bridges_dir = Path(__file__).resolve().parent.parent / "bridges"
         log_path = log_dir / "sidecar.log"
-        for node_id in range(min(1, n)):  # one sidecar per metrics node
-            metrics_url = "http://127.0.0.1:1500/metrics"   # PINME per protocol
-            cmd = protocol.sidecar_run_cmd.format(
-                bridges_dir=bridges_dir,
-                metrics_url=metrics_url,
-                extra="",
-            )
-            full = f"{cmd} > {shlex.quote(str(log_path))} 2>&1"
-            window_name = f"sidecar-{node_id}"
-            _tmux(["new-window", "-t", session, "-n", window_name])
-            _tmux(["send-keys", "-t", f"{session}:{window_name}", full, "C-m"])
-            processes.append(LocalProcess(tmux_window=window_name, log_path=log_path))
+        metrics_url = "http://127.0.0.1:1504/metrics"
+        max_secs = 600  # bridge auto-exits; orchestrator tears down earlier
+        cmd = protocol.sidecar_run_cmd.format(
+            bridges_dir=bridges_dir,
+            metrics_url=metrics_url,
+            max_secs=max_secs,
+            extra="",
+        )
+        full = f"{cmd} > {shlex.quote(str(log_path))} 2>&1"
+        window_name = "sidecar-0"
+        _tmux(["new-window", "-t", session, "-n", window_name])
+        _tmux(["send-keys", "-t", f"{session}:{window_name}", full, "C-m"])
+        processes.append(LocalProcess(tmux_window=window_name, log_path=log_path))
 
     return processes
 

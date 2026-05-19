@@ -17,3 +17,4 @@ benchmark/benchmark-ref/
 .DS_Store
 .vscode/
 .claude/settings.local.json
+dryrun-validator-*/

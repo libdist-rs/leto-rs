@@ -35,16 +35,22 @@ struct Args {
     #[arg(long, default_value_t = 1000)]
     interval_ms: u64,
 
-    /// Metric name carrying the cumulative committed-tx counter.
-    /// Adjust if Mysticeti's metric is named differently in the
-    /// build you pinned.
-    #[arg(long, default_value = "committed_transactions_total")]
+    /// Exact Prometheus series name carrying the cumulative
+    /// committed-tx counter.
+    ///
+    /// Mysticeti increments `latency_s_count` (the count component of
+    /// the end-to-end-latency histogram) once per committed tx, so it
+    /// IS the committed-tx counter under that name.  Pass the literal
+    /// series name (including any `_count` / `_total` suffix) — not
+    /// the histogram base.
+    #[arg(long, default_value = "latency_s_count")]
     throughput_metric: String,
 
     /// Metric name carrying the commit-latency histogram.
+    /// Mysticeti uses `latency_s` (seconds; histogram).
     /// We read the p50 quantile bucket; pass --latency-quantile to
     /// override.
-    #[arg(long, default_value = "commit_latency_seconds")]
+    #[arg(long, default_value = "latency_s")]
     latency_metric: String,
 
     /// Quantile to extract from the latency histogram (0.0–1.0).
@@ -122,19 +128,46 @@ fn scrape(client: &reqwest::blocking::Client, url: &str) -> Result<Scrape> {
     Ok(Scrape::parse(lines).map_err(|e| anyhow!("prometheus parse: {e}"))?)
 }
 
-/// Find a counter or gauge by name; returns the sample sum across labels.
+/// Find a counter, gauge, or histogram-count by name; returns the sum
+/// across labels.
+///
+/// Counter / Gauge / Untyped are matched directly on the series name.
+/// Histograms are matched on either:
+///   - the bare histogram name (`latency_s`) → use the histogram's
+///     sample count (i.e. count of observations, which is what
+///     Mysticeti increments per committed tx);
+///   - the explicit `<name>_count` series (the caller spelled it out)
+///     → same: extract from any Histogram whose bare name matches the
+///     `_count`-stripped requested name.
+///
+/// This handles prometheus-parse's API choice to bundle histogram
+/// count/sum/buckets into a single `Value::Histogram` sample rather
+/// than emitting them as separate counter series.
 fn find_counter(scrape: &Scrape, name: &str) -> Option<f64> {
+    let histogram_target = name.strip_suffix("_count").unwrap_or(name);
     let mut sum = 0.0f64;
     let mut found = false;
     for sample in &scrape.samples {
-        if sample.metric == name {
-            match sample.value {
-                Value::Counter(v) | Value::Gauge(v) | Value::Untyped(v) => {
-                    sum += v;
+        match &sample.value {
+            Value::Counter(v) | Value::Gauge(v) | Value::Untyped(v) => {
+                if sample.metric == name {
+                    sum += *v;
                     found = true;
                 }
-                _ => {}
             }
+            Value::Histogram(hist_samples) => {
+                if sample.metric == histogram_target {
+                    // Histogram total observation count = highest +Inf bucket
+                    // OR equivalently the last cumulative bucket count.  The
+                    // prometheus-parse HistogramCount type exposes the +Inf
+                    // bucket as the last entry; sum() over that gives the count.
+                    if let Some(last) = hist_samples.last() {
+                        sum += last.count;
+                        found = true;
+                    }
+                }
+            }
+            _ => {}
         }
     }
     if found {
@@ -168,40 +201,50 @@ fn compute_throughput(
 
 /// Extract a quantile from a Prometheus histogram, in milliseconds.
 ///
-/// Mysticeti histograms expose `_bucket{le=...}` lines; we walk them
-/// in ascending `le` order and find the smallest bucket whose
+/// prometheus-parse bundles a histogram's buckets into a single
+/// `Value::Histogram(Vec<HistogramCount>)` sample, where each entry
+/// is `{less_than: f64, count: f64}` (cumulative count ≤ less_than).
+/// We aggregate across all label combinations matching `metric`, walk
+/// buckets in ascending order, and find the smallest bucket whose
 /// cumulative count exceeds `quantile × total`.
+///
+/// Assumes the histogram unit is seconds; converts to ms in the return.
 fn extract_latency_ms(scrape: &Scrape, metric: &str, quantile: f64) -> Option<f64> {
-    let bucket_name = format!("{metric}_bucket");
-    let count_name = format!("{metric}_count");
-    let total = find_counter(scrape, &count_name)?;
-    if total <= 0.0 {
-        return None;
-    }
-    let mut buckets: Vec<(f64, f64)> = Vec::new();
+    // Aggregate buckets across all label sets that match this metric.
+    // Map le → summed-count.
+    let mut bucket_sum: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
+    let mut total: f64 = 0.0;
+    let mut found = false;
     for sample in &scrape.samples {
-        if sample.metric != bucket_name {
+        if sample.metric != metric {
             continue;
         }
-        let le_str = sample.labels.get("le")?;
-        let le: f64 = le_str.parse().ok()?;
-        let count = match sample.value {
-            Value::Counter(v) | Value::Gauge(v) | Value::Untyped(v) => v,
-            _ => continue,
-        };
-        buckets.push((le, count));
+        if let Value::Histogram(entries) = &sample.value {
+            found = true;
+            for entry in entries {
+                // BTreeMap doesn't support f64 keys; encode as bits.
+                let key = entry.less_than.to_bits();
+                *bucket_sum.entry(key).or_insert(0.0) += entry.count;
+            }
+            // The total observation count is the highest cumulative bucket.
+            if let Some(last) = entries.last() {
+                total += last.count;
+            }
+        }
     }
-    if buckets.is_empty() {
+    if !found || total <= 0.0 {
         return None;
     }
-    buckets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let target = quantile * total;
-    for (le, count) in &buckets {
+    for (key, count) in &bucket_sum {
         if *count >= target {
-            // Assume histogram unit is seconds; convert to ms.
+            let le = f64::from_bits(*key);
             return Some(le * 1000.0);
         }
     }
     // Fallback: top bucket
-    buckets.last().map(|(le, _)| le * 1000.0)
+    bucket_sum
+        .keys()
+        .next_back()
+        .map(|key| f64::from_bits(*key) * 1000.0)
 }

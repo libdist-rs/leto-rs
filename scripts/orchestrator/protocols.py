@@ -150,25 +150,26 @@ MYSTICETI = Protocol(
     name="mysticeti",
     git_url="https://github.com/MystenLabs/mysticeti.git",
     git_sha="PINME",
-    build_cmd="cargo build --release -p mysticeti",
-    # Mysticeti's own binary; flags TBD against the pinned SHA's CLI.
+    build_cmd="cargo build --release --bin mysticeti",
+    # Mysticeti's single binary; `dry-run` self-generates committee +
+    # keys + load (no separate client binary). TPS env controls the
+    # built-in generator's rate.  Substitute {rate} into TPS at launch
+    # time via the shell prefix.
     node_run_cmd=(
-        "{bin_dir}/mysticeti --committee {config} --authority {id} "
-        "--metrics-address 0.0.0.0:1500 {extra}"
+        "TPS={rate} {bin_dir}/mysticeti dry-run "
+        "--committee-size {n} --authority {id}"
     ),
-    # Mysticeti uses --dedicated-clients; the client binary's name and
-    # exact flags depend on the SHA. PINME during install.
-    client_run_cmd=(
-        "{bin_dir}/mysticeti-client --committee {config} --rate {rate} "
-        "--duration-secs {window}"
-    ),
+    # Mysticeti's dryrun mode has no separate client — the node binary
+    # generates load internally.  We use a no-op client_run_cmd that
+    # exits immediately; effective_clients=0 in deploy keeps it from
+    # being launched.
+    client_run_cmd="true",
     sidecar_run_cmd=(
-        # Built from scripts/bridges/mysticeti_dpbridge/.
         "{bridges_dir}/mysticeti_dpbridge/target/release/mysticeti-dpbridge "
-        "--metrics-url {metrics_url} --interval-ms 1000"
+        "--metrics-url {metrics_url} --interval-ms 1000 --max-secs {max_secs}"
     ),
     translator_module="orchestrator.translators.mysticeti",
-    instance_type="c8g.xlarge",   # bumped per profile; revisit after smoke
+    instance_type="c8g.xlarge",   # DAG nodes heavier than chain-BFT
 )
 
 
