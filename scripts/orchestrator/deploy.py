@@ -345,8 +345,24 @@ def install_remote(
     # Ensure cargo on PATH for subsequent commands.
     _run_parallel(conns, "echo 'source $HOME/.cargo/env' >> $HOME/.bashrc || true")
 
-    # --- per-protocol clone + checkout ---
+    # --- per-protocol clone + checkout (skipped if cache hit) ---
+    from orchestrator import binstore
+    _, cf = _fabric_imports()
     for proto in protocols:
+        if binstore.is_cached(proto):
+            # Cache hit: push the cached tarball to every host and untar.
+            # Skip the clone — we don't need source for protocols whose
+            # binaries we'll just deploy verbatim.
+            print(
+                f"[install] CACHE HIT {proto.name}@{proto.git_sha[:7]} — "
+                f"pushing binaries to {len(conns)} hosts"
+            )
+            def _push(c, p=proto):
+                binstore.push_to_host(c, p, REMOTE_ROOT)
+            with cf.ThreadPoolExecutor(max_workers=max(1, len(conns))) as ex:
+                list(ex.map(_push, conns))
+            continue
+
         target = f"{REMOTE_ROOT}/repos/{proto.name}"
         sha = proto.git_sha
         if sha == "PINME":
@@ -362,7 +378,7 @@ def install_remote(
             f"&& git fetch --quiet --tags origin "
             f"&& {sha_cmd}"
         )
-        print(f"[install] clone+checkout {proto.name}@{sha}")
+        print(f"[install] clone+checkout {proto.name}@{sha} (cache miss)")
         _run_parallel(conns, cmd)
 
 
@@ -388,7 +404,18 @@ def build_remote(
     c0 = conns[0]
     other = conns[1:]
 
+    from orchestrator import binstore
     for proto in protocols:
+        # Skip protocols that install_remote already deployed from
+        # cache; their /bin/<protocol>/ is already populated on every
+        # host and there's no source tree to build against.
+        if binstore.is_cached(proto):
+            print(
+                f"[build] SKIP {proto.name}@{proto.git_sha[:7]} — "
+                f"deployed from local cache during install_remote"
+            )
+            continue
+
         src = f"{REMOTE_ROOT}/repos/{proto.name}"
         bin_dir = f"{REMOTE_ROOT}/bin/{proto.name}"
 
@@ -408,6 +435,13 @@ def build_remote(
             f"&& cp -r {src}/{proto.bin_dir}/* {bin_dir}/ 2>/dev/null || true",
             warn=True,
         )
+
+        # Pull a tarball back to the local cache so future provisions
+        # can skip the build entirely.
+        print(f"[build] caching {proto.name} binaries to local disk")
+        local_cache = binstore.pull_from_host(c0, proto, REMOTE_ROOT)
+        size_mb = local_cache.stat().st_size / (1024 * 1024)
+        print(f"[build]   wrote {local_cache.name} ({size_mb:.1f} MB)")
 
         if not other:
             continue

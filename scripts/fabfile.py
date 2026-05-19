@@ -12,26 +12,36 @@ from fabric import task
 
 
 @task
-def provision(c, num_nodes=4, num_clients=2, instance_type="c8g.large",
-              az="us-west-2d", spot=True, key_name=None,
-              security_group_id=None, subnet_id=None, tag="leto-bench"):
-    """Provision EC2 instances on AWS (spot c8g.large in us-west-2d default).
+def provision(c, num_nodes=4, num_clients=2, instance_type=None,
+              az="us-west-2d", spot=None, key_name=None,
+              security_group_id=None, subnet_id=None, tag="leto-bench",
+              root_volume_gb=None):
+    """Provision EC2 instances on AWS.
+
+    Defaults (from orchestrator/aws.py): c8g.xlarge on-demand in
+    us-west-2d with a 30 GB gp3 root volume.  Overridable per-task.
 
     Requires AWS credentials in env or ~/.aws/. Caller supplies an
     existing key pair, security group, and subnet ID in the target AZ.
     """
     from orchestrator import aws
-    instances = aws.provision(
-        num_nodes=int(num_nodes),
-        num_clients=int(num_clients),
-        instance_type=instance_type,
-        az=az,
-        spot=bool(spot),
-        key_name=key_name,
-        security_group_id=security_group_id,
-        subnet_id=subnet_id,
-        tag=tag,
-    )
+    kwargs: dict = {
+        "num_nodes": int(num_nodes),
+        "num_clients": int(num_clients),
+        "az": az,
+        "key_name": key_name,
+        "security_group_id": security_group_id,
+        "subnet_id": subnet_id,
+        "tag": tag,
+    }
+    if instance_type is not None:
+        kwargs["instance_type"] = instance_type
+    if spot is not None:
+        # fabric passes the string "True"/"False"; normalise.
+        kwargs["spot"] = str(spot).lower() in ("1", "true", "yes")
+    if root_volume_gb is not None:
+        kwargs["root_volume_gb"] = int(root_volume_gb)
+    instances = aws.provision(**kwargs)
     print(f"provisioned {len(instances)} instance(s)")
     aws.status()
 

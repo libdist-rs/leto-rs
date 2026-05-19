@@ -22,7 +22,16 @@ from typing import Optional
 
 DEFAULT_REGION = "us-west-2"
 DEFAULT_AZ = "us-west-2d"
-DEFAULT_INSTANCE_TYPE = "c8g.large"
+# c8g.xlarge on-demand: $0.0796/hr × 6 hosts = $0.48/hr cluster.  Spot
+# would be ~$0.046/hr × 6 = $0.28/hr but risks mid-sweep interruption.
+# For paper-grade runs we trade ~$0.20/hr for guaranteed completion.
+DEFAULT_INSTANCE_TYPE = "c8g.xlarge"
+DEFAULT_SPOT = False
+# 30 GB gp3 root volume on every host so Mysticeti's LLVM codegen
+# doesn't OOM (AL2023's default 8 GB filled up during the first build).
+# gp3 is ~$0.08/GB-month → 30 GB × 6 hosts × $0.08 = ~$14/month if you
+# leave the volumes around; trivial for short-lived benchmark clusters.
+DEFAULT_ROOT_VOLUME_GB = 30
 # Amazon Linux 2023 (arm64) — free, owned by Amazon, no Marketplace
 # subscription required.  Matches libapollo-rs's existing fabfile.py
 # bootstrap pattern (dnf-based) so reproducibility across the two
@@ -85,11 +94,12 @@ def provision(
     num_clients: int,
     instance_type: str = DEFAULT_INSTANCE_TYPE,
     az: str = DEFAULT_AZ,
-    spot: bool = True,
+    spot: bool = DEFAULT_SPOT,
     key_name: Optional[str] = None,
     security_group_id: Optional[str] = None,
     subnet_id: Optional[str] = None,
     tag: str = DEFAULT_TAG,
+    root_volume_gb: int = DEFAULT_ROOT_VOLUME_GB,
 ) -> list[Instance]:
     """Launch EC2 instances; persist state to scripts/state/aws.json.
 
@@ -124,6 +134,14 @@ def provision(
         "SecurityGroupIds": [security_group_id],
         "SubnetId": subnet_id,
         "Placement": {"AvailabilityZone": az},
+        "BlockDeviceMappings": [{
+            "DeviceName": "/dev/xvda",   # AL2023 root EBS device
+            "Ebs": {
+                "VolumeSize": root_volume_gb,
+                "VolumeType": "gp3",
+                "DeleteOnTermination": True,
+            },
+        }],
         "TagSpecifications": [{
             "ResourceType": "instance",
             "Tags": [
