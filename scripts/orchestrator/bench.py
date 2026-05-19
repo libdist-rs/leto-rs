@@ -35,6 +35,9 @@ class SweepConfig:
     measure_secs: int = 30
     target: str = "local"         # "local" or "aws"
     tag: str = "untagged"
+    # Path to the SSH private key used by fabric for AWS hosts.
+    # Required when target == "aws". Ignored otherwise.
+    ssh_key_path: str | None = None
 
     def num_clients_for(self, n: int) -> int:
         # ⌈n/3⌉ matches the plan; minimum 1.
@@ -91,8 +94,22 @@ def run_sweep(cfg: SweepConfig, total_txs: int = 0, window: int = 0) -> Path:
                 total_txs=effective_total_txs,
                 window=effective_window,
             )
+            # launch_local is non-blocking — sleep for the run window
+            # here, then kill the session.
+            time.sleep(cfg.warmup_secs + cfg.measure_secs)
+            deploy.kill_session()
         else:
+            if not cfg.ssh_key_path:
+                raise ValueError(
+                    "target='aws' requires ssh_key_path in SweepConfig"
+                )
+            # Remote launch is blocking: it sleeps warmup+measure inside
+            # launch_remote and tears down + fetches logs before
+            # returning.  No extra sleep needed in the caller.
+            from orchestrator import aws as _aws
+            state = _aws.load_state()
             deploy.launch_remote(
+                state=state,
                 protocol=protocol,
                 config_dir=config_dir,
                 n=n,
@@ -101,13 +118,10 @@ def run_sweep(cfg: SweepConfig, total_txs: int = 0, window: int = 0) -> Path:
                 rate=load,
                 total_txs=effective_total_txs,
                 window=effective_window,
+                ssh_key_path=cfg.ssh_key_path,
+                warmup_secs=cfg.warmup_secs,
+                measure_secs=cfg.measure_secs,
             )
-
-        # Hold for warmup + measurement window, then tear down.
-        time.sleep(cfg.warmup_secs + cfg.measure_secs)
-        if cfg.target == "local":
-            deploy.kill_session()
-        # else: implement remote teardown when launch_remote lands.
 
         manifest["runs"].append({
             "protocol": protocol_name,

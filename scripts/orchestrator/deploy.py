@@ -166,31 +166,414 @@ def launch_local(
 
 
 # ---------------------------------------------------------------------------
-# Remote SSH launcher
+# Remote SSH launcher (AWS) — fabric-based.
+#
+# Shape mirrors libapollo-rs/scripts/fabfile.py's proven install / build /
+# launch sequence, generalised over the multi-protocol Protocol registry.
+#
+# Host layout:
+#   ~/leto-bench/
+#     repos/<protocol_name>/        # cloned ephemeral checkout, pinned SHA
+#     bin/<protocol_name>/          # distributed binaries (from node-0 build)
+#     run/<protocol_name>/          # per-run config files + key files
+#     logs/<protocol_name>/         # per-run stdout/stderr
+#
+# Idempotency: install + build skip if the right SHA / binary is already
+# present. Re-running `fab install` on an existing cluster is safe.
 # ---------------------------------------------------------------------------
 
 
-def install_remote(*args, **kwargs):
-    """Clone protocol repos at pinned SHAs on all hosts. PINME."""
-    raise NotImplementedError(
-        "remote install pending; use local mode for smoke. Implement via "
-        "fabric.SerialGroup with `git clone --depth=1 && git checkout <sha>` "
-        "and a build step."
+REMOTE_ROOT = "$HOME/leto-bench"
+REMOTE_USER = "ubuntu"           # Ubuntu 24.04 LTS arm64 default
+TMUX_SESSION = "leto-bench"
+
+
+def _fabric_imports():
+    """Import fabric lazily so the rest of deploy.py works without it
+    installed (local-tmux mode has no fabric dependency)."""
+    from fabric import Connection            # noqa: F401
+    import concurrent.futures as cf          # noqa: F401
+    return Connection, cf
+
+
+def _connections(state: dict, ssh_key_path: str) -> list:
+    """One fabric Connection per provisioned instance, ordered by role
+    then by index. Nodes come first, clients after — matches the
+    convention `aws.py` uses when laying out instances.
+
+    The caller is responsible for closing connections (fabric handles
+    this implicitly on garbage collection, but explicit `c.close()` is
+    safer for long sweeps).
+    """
+    Connection, _ = _fabric_imports()
+    instances = state.get("instances", [])
+    if not instances:
+        raise RuntimeError(
+            "no instances in scripts/state/aws.json; run `fab provision` first"
+        )
+    # Sort: nodes first (by index), then clients (by index). The aws.py
+    # provisioner inserts them in this order, but be defensive.
+    nodes = [i for i in instances if i.get("role") == "node"]
+    clients = [i for i in instances if i.get("role") == "client"]
+    ordered = nodes + clients
+    return [
+        Connection(
+            host=inst["public_ip"],
+            user=REMOTE_USER,
+            connect_kwargs={"key_filename": ssh_key_path},
+        )
+        for inst in ordered
+    ]
+
+
+def _run_parallel(conns, cmd: str, warn: bool = False) -> list:
+    """Run the same command on every host concurrently. Returns one
+    fabric Result per connection in input order.
+
+    Fabric 3 dropped `ThreadingGroup.run` returning a mapping, so we
+    use a small ThreadPoolExecutor to fan out + preserve ordering."""
+    _, cf = _fabric_imports()
+    def _one(c):
+        return c.run(cmd, warn=warn, hide=True)
+    with cf.ThreadPoolExecutor(max_workers=max(1, len(conns))) as ex:
+        return list(ex.map(_one, conns))
+
+
+def _ensure_remote_layout(conns) -> None:
+    """Create ~/leto-bench/{repos,bin,run,logs} on every host."""
+    _run_parallel(conns, f"mkdir -p {REMOTE_ROOT}/{{repos,bin,run,logs}}")
+
+
+# ---------------------------------------------------------------------------
+# install_remote — bootstrap host + clone all requested protocols
+# ---------------------------------------------------------------------------
+
+
+def install_remote(
+    state: dict,
+    protocols: list[Protocol],
+    ssh_key_path: str,
+) -> None:
+    """Idempotent install across every host:
+
+    1. apt install build-essential cmake clang libssl-dev pkg-config
+       librocksdb-dev tmux git (only what's missing).
+    2. rustup install stable + cargo PATH.
+    3. For each requested protocol: git clone + checkout pinned SHA.
+       Skip if HEAD already matches.
+
+    Safe to re-run. Surfaces errors per-host as RuntimeError.
+    """
+    conns = _connections(state, ssh_key_path)
+    _ensure_remote_layout(conns)
+
+    # --- system packages ---
+    apt_pkgs = (
+        "build-essential cmake clang libssl-dev pkg-config "
+        "librocksdb-dev tmux git curl jq"
+    )
+    print(f"[install] apt install on {len(conns)} hosts")
+    _run_parallel(
+        conns,
+        # `-qq -y` minimises log noise; `--no-install-recommends` keeps it lean.
+        f"sudo apt-get update -qq && sudo apt-get install -y -qq "
+        f"--no-install-recommends {apt_pkgs}",
     )
 
+    # --- rust toolchain ---
+    print("[install] rustup (idempotent)")
+    _run_parallel(
+        conns,
+        # -y: no prompts; --default-toolchain stable; skip if rustup already on PATH.
+        "command -v rustup >/dev/null 2>&1 || "
+        "curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs "
+        "| sh -s -- -y --default-toolchain stable --profile minimal "
+        "  --no-modify-path",
+    )
+    # Ensure cargo on PATH for subsequent commands.
+    _run_parallel(conns, "echo 'source $HOME/.cargo/env' >> $HOME/.bashrc || true")
 
-def build_remote(*args, **kwargs):
-    """Build protocol binaries on remote hosts. PINME."""
-    raise NotImplementedError(
-        "remote build pending; use local mode for smoke. Implement via "
-        "fabric.SerialGroup with `cargo build --release` per protocol."
+    # --- per-protocol clone + checkout ---
+    for proto in protocols:
+        target = f"{REMOTE_ROOT}/repos/{proto.name}"
+        sha = proto.git_sha
+        if sha == "PINME":
+            print(f"[install] WARNING: {proto.name} SHA is PINME — using HEAD")
+            sha_cmd = "git rev-parse HEAD"
+        else:
+            sha_cmd = f"git checkout {sha} && git rev-parse HEAD"
+
+        cmd = (
+            f"if [ ! -d {target}/.git ]; then "
+            f"  git clone --quiet {proto.git_url} {target}; "
+            f"fi && cd {target} "
+            f"&& git fetch --quiet --tags origin "
+            f"&& {sha_cmd}"
+        )
+        print(f"[install] clone+checkout {proto.name}@{sha}")
+        _run_parallel(conns, cmd)
+
+
+# ---------------------------------------------------------------------------
+# build_remote — build on node 0, distribute to all hosts
+# ---------------------------------------------------------------------------
+
+
+def build_remote(
+    state: dict,
+    protocols: list[Protocol],
+    ssh_key_path: str,
+) -> None:
+    """For each protocol: build on node 0 + distribute binaries to all
+    hosts. Identical instance type + AMI across the cluster makes ABI
+    compatibility a non-issue.
+
+    The bin dir on each host ends up at ~/leto-bench/bin/<protocol>/.
+    """
+    conns = _connections(state, ssh_key_path)
+    if not conns:
+        raise RuntimeError("no hosts")
+    c0 = conns[0]
+    other = conns[1:]
+
+    for proto in protocols:
+        src = f"{REMOTE_ROOT}/repos/{proto.name}"
+        bin_dir = f"{REMOTE_ROOT}/bin/{proto.name}"
+
+        print(f"[build] {proto.name} on node 0 (this can take a while)")
+        # Source cargo env in the same shell so cargo is on PATH after
+        # a fresh rustup install on this connection.
+        c0.run(
+            f"source $HOME/.cargo/env && cd {src} && {proto.build_cmd}",
+            hide=False,
+        )
+
+        # Stage binaries into bin/ on node 0, then scp to others.
+        # Apollo's binaries live at workspace_root/target/release/<bin>;
+        # so does leto-rs. The build_cmd already produced them.
+        c0.run(
+            f"rm -rf {bin_dir} && mkdir -p {bin_dir} "
+            f"&& cp -r {src}/{proto.bin_dir}/* {bin_dir}/ 2>/dev/null || true",
+            warn=True,
+        )
+
+        if not other:
+            continue
+
+        # Tarball + scp + untar is faster than per-file scp at n=61.
+        tarball = f"/tmp/{proto.name}-bin.tar.gz"
+        c0.run(f"tar czf {tarball} -C {REMOTE_ROOT}/bin {proto.name}")
+        local_stage = Path("/tmp") / f"leto-bench-{proto.name}-bin.tar.gz"
+        if local_stage.exists():
+            local_stage.unlink()
+        c0.get(tarball, str(local_stage))
+        c0.run(f"rm -f {tarball}")
+
+        print(f"[build] distribute {proto.name} binaries to {len(other)} other hosts")
+        _, cf = _fabric_imports()
+        def _push(c, local=local_stage):
+            c.put(str(local), tarball)
+            c.run(
+                f"mkdir -p {REMOTE_ROOT}/bin "
+                f"&& tar xzf {tarball} -C {REMOTE_ROOT}/bin "
+                f"&& rm -f {tarball}"
+            )
+        with cf.ThreadPoolExecutor(max_workers=max(1, len(other))) as ex:
+            list(ex.map(_push, other))
+        local_stage.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# launch_remote — run one sweep on the cluster
+# ---------------------------------------------------------------------------
+
+
+def launch_remote(
+    state: dict,
+    protocol: Protocol,
+    config_dir: Path,
+    n: int,
+    num_clients: int,
+    log_dir: Path,
+    rate: int,
+    total_txs: int,
+    window: int,
+    ssh_key_path: str,
+    warmup_secs: int = 5,
+    measure_secs: int = 30,
+) -> None:
+    """Launch `n` nodes + `num_clients` clients on the provisioned AWS
+    cluster for ONE sweep, wait for warmup + measure, tear down, fetch
+    per-host logs into `log_dir`.
+
+    `state` must have at least `n + num_clients` instances (nodes first,
+    clients after).
+    """
+    log_dir.mkdir(parents=True, exist_ok=True)
+    conns = _connections(state, ssh_key_path)
+    if len(conns) < n + num_clients:
+        raise RuntimeError(
+            f"provisioned {len(conns)} hosts; need {n + num_clients} "
+            f"({n} nodes + {num_clients} clients)"
+        )
+    node_conns = conns[:n]
+    client_conns = conns[n : n + num_clients]
+
+    bin_dir = f"{REMOTE_ROOT}/bin/{protocol.name}"
+    run_dir = f"{REMOTE_ROOT}/run/{protocol.name}"
+    log_remote = f"{REMOTE_ROOT}/logs/{protocol.name}"
+
+    # --- tear down any prior tmux session on every host ---
+    print(f"[launch] killing prior {TMUX_SESSION} sessions")
+    _run_parallel(
+        conns,
+        f"tmux kill-session -t {TMUX_SESSION} 2>/dev/null || true; "
+        f"mkdir -p {run_dir} {log_remote}",
     )
 
+    # --- distribute config + key files ---
+    server_config = config_dir / f"{protocol.name}-server.json"
+    if not server_config.exists():
+        raise FileNotFoundError(f"missing server config: {server_config}")
+    keys_dir = config_dir / "keys"  # optional; leto-rs translator may emit here
+    fallback_keys = Path(__file__).resolve().parent.parent.parent / "examples"
 
-def launch_remote(*args, **kwargs):
-    """Spawn nodes + clients on remote AWS hosts via SSH. PINME."""
-    raise NotImplementedError(
-        "remote launch pending; use local mode for smoke. Implement via "
-        "fabric.Connection per host with the same node_run_cmd / "
-        "client_run_cmd templates as launch_local."
+    _, cf = _fabric_imports()
+    def _push_node_files(idx_and_conn):
+        i, c = idx_and_conn
+        # Server config
+        c.put(str(server_config), f"{run_dir}/{protocol.name}-server.json")
+        # Per-node key file (leto/zeus). Apollo+Artemis ship keys via their
+        # own genconfig; for those, this put is a no-op if the file
+        # doesn't exist locally.
+        for cand in (
+            keys_dir / f"keys-{i}.json",
+            fallback_keys / f"keys-{i}.json",
+        ):
+            if cand.exists():
+                c.put(str(cand), f"{run_dir}/keys-{i}.json")
+                break
+
+    def _push_client_files(idx_and_conn):
+        i, c = idx_and_conn
+        client_id = n + i
+        client_config = config_dir / f"{protocol.name}-client-{client_id}.json"
+        if client_config.exists():
+            c.put(str(client_config), f"{run_dir}/{protocol.name}-client-{client_id}.json")
+
+    print("[launch] distributing config + keys")
+    with cf.ThreadPoolExecutor(max_workers=max(1, len(conns))) as ex:
+        list(ex.map(_push_node_files, enumerate(node_conns)))
+        list(ex.map(_push_client_files, enumerate(client_conns)))
+
+    # --- launch nodes in detached tmux ---
+    print(f"[launch] starting {n} {protocol.name} nodes")
+    for i, c in enumerate(node_conns):
+        node_cmd = protocol.node_run_cmd.format(
+            bin_dir=bin_dir,
+            config=f"{run_dir}/{protocol.name}-server.json",
+            id=i,
+            key_file=f"{run_dir}/keys-{i}.json",
+            extra=protocol.node_extra_args,
+        )
+        log_path = f"{log_remote}/node-{i}.log"
+        # tmux -d detaches; the inner bash -c wrap keeps the pipe redirect.
+        cmd = (
+            f"source $HOME/.cargo/env 2>/dev/null; "
+            f"tmux new-session -d -s {TMUX_SESSION} "
+            f"-n node-{i} bash -c "
+            f"{shlex.quote(node_cmd + ' > ' + log_path + ' 2>&1')}"
+        )
+        c.run(cmd)
+
+    # Give nodes a moment to bind before launching clients.
+    time.sleep(2)
+
+    # --- launch clients ---
+    print(f"[launch] starting {num_clients} {protocol.name} clients")
+    for i, c in enumerate(client_conns):
+        client_id = n + i
+        client_cmd = protocol.client_run_cmd.format(
+            bin_dir=bin_dir,
+            config=f"{run_dir}/{protocol.name}-client-{client_id}.json",
+            id=client_id,
+            rate=rate,
+            total_txs=total_txs,
+            window=window,
+            extra=protocol.client_extra_args,
+        )
+        log_path = f"{log_remote}/client-{client_id}.log"
+        cmd = (
+            f"source $HOME/.cargo/env 2>/dev/null; "
+            f"tmux new-session -d -s {TMUX_SESSION} "
+            f"-n client-{client_id} bash -c "
+            f"{shlex.quote(client_cmd + ' > ' + log_path + ' 2>&1')}"
+        )
+        c.run(cmd)
+
+    # --- optional sidecar (Mysticeti dpbridge) on node 0 ---
+    if protocol.sidecar_run_cmd:
+        sidecar_cmd = protocol.sidecar_run_cmd.format(
+            bridges_dir=f"{REMOTE_ROOT}/bin/{protocol.name}_dpbridge",
+            metrics_url="http://127.0.0.1:1500/metrics",
+            extra="",
+        )
+        sidecar_log = f"{log_remote}/sidecar.log"
+        node_conns[0].run(
+            f"tmux new-session -d -s {TMUX_SESSION} -n sidecar bash -c "
+            f"{shlex.quote(sidecar_cmd + ' > ' + sidecar_log + ' 2>&1')}",
+            warn=True,
+        )
+
+    # --- wait warmup + measure ---
+    total_wait = warmup_secs + measure_secs
+    print(f"[launch] waiting {total_wait}s (warmup={warmup_secs} + measure={measure_secs})")
+    time.sleep(total_wait)
+
+    # --- tear down ---
+    print(f"[launch] tearing down {TMUX_SESSION} sessions")
+    _run_parallel(
+        conns,
+        f"tmux kill-session -t {TMUX_SESSION} 2>/dev/null || true",
+        warn=True,
     )
+
+    # --- fetch logs ---
+    print(f"[launch] fetching {protocol.name} logs to {log_dir}")
+    def _fetch_node_log(idx_and_conn):
+        i, c = idx_and_conn
+        try:
+            c.get(f"{log_remote}/node-{i}.log", str(log_dir / f"node-{i}.log"))
+        except Exception as e:
+            print(f"  warn: fetch node-{i}.log failed: {e}")
+
+    def _fetch_client_log(idx_and_conn):
+        i, c = idx_and_conn
+        client_id = n + i
+        try:
+            c.get(
+                f"{log_remote}/client-{client_id}.log",
+                str(log_dir / f"client-{client_id}.log"),
+            )
+        except Exception as e:
+            print(f"  warn: fetch client-{client_id}.log failed: {e}")
+
+    with cf.ThreadPoolExecutor(max_workers=max(1, len(conns))) as ex:
+        list(ex.map(_fetch_node_log, enumerate(node_conns)))
+        list(ex.map(_fetch_client_log, enumerate(client_conns)))
+
+    if protocol.sidecar_run_cmd:
+        try:
+            node_conns[0].get(
+                f"{log_remote}/sidecar.log",
+                str(log_dir / "sidecar.log"),
+            )
+        except Exception as e:
+            print(f"  warn: fetch sidecar.log failed: {e}")
+
+    # Close fabric connections.
+    for c in conns:
+        try:
+            c.close()
+        except Exception:
+            pass

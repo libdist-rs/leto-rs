@@ -37,34 +37,65 @@ def provision(c, num_nodes=4, num_clients=2, instance_type="c8g.large",
 
 
 @task
-def install(c, target="aws"):
-    """Clone protocol repos at pinned SHAs into state/repos/ on each host."""
+def install(c, target="aws", ssh_key_path=None,
+            protocols="apollo,artemis,leto,zeus,mysticeti"):
+    """Bootstrap + clone protocol repos at pinned SHAs on each host.
+
+    Local mode: clones into scripts/state/repos/ (not yet wired — use
+    `fab smoke --target local --protocol leto` which uses the parent
+    leto-rs checkout directly).
+
+    AWS mode: requires `--ssh-key-path /path/to/keypair.pem`. Idempotent.
+    """
+    from orchestrator import deploy
+    from orchestrator.protocols import REGISTRY
+    proto_list = [REGISTRY[p.strip()] for p in protocols.split(",") if p.strip()]
     if target == "local":
-        from orchestrator.deploy import install_remote  # placeholder
-        print("local install: clone repos into scripts/state/repos/")
+        print("local install: cloning into scripts/state/repos/ is pending; "
+              "for now use --target=local smoke which builds in-place")
         return
-    raise NotImplementedError(
-        "remote install pending — see orchestrator/deploy.py::install_remote"
-    )
+    if not ssh_key_path:
+        raise SystemExit(
+            "remote install requires --ssh-key-path /path/to/keypair.pem"
+        )
+    from orchestrator import aws
+    state = aws.load_state()
+    deploy.install_remote(state, proto_list, ssh_key_path)
+    print(f"install complete on {len(state['instances'])} hosts")
 
 
 @task
-def build(c, target="aws"):
-    """Build each protocol's binaries on each host (remote) or locally."""
+def build(c, target="aws", ssh_key_path=None,
+          protocols="apollo,artemis,leto,zeus,mysticeti"):
+    """Build each protocol's binaries on every host.
+
+    Local mode: cargo build --release --all in the leto-rs workspace.
+    AWS mode: build on node 0 + distribute binaries via tarball + scp.
+    """
     if target == "local":
         import subprocess
-        # Just exercise the leto/zeus side of the workspace; apollo+mysticeti
-        # cloned-checkout builds plug in once state/repos/ is populated.
         subprocess.run(["cargo", "build", "--release", "--all"], check=True)
         print("local build complete")
         return
-    raise NotImplementedError("remote build pending")
+    if not ssh_key_path:
+        raise SystemExit(
+            "remote build requires --ssh-key-path /path/to/keypair.pem"
+        )
+    from orchestrator import deploy, aws
+    from orchestrator.protocols import REGISTRY
+    proto_list = [REGISTRY[p.strip()] for p in protocols.split(",") if p.strip()]
+    state = aws.load_state()
+    deploy.build_remote(state, proto_list, ssh_key_path)
+    print(f"build complete on {len(state['instances'])} hosts")
 
 
 @task
 def smoke(c, target="local", protocol="leto", num_nodes=4, num_clients=2,
-          rate=5000, duration=30):
-    """Quick end-to-end run for one protocol — wiring validation."""
+          rate=5000, duration=30, ssh_key_path=None):
+    """Quick end-to-end run for one protocol — wiring validation.
+
+    AWS mode requires `--ssh-key-path /path/to/keypair.pem`.
+    """
     from orchestrator.bench import SweepConfig, run_sweep
     cfg = SweepConfig(
         protocols=[protocol],
@@ -75,6 +106,7 @@ def smoke(c, target="local", protocol="leto", num_nodes=4, num_clients=2,
         measure_secs=int(duration),
         target=target,
         tag=f"smoke-{protocol}",
+        ssh_key_path=ssh_key_path,
     )
     out = run_sweep(cfg)
     print(f"smoke results: {out}")
@@ -83,8 +115,11 @@ def smoke(c, target="local", protocol="leto", num_nodes=4, num_clients=2,
 @task
 def bench(c, runs=3, t="1", protocols="apollo,artemis,leto,zeus,mysticeti",
           loads=None, load_mode="ramp", faults="none", tag="untagged",
-          target="aws"):
-    """Run a sweep matrix: protocols × scales × loads × trials."""
+          target="aws", ssh_key_path=None):
+    """Run a sweep matrix: protocols × scales × loads × trials.
+
+    AWS mode requires `--ssh-key-path /path/to/keypair.pem`.
+    """
     from orchestrator.bench import SweepConfig, run_sweep
     t_values = [int(x) for x in str(t).split(",") if x]
     if loads is None:
@@ -99,6 +134,7 @@ def bench(c, runs=3, t="1", protocols="apollo,artemis,leto,zeus,mysticeti",
         trials=int(runs),
         target=target,
         tag=tag,
+        ssh_key_path=ssh_key_path,
     )
     out = run_sweep(cfg)
     print(f"sweep results: {out}")
