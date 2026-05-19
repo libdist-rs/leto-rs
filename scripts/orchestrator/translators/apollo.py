@@ -1,71 +1,131 @@
 """Canonical committee → libapollo-rs config files.
 
-Apollo and Artemis share libapollo-rs's `config::node::Config` +
-`config::client::Config` JSON shapes — see
-`~/Github/libapollo-rs/config/src/`. They take the same committee for
-both protocols.
+Apollo and Artemis both consume libapollo-rs's `genconfig` output:
+- nodes-{i}.json       per-node config (peer list, ports, TLS material refs)
+- node-{i}.{chain,key}.pem  per-node TLS material
+- client.json          single client config
+- client-0.{chain,key}.pem  client TLS
+- root-cert.pem        CA root
+
+Plus two files this translator writes itself (genconfig doesn't):
+- ip_file              `<ip>:<base_port+i>` per node, one line each
+- cli_ip_file          `<ip>:<client_base_port+i>` per node, one line each
+
+This translator subprocess-calls the `genconfig` binary from a built
+checkout of libapollo-rs so the JSON schema is always exactly what
+`config::Node` expects.  Trying to re-implement the schema in Python
+would drift on every libapollo-rs change.
+
+Local dev: looks for `genconfig` at `~/Github/libapollo-rs/target/release/`.
+AWS path: install_remote builds it inside `~/leto-bench/repos/libapollo-rs/`;
+the deploy layer points GENCONFIG_OVERRIDE at that location.
 """
 
 from __future__ import annotations
 
-import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 from typing import Any
 
 from orchestrator.genconfig import Committee
 
 
-def translate(committee: Committee, out_dir: Path, protocol: str = "apollo") -> dict[str, Path]:
-    """Write apollo/artemis server + client configs.
+# Default discovery: dev-machine path.  Override via env var for AWS.
+DEFAULT_GENCONFIG = Path.home() / "Github" / "libapollo-rs" / "target" / "release" / "genconfig"
 
-    Returns a dict mapping role label → written file path.
+
+def _find_genconfig() -> Path:
+    override = os.environ.get("GENCONFIG_OVERRIDE")
+    if override:
+        p = Path(override)
+        if p.exists():
+            return p
+        raise FileNotFoundError(f"GENCONFIG_OVERRIDE={override} not found")
+    if DEFAULT_GENCONFIG.exists():
+        return DEFAULT_GENCONFIG
+    raise FileNotFoundError(
+        f"genconfig not found at {DEFAULT_GENCONFIG}; "
+        f"build libapollo-rs first: "
+        f"`cd ~/Github/libapollo-rs && cargo build --release --bin genconfig`"
+    )
+
+
+def translate(committee: Committee, out_dir: Path, protocol: str = "apollo") -> dict[str, Path]:
+    """Generate apollo/artemis configs for the canonical committee.
+
+    Returns {label → path} for the generated files.  Protocol is the
+    binary key ("apollo" or "artemis") — both protocols read identical
+    genconfig output; the protocol differs only in which binary you
+    invoke.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    paths: dict[str, Path] = {}
+    genconfig = _find_genconfig()
 
-    # libapollo-rs's node Config (from the genconfig output structure).
-    # Field names mirror config/src/node.rs / config/src/client.rs.
-    nodes = []
-    for m in committee.members:
-        nodes.append({
-            "id": m.id,
-            "ip": m.endpoint.host,
-            "consensus_port": m.endpoint.consensus_port,
-            "mempool_port": m.endpoint.mempool_port,
-            "client_port": m.endpoint.client_port,
-            "pubkey": m.pubkey_b64,
-        })
+    # Apollo's genconfig allocates ports as `base + node_id`, NOT the
+    # canonical committee's stride-100-per-node layout.  Picking four
+    # disjoint base-port ranges keeps them clear of leto/zeus's 18000+
+    # range so apollo + leto can coexist if both happen to run.
+    if not committee.members:
+        raise ValueError("committee has no members")
+    base_port = 14000                            # -P, node-node consensus
+    client_base = 15000                          # -C, server's client-tx port
+    mempool_base = 16000                         # -M, mempool peer-sync
+    client_listen = 17000                        # -L, client's listen port for pushed ClientMsg
 
-    server_settings: dict[str, Any] = {
-        "protocol": protocol,
-        "num_nodes": committee.n,
-        "num_faults": committee.f,
-        "delta": 50,              # apollo default per Explore survey
-        "block_size": 400,        # txs per block (apollo default)
-        "payload": 0,             # tx payload bytes
-        "crypto_alg": "ED25519",
-        "nodes": nodes,
-        "bench_emit_window_secs": 5,
-        "bench_metrics_node": 0,
+    # node_ips / client_ips: comma-separated unique IPs of all hosts
+    # (used for TLS cert SAN).  Local-tmux all share 127.0.0.1.
+    node_ips = ",".join(sorted({m.endpoint.host for m in committee.members}))
+    client_ips = ",".join(sorted({c.endpoint.host for c in committee.clients})) or "127.0.0.1"
+
+    cmd = [
+        str(genconfig),
+        "-n", str(committee.n),
+        "-f", str(committee.f),
+        "-d", "50",                              # Δ in ms
+        "-b", "400",                             # block_size (txs/block)
+        "-P", str(base_port),
+        "-C", str(client_base),
+        "-M", str(mempool_base),
+        "-L", str(client_listen),
+        "--node_ips", node_ips,
+        "--client_ips", client_ips,
+        "--payload", "0",
+        "--target", str(out_dir),
+    ]
+    subprocess.run(cmd, check=True)
+
+    # Hand-write ip_file + cli_ip_file (genconfig doesn't emit these).
+    # Each line: "<ip>:<base_port + i>" for i in 0..n.
+    ip_lines = [
+        f"{committee.members[i].endpoint.host}:{base_port + i}"
+        for i in range(committee.n)
+    ]
+    cli_lines = [
+        f"{committee.members[i].endpoint.host}:{client_base + i}"
+        for i in range(committee.n)
+    ]
+    (out_dir / "ip_file").write_text("\n".join(ip_lines) + "\n")
+    (out_dir / "cli_ip_file").write_text("\n".join(cli_lines) + "\n")
+
+    # Build the return dict pointing at the generated files.
+    paths: dict[str, Path] = {
+        "ip_file": out_dir / "ip_file",
+        "cli_ip_file": out_dir / "cli_ip_file",
+        "client_config": out_dir / "client.json",
+        "root_cert": out_dir / "root-cert.pem",
     }
+    for i in range(committee.n):
+        paths[f"node_config_{i}"] = out_dir / f"nodes-{i}.json"
+        paths[f"node_chain_{i}"] = out_dir / f"node-{i}.chain.pem"
+        paths[f"node_key_{i}"] = out_dir / f"node-{i}.key.pem"
+    paths["client_chain"] = out_dir / "client-0.chain.pem"
+    paths["client_key"] = out_dir / "client-0.key.pem"
 
-    server_path = out_dir / f"{protocol}-server.json"
-    server_path.write_text(json.dumps(server_settings, indent=2))
-    paths["server"] = server_path
-
-    for client in committee.clients:
-        client_settings: dict[str, Any] = {
-            "protocol": protocol,
-            "client_id": client.id,
-            "total_txs": 50_000,
-            "window": 10_000,
-            "block_size": 400,
-            "payload": 0,
-            "nodes": nodes,
-            "bench_emit_window_secs": 5,
-        }
-        client_path = out_dir / f"{protocol}-client-{client.id}.json"
-        client_path.write_text(json.dumps(client_settings, indent=2))
-        paths[f"client-{client.id}"] = client_path
+    # Verify everything genconfig was supposed to produce actually exists.
+    for label, p in paths.items():
+        if not p.exists():
+            raise RuntimeError(f"genconfig did not produce {label} at {p}")
 
     return paths

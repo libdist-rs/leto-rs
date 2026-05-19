@@ -43,15 +43,22 @@ class Sample:
 
 
 def parse_log(path: Path) -> dict[str, float | None]:
-    """Pull the *last* DP[Throughput] and DP[Latency] from a single log.
+    """Pull the median non-zero DP[Throughput] and DP[Latency] from a
+    single log.
 
-    Clients emit DP[…] every `window` seconds and once at shutdown;
-    we take the last reading since that reflects the full measurement
-    window. Returns `{"throughput": ..., "latency_ms": ...}` with
-    `None` for any missing key.
+    Each emission window writes one DP[Throughput] and one DP[Latency]
+    line; many windows accumulate across one run.  Median-of-non-zero
+    gives the steady-state value and is robust to:
+    - warmup windows that haven't accumulated commits yet
+    - post-client-finish windows where the load driver has exited
+    - bursty outliers in either direction
+
+    Zero readings are treated as "no data this window" and excluded.
+    Returns `{"throughput": ..., "latency_ms": ...}` with `None` if
+    every reading was zero or missing.
     """
-    throughput: float | None = None
-    latency: float | None = None
+    throughputs: list[float] = []
+    latencies: list[float] = []
     with path.open("r", errors="replace") as fp:
         for line in fp:
             m = _DP_LINE.search(line)
@@ -59,11 +66,16 @@ def parse_log(path: Path) -> dict[str, float | None]:
                 continue
             key = m.group("key")
             value = float(m.group("value"))
+            if value <= 0.0:
+                continue
             if key == "Throughput":
-                throughput = value
+                throughputs.append(value)
             elif key == "Latency":
-                latency = value
-    return {"throughput": throughput, "latency_ms": latency}
+                latencies.append(value)
+    return {
+        "throughput": statistics.median(throughputs) if throughputs else None,
+        "latency_ms": statistics.median(latencies) if latencies else None,
+    }
 
 
 def parse_run_dir(

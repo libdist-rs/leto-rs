@@ -79,11 +79,18 @@ APOLLO = Protocol(
     name="apollo",
     git_url="https://github.com/libdist-rs/libapollo-rs.git",
     git_sha="PINME",
-    build_cmd="cargo build --release --bin node-apollo --bin client-apollo",
-    node_run_cmd="{bin_dir}/node-apollo --config {config} --id {id}",
+    build_cmd="cargo build --release --bin node-apollo --bin client-apollo --bin genconfig",
+    # libapollo-rs node-apollo CLI: `-c nodes-<i>.json -i ip_file -s --sleep N --delta MS`.
+    # {node_config} and {ip_file} are substituted by deploy.launch_*.
+    node_run_cmd=(
+        "{bin_dir}/node-apollo -c {node_config} -i {ip_file} "
+        "-s --sleep 5 --delta 50"
+    ),
+    # libapollo-rs client-apollo CLI: `-c client.json -i cli_ip_file -m <metrics> -w <window>`.
+    # Apollo is single-client; ignore {id} / {rate}.
     client_run_cmd=(
-        "{bin_dir}/client-apollo --config {config} --total-txs {total_txs} "
-        "--window {window}"
+        "{bin_dir}/client-apollo -c {client_config} -i {cli_ip_file} "
+        "-m {total_txs} -w {window}"
     ),
     translator_module="orchestrator.translators.apollo",
 )
@@ -92,13 +99,16 @@ ARTEMIS = Protocol(
     name="artemis",
     git_url="https://github.com/libdist-rs/libapollo-rs.git",
     git_sha="PINME",
-    build_cmd="cargo build --release --bin node-artemis --bin client-artemis",
-    node_run_cmd="{bin_dir}/node-artemis --config {config} --id {id}",
-    client_run_cmd=(
-        "{bin_dir}/client-artemis --config {config} --total-txs {total_txs} "
-        "--window {window}"
+    build_cmd="cargo build --release --bin node-artemis --bin client-artemis --bin genconfig",
+    node_run_cmd=(
+        "{bin_dir}/node-artemis -c {node_config} -i {ip_file} "
+        "-s --sleep 5 --delta 50"
     ),
-    translator_module="orchestrator.translators.apollo",   # same config format
+    client_run_cmd=(
+        "{bin_dir}/client-artemis -c {client_config} -i {cli_ip_file} "
+        "-m {total_txs} -w {window}"
+    ),
+    translator_module="orchestrator.translators.apollo",   # same genconfig output
 )
 
 LETO = Protocol(

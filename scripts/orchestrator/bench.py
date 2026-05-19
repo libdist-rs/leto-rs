@@ -79,8 +79,14 @@ def run_sweep(cfg: SweepConfig, total_txs: int = 0, window: int = 0) -> Path:
         translator.translate(committee, config_dir, protocol=protocol_name)
 
         # Default driver volumes if not supplied.
-        effective_total_txs = total_txs or (load * cfg.measure_secs * 2)
-        effective_window = window or max(1, load // 10)
+        # total_txs sized so the closed-loop client (apollo/artemis) keeps
+        # firing for the whole measurement window; ignored by open-loop
+        # clients (leto/zeus use burst_interval_ms instead).
+        effective_total_txs = total_txs or max(100_000, load * cfg.measure_secs * 2)
+        # window must be large enough to keep apollo/artemis's pipeline
+        # full; too-small windows starve the closed-loop into idle. Empirical
+        # smoke shows 5_000 works for apollo-class protocols at n=4.
+        effective_window = window or max(5_000, load // 10)
 
         if cfg.target == "local":
             deploy.kill_session()
