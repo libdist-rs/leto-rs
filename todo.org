@@ -39,7 +39,7 @@
    because node-zeus was added.  Add --bin node or set default-run in
    node/Cargo.toml.
 
-* Known regressions (2026-05-18) [1/2]                              :Zeus:
+* Known regressions (2026-05-18) [2/2]                              :Zeus:
 ** DONE Zeus commit-stall in orchestrator local smoke               :Zeus:Correctness:
    CLOSED: [2026-05-18 Sun]
    Root cause: eleader proposed empty data blocks on every batcher
@@ -52,7 +52,16 @@
    throughput.  No regression on Leto (still 39k tx/s).
    Committed in 27e0f16.
 
-** TODO Zeus DP[Latency] still NaN — BatchConfirmation hash mismatch :Zeus:Net:
+** DONE Zeus DP[Latency] NaN — BatchConfirmation hash mismatch       :Zeus:Net:
+   CLOSED: [2026-05-18 Sun]
+   Switched from per-batch BatchConfirmation to per-tx
+   Confirmation(Hash<Tx>) for the roundtrip.  Server now hashes each
+   tx in the committed batch, looks up its originating client, and
+   sends one Confirmation per tx.  Stressor stores per-tx send_ts.
+   Verified: Zeus 68.9 ms latency, Leto 79.5 ms (was NaN).  Committed
+   in 4dfe60e.
+
+** ARCHIVE-NOTE BatchConfirmation hash mismatch (closed)             :Zeus:Net:
    :PROPERTIES:
    :Location: consensus/src/server/zeus/server.rs::run_confirmation_router
    :END:
