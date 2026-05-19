@@ -236,7 +236,7 @@ def launch_local(
 
 
 REMOTE_ROOT = "$HOME/leto-bench"
-REMOTE_USER = "ubuntu"           # Ubuntu 24.04 LTS arm64 default
+REMOTE_USER = "ec2-user"         # Amazon Linux 2023 arm64 default
 TMUX_SESSION = "leto-bench"
 
 
@@ -319,17 +319,17 @@ def install_remote(
     conns = _connections(state, ssh_key_path)
     _ensure_remote_layout(conns)
 
-    # --- system packages ---
-    apt_pkgs = (
-        "build-essential cmake clang libssl-dev pkg-config "
-        "librocksdb-dev tmux git curl jq"
+    # --- system packages (Amazon Linux 2023; dnf-based) ---
+    # Matches libapollo-rs's existing bootstrap (fabfile.py:88).
+    # No librocksdb-dev — rust-rocksdb vendors its own + builds via cargo.
+    dnf_pkgs = (
+        "clang clang-devel cmake gcc gcc-c++ git llvm-devel "
+        "openssl-devel pkgconfig perl tmux tar zip rsync curl jq"
     )
-    print(f"[install] apt install on {len(conns)} hosts")
+    print(f"[install] dnf install on {len(conns)} hosts")
     _run_parallel(
         conns,
-        # `-qq -y` minimises log noise; `--no-install-recommends` keeps it lean.
-        f"sudo apt-get update -qq && sudo apt-get install -y -qq "
-        f"--no-install-recommends {apt_pkgs}",
+        f"sudo dnf install -y --allowerasing {dnf_pkgs}",
     )
 
     # --- rust toolchain ---

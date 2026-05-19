@@ -42,20 +42,31 @@ class Sample:
     source_file: str             # path to the client log this sample came from
 
 
+# Number of leading DP windows to drop as "warmup" before computing the
+# median.  The orchestrator's `warmup_secs` is observed by the sleep
+# *before* launching clients/scrape, but the first emission window of
+# the server-side counter or the client-side latency histogram can still
+# include partial-buildup data (especially Zeus where the first sig
+# round commits an outlier-latency burst).  Dropping window 0 of each
+# stream gives a more honest steady-state median.
+WARMUP_DROP = 1
+
+
 def parse_log(path: Path) -> dict[str, float | None]:
-    """Pull the median non-zero DP[Throughput] and DP[Latency] from a
-    single log.
+    """Pull the steady-state median of DP[Throughput] and DP[Latency]
+    from a single log.
 
-    Each emission window writes one DP[Throughput] and one DP[Latency]
-    line; many windows accumulate across one run.  Median-of-non-zero
-    gives the steady-state value and is robust to:
-    - warmup windows that haven't accumulated commits yet
-    - post-client-finish windows where the load driver has exited
-    - bursty outliers in either direction
+    Filters:
+    - Drop zero readings ("no data this window" — covers post-client-
+      finish windows and pre-load windows).
+    - Drop the first WARMUP_DROP non-zero readings per stream (warmup
+      transient — Zeus's first commit window is famously high-latency).
+    - Median over what remains.
 
-    Zero readings are treated as "no data this window" and excluded.
-    Returns `{"throughput": ..., "latency_ms": ...}` with `None` if
-    every reading was zero or missing.
+    If after warmup-drop fewer than 1 reading remains for a stream,
+    the warmup-drop is skipped for that stream (don't lose the data
+    for protocols that only emit a few windows, e.g. apollo's closed-
+    loop client).
     """
     throughputs: list[float] = []
     latencies: list[float] = []
@@ -72,6 +83,22 @@ def parse_log(path: Path) -> dict[str, float | None]:
                 throughputs.append(value)
             elif key == "Latency":
                 latencies.append(value)
+
+    def _trim_warmup(xs: list[float]) -> list[float]:
+        # Drop the first WARMUP_DROP readings if at least one remains
+        # after the drop.  Earlier threshold of `len > WARMUP_DROP + 1`
+        # was too conservative — Zeus typically emits exactly 2 latency
+        # readings (warmup + steady) and we want to drop the warmup,
+        # leaving 1 steady-state reading.  Apollo's closed-loop client
+        # emits only 1 reading; we keep it (no warmup to drop in a
+        # single-window run).
+        if len(xs) > WARMUP_DROP:
+            return xs[WARMUP_DROP:]
+        return xs
+
+    throughputs = _trim_warmup(throughputs)
+    latencies = _trim_warmup(latencies)
+
     return {
         "throughput": statistics.median(throughputs) if throughputs else None,
         "latency_ms": statistics.median(latencies) if latencies else None,

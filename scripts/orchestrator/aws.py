@@ -23,8 +23,12 @@ from typing import Optional
 DEFAULT_REGION = "us-west-2"
 DEFAULT_AZ = "us-west-2d"
 DEFAULT_INSTANCE_TYPE = "c8g.large"
-DEFAULT_AMI_OWNER = "099720109477"          # Canonical
-DEFAULT_AMI_NAME_FILTER = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"
+# Amazon Linux 2023 (arm64) — free, owned by Amazon, no Marketplace
+# subscription required.  Matches libapollo-rs's existing fabfile.py
+# bootstrap pattern (dnf-based) so reproducibility across the two
+# orchestrators stays cheap.
+DEFAULT_AMI_OWNER = "amazon"
+DEFAULT_AMI_NAME_FILTER = "al2023-ami-2023.*-kernel-*-arm64"
 DEFAULT_TAG = "leto-bench"
 
 
