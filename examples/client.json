@@ -4,28 +4,37 @@
       "1": {
         "id": 1,
         "address": "127.0.0.1",
-        "port": 10002
+        "port": 10006,
+        "confirmation_port": 10010
       },
       "0": {
         "id": 0,
         "address": "127.0.0.1",
-        "port": 10001
+        "port": 10005,
+        "confirmation_port": 10009
       },
       "3": {
         "id": 3,
         "address": "127.0.0.1",
-        "port": 10004
+        "port": 10008,
+        "confirmation_port": 10012
       },
       "2": {
         "id": 2,
         "address": "127.0.0.1",
-        "port": 10003
+        "port": 10007,
+        "confirmation_port": 10011
       }
     }
   },
   "bench_config": {
     "tx_size": 1024,
     "burst_interval_ms": 50,
-    "txs_per_burst": 1000
-  }
+    "txs_per_burst": 100,
+    "bench_emit_window_secs": 5,
+    "emit_dp": true
+  },
+  "client_mode": "LetoBroadcast",
+  "my_confirmation_address": "0.0.0.0",
+  "my_confirmation_port": 0
 }
