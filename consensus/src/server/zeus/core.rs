@@ -575,6 +575,8 @@ where
                 committed = self.zeus_commit_ctx.rx_committed.recv() => {
                     if let Some(c) = committed {
                         self.on_committed_attestation(c);
+                    } else {
+                        warn!("Zeus main: rx_committed closed");
                     }
                 }
 

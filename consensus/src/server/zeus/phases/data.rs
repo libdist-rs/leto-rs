@@ -65,6 +65,20 @@ where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
     {
         // ----------------------------------------------------------------
+        // Skip empty batches.
+        //
+        // The libmempool batcher seals on `batch_timeout` even when no txs
+        // arrived in the window.  Proposing empty data blocks pollutes the
+        // chain with payload-less heights — the prefix-commit projection
+        // emits nothing for them, so DP[Throughput] reads 0 and the paper
+        // numbers look broken.  The eleader is the only data-block producer
+        // in Zeus's client-routing model; if it has nothing to say, it stays
+        // silent and lets the sig-chain freshness rule wait.
+        if batch.payload.is_empty() {
+            return Ok(());
+        }
+
+        // ----------------------------------------------------------------
         // Pipeline gate: drop if window is full.
         // ----------------------------------------------------------------
         let in_flight = self

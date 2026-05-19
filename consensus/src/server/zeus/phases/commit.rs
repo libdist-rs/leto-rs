@@ -134,6 +134,14 @@ where
                         continue;
                     }
 
+                    debug!(
+                        "Zeus commit: EndRound round={} head_hash={:?} queue_len={} unique_proposers={}",
+                        round_element.proposal.round(),
+                        &round_element_hash,
+                        commit_queue.len(),
+                        unique_proposers.len(),
+                    );
+
                     let mut head = round_element;
                     let mut head_hash = round_element_hash;
                     let mut local_queue =
@@ -173,6 +181,11 @@ where
                     }
 
                     if !connected {
+                        debug!(
+                            "Zeus commit: FORK detected, replacing queue (was {}, now {})",
+                            commit_queue.len(),
+                            local_queue.len(),
+                        );
                         let _ = std::mem::replace(&mut commit_queue, local_queue);
                         let _ = std::mem::replace(&mut unique_proposers, local_unique_proposers);
                     } else {
@@ -208,7 +221,7 @@ where
 
                         if let Some(attestation) = best_att {
                             debug!(
-                                "Zeus commit: sig_round={} pinned data_height={}",
+                                "Zeus commit: firing sig_round={} pinned data_height={}",
                                 sig_round, attestation.envelope.data_block_height
                             );
                             // Ignore send errors: main task may have exited
@@ -380,6 +393,9 @@ where
                     return;
                 }
             } else {
+                // Should not happen post-fix: on_eleader_propose drops empty
+                // batches before they reach the chain.  Kept as a guard for
+                // future code paths that might admit empty blocks.
                 debug!("Zeus: committed empty data block at height {}", h);
             }
             self.zeus_committed_high = h;
