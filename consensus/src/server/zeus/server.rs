@@ -98,8 +98,7 @@ where
 
         // Confirmation router (same logic as Leto Server).
         tokio::spawn(async move {
-            Self::run_confirmation_router(&mut rx_tx_sender_map, &mut rx_commit_for_confirm)
-                .await;
+            Self::run_confirmation_router(&mut rx_tx_sender_map, &mut rx_commit_for_confirm).await;
         });
 
         // Client batch listener on consensus_client_port.

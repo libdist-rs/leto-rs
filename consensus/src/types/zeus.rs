@@ -340,24 +340,25 @@ where
 
 // ---------------------------------------------------------------------------
 // consensus Transaction impl for Attestation<Tx>
-// Attestation<Tx> satisfies the consensus Transaction trait automatically
-// via the blanket impl in tx.rs (Serialize + DeserializeOwned + Debug +
-// Send + Sync + Clone + 'static + Message + Unpin).
+// Attestations are not user transactions and do not participate in the
+// nonce-keyed mempool replay-protection machinery.  Stub values of 0 are
+// returned for client_id / nonce so the trait bounds are satisfied;
+// Zeus's data-chain admission uses its own logic.
 // ---------------------------------------------------------------------------
 
-// The consensus Transaction trait adds Unpin.  Attestation<Tx> is Unpin
-// by default (all fields are Unpin for any Tx: Unpin).  We add an explicit
-// impl here for clarity in the non-benchmark case.
-#[cfg(not(feature = "benchmark"))]
-impl<Tx> crate::types::Transaction for Attestation<Tx> where Tx: crate::types::Transaction {}
-
-#[cfg(feature = "benchmark")]
 impl<Tx> crate::types::Transaction for Attestation<Tx>
 where
     Tx: crate::types::Transaction,
 {
+    fn client_id(&self) -> crate::Id {
+        0
+    }
+
+    fn nonce(&self) -> u64 {
+        0
+    }
+
     fn is_sample(&self) -> bool {
-        // Attestations are not sampled transactions.
         false
     }
 

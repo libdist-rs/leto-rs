@@ -508,6 +508,7 @@ where
                 .tx_consensus_to_batcher
                 .send(BatcherConsensusMsg::NewRound {
                     leader: initial_eleader,
+                    round: 0, // Zeus follow-up: proper round threading not yet wired
                 });
         }
 
@@ -962,7 +963,10 @@ where
         if self.my_id == eleader_fn(new_epoch, n) {
             let _ = self
                 .tx_consensus_to_batcher
-                .send(BatcherConsensusMsg::NewRound { leader: self.my_id });
+                .send(BatcherConsensusMsg::NewRound {
+                    leader: self.my_id,
+                    round: 0, // Zeus follow-up: proper round threading not yet wired
+                });
         }
 
         Ok(())

@@ -106,8 +106,7 @@ where
         // Receives committed batches and (tx_hash → SocketAddr) per-tx
         // registrations; sends Confirmation(Hash<Tx>) back per committed tx.
         tokio::spawn(async move {
-            Self::run_confirmation_router(&mut rx_tx_sender_map, &mut rx_commit_for_confirm)
-                .await;
+            Self::run_confirmation_router(&mut rx_tx_sender_map, &mut rx_commit_for_confirm).await;
         });
 
         // Spawn the client batch listener on consensus_client_port.

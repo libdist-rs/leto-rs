@@ -1,5 +1,5 @@
 use crate::{
-    server::{ChainState, Leto},
+    server::{BatcherConsensusMsg as BCM, ChainState, Leto},
     types::{Element, Transaction},
     Id, Round, START_ID,
 };
@@ -24,13 +24,14 @@ pub enum CommitMsg<Tx> {
 }
 
 pub struct CommitContext<Tx> {
-    tx_inner: UnboundedSender<CommitMsg<Tx>>,
+    pub(crate) tx_inner: UnboundedSender<CommitMsg<Tx>>,
 }
 
 impl<Tx> CommitContext<Tx> {
     pub fn spawn(
         store: Storage,
         tx_commit: UnboundedSender<Arc<Batch<Tx>>>,
+        tx_batcher: UnboundedSender<BCM<Id, Tx>>,
         num_nodes: usize,
         num_faults: usize,
         my_id: Id,
@@ -45,6 +46,7 @@ impl<Tx> CommitContext<Tx> {
             if let Err(e) = Self::run(
                 store,
                 tx_commit,
+                tx_batcher,
                 rx_inner,
                 num_nodes,
                 num_faults,
@@ -69,6 +71,7 @@ impl<Tx> CommitContext<Tx> {
     async fn run(
         store: Storage,
         tx_commit: UnboundedSender<Arc<Batch<Tx>>>,
+        tx_batcher: UnboundedSender<BCM<Id, Tx>>,
         mut rx_inner: UnboundedReceiver<CommitMsg<Tx>>,
         num_nodes: usize,
         num_faults: usize,
@@ -176,7 +179,19 @@ impl<Tx> CommitContext<Tx> {
                             // (b) the genesis [first n rounds]
                             // (c) commit queue [others including crash only]
                             if !connected_to_commit_queue {
-                                debug!("Replacing commit queue");
+                                debug!("Replacing commit queue (chain switch)");
+                                // Signal the batcher to roll back InFlight entries
+                                // from the rounds that are being discarded (step 10).
+                                let orphaned_rounds: Vec<Round> = commit_queue
+                                    .values()
+                                    .map(|e| e.proposal.round())
+                                    .filter(|r| *r != 0)
+                                    .collect();
+                                if !orphaned_rounds.is_empty() {
+                                    let _ = tx_batcher.send(BCM::Rollback {
+                                        rounds: orphaned_rounds,
+                                    });
+                                }
                                 let _ = std::mem::replace(
                                     &mut commit_queue,
                                     local_queue
@@ -260,6 +275,14 @@ impl<Tx> CommitContext<Tx> {
                                     committed_tx_count +=
                                         element.batch.payload.len() as u64;
                                 }
+
+                                // Signal the batcher: advance high_committed_nonce
+                                // and GC stale entries (step 9).
+                                let committed_round = element.proposal.round();
+                                let _ = tx_batcher.send(BCM::Committed {
+                                    batch: element.batch.clone(),
+                                    round: committed_round,
+                                });
 
                                 tx_commit.send(
                                     Arc::new(element.batch.clone())

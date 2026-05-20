@@ -145,11 +145,18 @@ where
             .update_highest_chain(proposal, auth, batch)
             .await?;
 
-        // Signal the batcher (txs already removed from pool by make_batch)
+        // Notify the batcher that this proposal has been admitted so it can
+        // mark the batch's txs InFlight (idempotent for the proposer's own
+        // loopback — see race Trace 8).
+        let batch_for_batcher = self.chain_state.highest_chain().batch.clone();
+        let round_for_batcher = self.chain_state.highest_chain().proposal.round();
         self.tx_consensus_to_batcher
-            .send(BCM::OptimisticClear)
+            .send(BCM::Proposed {
+                batch: batch_for_batcher,
+                round: round_for_batcher,
+            })
             .map_err(anyhow::Error::new)
-            .context("Error while sending optimistic clear")?;
+            .context("Error while sending Proposed to batcher")?;
 
         // Advance the round
         self.advance_round().await?;

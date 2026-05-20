@@ -49,6 +49,11 @@ impl Display for SimpleData {
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct SimpleTx<D> {
     pub data: D,
+    /// Client that originated this tx.
+    pub source: Id,
+    /// Per-client monotonically increasing sequence number.
+    pub nonce: u64,
+    /// Extra data for benchmark sampling (sample flag + sample_id only).
     pub extra: Vec<u8>,
 }
 
@@ -58,7 +63,11 @@ impl<D: Debug> Debug for SimpleTx<D> {
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
         let encoded = general_purpose::STANDARD.encode(&self.extra);
-        write!(f, "Tx [{:?}, {}]", self.data, &encoded)
+        write!(
+            f,
+            "Tx [{:?}, src={}, n={}, {}]",
+            self.data, self.source, self.nonce, &encoded
+        )
     }
 }
 
@@ -68,7 +77,11 @@ impl<D: Debug> Display for SimpleTx<D> {
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
         let encoded = general_purpose::STANDARD.encode(&self.extra);
-        write!(f, "Tx [{:?}, {}]", self.data, &encoded)
+        write!(
+            f,
+            "Tx [{:?}, src={}, n={}, {}]",
+            self.data, self.source, self.nonce, &encoded
+        )
     }
 }
 
@@ -83,49 +96,71 @@ where
 }
 
 impl<D: Data> Transaction for SimpleTx<D> {
-    #[cfg(feature = "benchmark")]
-    fn is_sample(&self) -> bool {
-        let extra_data: ExtraData =
-            bincode::deserialize(&self.extra).expect("Failed to deserialize");
-        extra_data.sample
+    fn client_id(&self) -> Id {
+        self.source
     }
 
-    #[cfg(feature = "benchmark")]
+    fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
+    fn is_sample(&self) -> bool {
+        #[cfg(feature = "benchmark")]
+        {
+            let extra_data: ExtraData =
+                bincode::deserialize(&self.extra).expect("Failed to deserialize");
+            extra_data.sample
+        }
+        #[cfg(not(feature = "benchmark"))]
+        {
+            false
+        }
+    }
+
     fn get_id(&self) -> u64 {
-        let extra_data: ExtraData =
-            bincode::deserialize(&self.extra).expect("Failed to deserialize");
-        extra_data.sample_id
+        #[cfg(feature = "benchmark")]
+        {
+            let extra_data: ExtraData =
+                bincode::deserialize(&self.extra).expect("Failed to deserialize");
+            extra_data.sample_id
+        }
+        #[cfg(not(feature = "benchmark"))]
+        {
+            0
+        }
     }
 }
 
 // --- ExtraData + MockTx impl (from node/src/smr/mocker.rs) ---
 
+/// Benchmark-only metadata embedded in `extra`.  Only sample flag and
+/// sample_id remain here; `source` and `nonce` are now top-level fields.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ExtraData {
-    pub source: Id,
     pub sample: bool,
     pub sample_id: u64,
-    pub tag: usize,
 }
 
 impl ExtraData {
     pub fn new(
-        tag: usize,
-        source: Id,
         sample: bool,
         sample_id: u64,
     ) -> Self {
-        Self {
-            source,
-            sample,
-            sample_id,
-            tag,
-        }
+        Self { sample, sample_id }
     }
 }
 
 impl<D: Data> MockTx for SimpleTx<D> {
-    const HEADER_SIZE: usize = 33;
+    // Wire layout (bincode):
+    //   data field    = tx_size - HEADER_SIZE bytes of payload
+    //   source (Id = usize): 8 B
+    //   nonce  (u64):        8 B
+    //   extra  (Vec<u8>):    4 B len prefix + ExtraData contents
+    // HEADER_SIZE covers the fixed-size non-data portions so that the
+    // caller can size `data` to hit exactly `tx_size` on the wire.
+    // Id (usize) = 8 B, nonce (u64) = 8 B → 16 B additional over the
+    // previous layout; old HEADER_SIZE was 33 B, new = 49 B.
+    const HEADER_SIZE: usize = 49;
 
     fn mock_transaction(
         tx_id: usize,
@@ -134,10 +169,13 @@ impl<D: Data> MockTx for SimpleTx<D> {
         sample: bool,
         sample_id: u64,
     ) -> Self {
-        let data = D::with_payload(&vec![0; tx_size - Self::HEADER_SIZE]);
-        let extra_data = ExtraData::new(tx_id, client_id, sample, sample_id);
+        let payload_size = tx_size.saturating_sub(Self::HEADER_SIZE);
+        let data = D::with_payload(&vec![0; payload_size]);
+        let extra_data = ExtraData::new(sample, sample_id);
         SimpleTx {
             data,
+            source: client_id,
+            nonce: tx_id as u64,
             extra: bincode::serialize(&extra_data).unwrap(),
         }
     }

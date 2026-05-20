@@ -4,10 +4,10 @@
 /// non-metrics node (node 1) mid-flight and asserts:
 ///
 ///   1. The remaining 3 nodes continue committing batches after the kill
-///      (proves liveness — at least N_POST_KILL batches arrive on the
-///      surviving metrics node within the observation window).
-///   2. The round counter on node 0's commit stream advances, showing
-///      the blame → BlameQC → advance_round path fired.
+///      (proves liveness — at least N_POST_KILL batches arrive on the surviving
+///      metrics node within the observation window).
+///   2. The round counter on node 0's commit stream advances, showing the blame
+///      → BlameQC → advance_round path fired.
 ///   3. No surviving node panics.
 ///
 /// The test is deterministic: all randomness is seeded by a fixed
@@ -157,8 +157,7 @@ async fn test_crash_fault_view_change() -> Result<()> {
     let mut _drain_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     for id in 0..NUM_NODES {
-        let (tx_commit, rx_commit) =
-            unbounded_channel::<Arc<Batch<SimpleTx<SimpleData>>>>();
+        let (tx_commit, rx_commit) = unbounded_channel::<Arc<Batch<SimpleTx<SimpleData>>>>();
 
         if id == 0 {
             // Node 0: feed commits into the counter task.
@@ -194,8 +193,7 @@ async fn test_crash_fault_view_change() -> Result<()> {
     }
 
     // Spawn the stressor client.
-    let client_exit_tx =
-        Stressor::<SimpleTx<SimpleData>>::spawn(CLIENT_ID, client_settings)?;
+    let client_exit_tx = Stressor::<SimpleTx<SimpleData>>::spawn(CLIENT_ID, client_settings)?;
 
     // --- Warmup: let nodes establish connections and start committing ---
     tokio::time::sleep(Duration::from_secs(WARMUP_SECS)).await;
@@ -219,7 +217,10 @@ async fn test_crash_fault_view_change() -> Result<()> {
     kill_flag.store(1, Ordering::Relaxed);
     let _kill_ts = Instant::now();
     let _ = kill_sender.send(());
-    println!("[crash-test] Killed node {}; observing for {}s", NODE_TO_KILL, POST_KILL_OBSERVATION_SECS);
+    println!(
+        "[crash-test] Killed node {}; observing for {}s",
+        NODE_TO_KILL, POST_KILL_OBSERVATION_SECS
+    );
 
     // --- Post-kill observation window ---
     tokio::time::sleep(Duration::from_secs(POST_KILL_OBSERVATION_SECS)).await;

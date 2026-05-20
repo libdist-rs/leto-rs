@@ -380,6 +380,7 @@ where
         // Let the batcher know that we are in a new round
         let batcher_msg = BCM::NewRound {
             leader: self.leader_context.leader(),
+            round: self.round_context.round(),
         };
         self.tx_consensus_to_batcher.send(batcher_msg)?;
 

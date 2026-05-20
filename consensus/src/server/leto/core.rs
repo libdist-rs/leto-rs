@@ -149,10 +149,13 @@ where
             tx_processor,
         )?;
 
-        // Start the commit context
+        // Start the commit context; give it a sender to the batcher so it can
+        // emit Committed and Rollback signals (nonce-keyed mempool steps 9-10).
+        let tx_batcher_for_commit = tx_consensus_to_batcher.clone();
         let commit_ctx = CommitContext::spawn(
             store.clone(),
             tx_commit,
+            tx_batcher_for_commit,
             settings.committee_config.num_nodes(),
             settings.committee_config.num_faults(),
             my_id,

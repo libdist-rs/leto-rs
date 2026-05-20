@@ -184,6 +184,7 @@ where
                 self.tx_consensus_to_batcher
                     .send(crate::server::BatcherConsensusMsg::NewRound {
                         leader: crate::server::zeus::chain_state::eleader(self.current_epoch, n),
+                        round: 0, // Zeus follow-up: proper round threading not yet wired
                     });
         }
 
@@ -616,6 +617,7 @@ where
                 let _ = self.tx_consensus_to_batcher.send(
                     crate::server::BatcherConsensusMsg::NewRound {
                         leader: crate::server::zeus::chain_state::eleader(self.current_epoch, n),
+                        round: 0, // Zeus follow-up: proper round threading not yet wired
                     },
                 );
             }

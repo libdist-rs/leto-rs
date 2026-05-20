@@ -1,12 +1,16 @@
 use base64::{engine::general_purpose, Engine as _};
-use consensus::types::Transaction;
+use consensus::{types::Transaction, Id};
 use serde::{Deserialize, Serialize};
 use std::fmt::{self, Debug, Display};
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct SimpleTx<Data> {
     pub data: Data,
-    /// Extra data for future extensions
+    /// Client that originated this tx.
+    pub source: Id,
+    /// Per-client monotonically increasing sequence number.
+    pub nonce: u64,
+    /// Extra data for benchmark sampling (sample flag + sample_id only).
     pub extra: Vec<u8>,
 }
 
@@ -19,7 +23,11 @@ where
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
         let encoded = general_purpose::STANDARD.encode(&self.extra);
-        write!(f, "Tx [{:?}, {}]", self.data, &encoded)
+        write!(
+            f,
+            "Tx [{:?}, src={}, n={}, {}]",
+            self.data, self.source, self.nonce, &encoded
+        )
     }
 }
 
@@ -32,7 +40,11 @@ where
         f: &mut fmt::Formatter<'_>,
     ) -> fmt::Result {
         let encoded = general_purpose::STANDARD.encode(&self.extra);
-        write!(f, "Tx [{:?}, {}]", self.data, &encoded)
+        write!(
+            f,
+            "Tx [{:?}, src={}, n={}, {}]",
+            self.data, self.source, self.nonce, &encoded
+        )
     }
 }
 
@@ -50,21 +62,37 @@ impl<Data> Transaction for SimpleTx<Data>
 where
     Data: crate::Data,
 {
-    #[cfg(feature = "benchmark")]
-    fn is_sample(&self) -> bool {
-        use crate::ExtraData;
-
-        let extra_data: ExtraData =
-            bincode::deserialize(&self.extra).expect("Failed to deserialize");
-        extra_data.sample
+    fn client_id(&self) -> Id {
+        self.source
     }
 
-    #[cfg(feature = "benchmark")]
-    fn get_id(&self) -> u64 {
-        use crate::ExtraData;
+    fn nonce(&self) -> u64 {
+        self.nonce
+    }
 
-        let extra_data: ExtraData =
-            bincode::deserialize(&self.extra).expect("Failed to deserialize");
-        extra_data.sample_id
+    fn is_sample(&self) -> bool {
+        #[cfg(feature = "benchmark")]
+        {
+            use crate::ExtraData;
+            let e: ExtraData = bincode::deserialize(&self.extra).expect("Failed to deserialize");
+            e.sample
+        }
+        #[cfg(not(feature = "benchmark"))]
+        {
+            false
+        }
+    }
+
+    fn get_id(&self) -> u64 {
+        #[cfg(feature = "benchmark")]
+        {
+            use crate::ExtraData;
+            let e: ExtraData = bincode::deserialize(&self.extra).expect("Failed to deserialize");
+            e.sample_id
+        }
+        #[cfg(not(feature = "benchmark"))]
+        {
+            0
+        }
     }
 }

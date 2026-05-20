@@ -370,10 +370,7 @@ async fn main() -> Result<()> {
                 let derived = ((rate * interval_ms) / 1000).max(1) as usize;
                 info!(
                     "Overriding txs_per_burst {} -> {} (rate={} tx/s, burst={} ms)",
-                    settings.bench_config.txs_per_burst,
-                    derived,
-                    rate,
-                    interval_ms,
+                    settings.bench_config.txs_per_burst, derived, rate, interval_ms,
                 );
                 settings.bench_config.txs_per_burst = derived;
             }

@@ -1,23 +1,24 @@
 use super::Txpool;
+use crate::{types::Transaction, Round};
 use anyhow::{anyhow, Result};
-use futures_util::StreamExt;
 use log::*;
-use mempool::{Batch, Transaction};
+use mempool::Batch;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-/// Messages sent back and forth between the consensus and the batcher
+/// Messages sent from the consensus engine to the batcher.
 #[derive(Debug)]
 pub enum BatcherConsensusMsg<Id, Tx> {
-    /// On entering a new round, notify the batcher that it may be its turn to
-    /// propose
-    NewRound { leader: Id },
-    /// On committing a batch, clear the batch
-    Commit { batch: Batch<Tx> },
-    /// Signal that a batch was received/proposed. The txs are already removed
-    /// from the pool by make_batch, so no clearing is needed.
-    OptimisticClear,
+    /// Entering a new round: the batcher may now propose if it is the leader.
+    NewRound { leader: Id, round: Round },
+    /// A proposal carrying `batch` was admitted at `round`.
+    /// Idempotent if (client,nonce) pairs are already InFlight.
+    Proposed { batch: Batch<Tx>, round: Round },
+    /// The batch committed at `round` on the canonical chain.
+    Committed { batch: Batch<Tx>, round: Round },
+    /// The chain switched away from `rounds`; orphan those InFlight entries.
+    Rollback { rounds: Vec<Round> },
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -51,13 +52,15 @@ pub struct RRBatcher<Id, Tx> {
     my_id: Id,
     /// The ID of the current leader
     current_leader: Id,
+    /// The current consensus round (needed to tag make_batch calls)
+    current_round: Round,
     /// Have we proposed in this round?
     proposed: bool,
-    /// A channel to receive messages from the mempool
+    /// A channel to receive transactions from the client listener
     rx_incoming_tx: UnboundedReceiver<(Tx, usize)>,
-    /// A channel to receive messages from the consensus
+    /// A channel to receive messages from the consensus engine
     rx_incoming_consensus: UnboundedReceiver<BatcherConsensusMsg<Id, Tx>>,
-    /// A channel to output batches
+    /// A channel to output sealed batches to the proposer
     tx_outgoing_batch: UnboundedSender<Batch<Tx>>,
     /// The in-memory mempool
     pool: Txpool<Tx>,
@@ -78,6 +81,7 @@ where
             let res = Self {
                 my_id: params.my_id,
                 current_leader: params.initial_leader,
+                current_round: 0,
                 proposed: false,
                 rx_incoming_tx,
                 rx_incoming_consensus,
@@ -99,14 +103,15 @@ where
             self.my_id, self.current_leader
         );
         loop {
+            // Poll the timer / ready flag without holding a borrow across await.
+            let can_propose = self.my_id == self.current_leader && !self.proposed;
+
             tokio::select! {
-                batch = &mut self.pool.next(), if self.my_id == self.current_leader &&
-                    !self.proposed => {
-                    // Make a batch even if we have insufficient transactions
-                    debug!("Proposing a batch");
-                    let batch = batch.ok_or_else(||
-                        anyhow!("Failed to get a batch")
-                    )?;
+                // Timer or size threshold: propose when we are the leader and
+                // haven't proposed yet this round.
+                _ = self.pool.tick_timer(), if can_propose => {
+                    debug!("Proposing a batch (timer/size)");
+                    let batch = self.pool.make_batch(self.current_round);
                     self.propose(batch)?;
                 },
                 tx = self.rx_incoming_tx.recv() => {
@@ -117,40 +122,45 @@ where
                     )?;
                     trace!("Got a transaction: {:?}", tx);
                     self.pool.add_tx(tx, tx_size);
+                    // If ready to propose, fire immediately.
+                    if can_propose && self.pool.ready() {
+                        debug!("Proposing a batch (ready)");
+                        let batch = self.pool.make_batch(self.current_round);
+                        self.propose(batch)?;
+                    }
                 },
                 msg_from_consensus = self.rx_incoming_consensus.recv() => {
-                    let msg_from_consensus = msg_from_consensus.ok_or_else(||
+                    let msg = msg_from_consensus.ok_or_else(||
                         anyhow!(
                             "Incoming msg channel has closed for the batcher. Terminating."
                         )
                     )?;
-                    match msg_from_consensus {
-                        BatcherConsensusMsg::NewRound { leader } => {
+                    match msg {
+                        BatcherConsensusMsg::NewRound { leader, round } => {
                             self.current_leader = leader;
+                            self.current_round = round;
                             self.proposed = false;
                             self.pool.reset_timer();
-                            // Check if we can propose and propose
+                            // If we are the new leader and already have enough,
+                            // propose immediately.
                             self.try_propose()?;
                         },
-                        BatcherConsensusMsg::Commit { batch } => {
-                            // Clear in-memory mempool
-                            self.pool.clear_batch(batch);
+                        BatcherConsensusMsg::Proposed { batch, round } => {
+                            self.pool.admit_proposal(&batch, round);
                         },
-                        BatcherConsensusMsg::OptimisticClear { .. } => {
-                            // No-op: the txs were already removed from the pool
-                            // by make_batch (pop_front) when the batch was sealed.
-                        }
+                        BatcherConsensusMsg::Committed { batch, round } => {
+                            self.pool.commit(&batch, round);
+                        },
+                        BatcherConsensusMsg::Rollback { rounds } => {
+                            self.pool.rollback(&rounds);
+                        },
                     }
                 }
             }
         }
     }
 
-    /// Will convert the in-memory mempool into a batch
-    /// If insufficient transactions are present, then a smaller (possibly)
-    /// empty batch is created
-    ///
-    /// Can throw errors if the sending fails
+    /// Seals and sends a batch to the proposer task.
     fn propose(
         &mut self,
         batch: Batch<Tx>,
@@ -161,11 +171,10 @@ where
             .map_err(anyhow::Error::new)
     }
 
-    /// Checks if we can propose, and proposes if we can
-    /// Called the round changes so that the new leader can immediately propose
+    /// Proposes immediately if there are enough buffered transactions.
     fn try_propose(&mut self) -> Result<()> {
-        if self.pool.ready() {
-            let batch = self.pool.make_batch();
+        if self.my_id == self.current_leader && !self.proposed && self.pool.ready() {
+            let batch = self.pool.make_batch(self.current_round);
             self.propose(batch)
         } else {
             Ok(())
