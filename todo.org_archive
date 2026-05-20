@@ -1,0 +1,62 @@
+#    -*- mode: org -*-
+
+
+Archived entries from file /Users/hermitsage/Github/leto-rs/todo.org
+
+
+* DONE Crash-fault smoke: blame→BlameQC→advance_round path verified :Leto:Correctness:Test:
+   CLOSED: [2026-05-18]
+   :PROPERTIES:
+   :ARCHIVE_TIME: 2026-05-20 Wed 09:14
+   :ARCHIVE_FILE: ~/Github/leto-rs/todo.org
+   :ARCHIVE_OLPATH: Leto view-change test findings (2026-05-18)
+   :ARCHIVE_CATEGORY: todo
+   :ARCHIVE_TODO: DONE
+   :END:
+   Test path: Option B (in-process Rust test).
+   File: node/src/test/server/crash_fault_test.rs (test_crash_fault_view_change).
+
+   4 nodes spawned in-process, 1 Stressor client.  Node 1 killed after 6s
+   warmup (node 0 is metrics node, stays up).  Results across 2 runs:
+   - Pre-kill commits (node 0, 6s): 44–46
+   - Post-kill commits (node 0, 25s window): 73–74
+   Protocol recovered cleanly.  No panics.  No bugs found in blame.rs or
+   round_context.rs.
+
+
+* DONE Zeus DP[Latency] NaN — BatchConfirmation hash mismatch :Zeus:Net:
+   CLOSED: [2026-05-18 Sun]
+   :PROPERTIES:
+   :ARCHIVE_TIME: 2026-05-20 Wed 09:15
+   :ARCHIVE_FILE: ~/Github/leto-rs/todo.org
+   :ARCHIVE_OLPATH: Known regressions (2026-05-18)
+   :ARCHIVE_CATEGORY: todo
+   :ARCHIVE_TODO: DONE
+   :END:
+   Switched from per-batch BatchConfirmation to per-tx
+   Confirmation(Hash<Tx>) for the roundtrip.  Server now hashes each
+   tx in the committed batch, looks up its originating client, and
+   sends one Confirmation per tx.  Stressor stores per-tx send_ts.
+   Verified: Zeus 68.9 ms latency, Leto 79.5 ms (was NaN).  Committed
+   in 4dfe60e.
+
+
+* DONE Zeus commit-stall in orchestrator local smoke :Zeus:Correctness:
+   CLOSED: [2026-05-18 Sun]
+   :PROPERTIES:
+   :ARCHIVE_TIME: 2026-05-20 Wed 09:15
+   :ARCHIVE_FILE: ~/Github/leto-rs/todo.org
+   :ARCHIVE_OLPATH: Known regressions (2026-05-18)
+   :ARCHIVE_CATEGORY: todo
+   :ARCHIVE_TODO: DONE
+   :END:
+   Root cause: eleader proposed empty data blocks on every batcher
+   tick (libmempool seals on batch_timeout even with no txs).  Every
+   committed payload was empty → counter stayed 0.  Sig-chain commit
+   machinery was working all along (~400 FIRING events confirmed via
+   instrumentation).  Fix: on_eleader_propose drops empty batches
+   before they reach the chain (consensus/src/server/zeus/phases/data.rs).
+   Verified: Zeus orchestrator smoke now produces 9.8k tx/s real
+   throughput.  No regression on Leto (still 39k tx/s).
+   Committed in 27e0f16.
+
