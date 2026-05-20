@@ -46,6 +46,16 @@ struct Args {
     #[arg(long, default_value = "latency_s_count")]
     throughput_metric: String,
 
+    /// Filter the `latency_s` histogram by a single `workload` label
+    /// value.  Mysticeti emits two label series ("owned" via fast-path
+    /// and "shared" via consensus); both count every committed tx, so
+    /// summing them double-counts.  "shared" is the consensus-committed
+    /// rate and matches what the Mysticeti orchestrator reports as
+    /// system throughput.  Pass "" to disable filtering (sum across all
+    /// labels — only correct if the histogram has no `workload` label).
+    #[arg(long, default_value = "shared")]
+    workload_label: String,
+
     /// Metric name carrying the commit-latency histogram.
     /// Mysticeti uses `latency_s` (seconds; histogram).
     /// We read the p50 quantile bucket; pass --latency-quantile to
@@ -86,9 +96,15 @@ fn main() -> Result<()> {
         match scrape(&client, &args.metrics_url) {
             Ok(scrape) => {
                 let now = Instant::now();
+                let label_filter = if args.workload_label.is_empty() {
+                    None
+                } else {
+                    Some(args.workload_label.as_str())
+                };
                 if let Some(throughput) = compute_throughput(
                     &scrape,
                     &args.throughput_metric,
+                    label_filter,
                     prev_count,
                     prev_time,
                     now,
@@ -98,12 +114,13 @@ fn main() -> Result<()> {
                 if let Some(latency_ms) = extract_latency_ms(
                     &scrape,
                     &args.latency_metric,
+                    label_filter,
                     args.latency_quantile,
                 ) {
                     eprintln!("DP[Latency]: {latency_ms}");
                 }
                 // Update prev counters
-                if let Some(cur) = find_counter(&scrape, &args.throughput_metric) {
+                if let Some(cur) = find_counter(&scrape, &args.throughput_metric, label_filter) {
                     prev_count = Some(cur);
                     prev_time = Some(now);
                 }
@@ -143,11 +160,16 @@ fn scrape(client: &reqwest::blocking::Client, url: &str) -> Result<Scrape> {
 /// This handles prometheus-parse's API choice to bundle histogram
 /// count/sum/buckets into a single `Value::Histogram` sample rather
 /// than emitting them as separate counter series.
-fn find_counter(scrape: &Scrape, name: &str) -> Option<f64> {
+fn find_counter(scrape: &Scrape, name: &str, workload: Option<&str>) -> Option<f64> {
     let histogram_target = name.strip_suffix("_count").unwrap_or(name);
     let mut sum = 0.0f64;
     let mut found = false;
     for sample in &scrape.samples {
+        if let Some(w) = workload {
+            if sample.labels.get("workload").map(|v| v != w).unwrap_or(false) {
+                continue;
+            }
+        }
         match &sample.value {
             Value::Counter(v) | Value::Gauge(v) | Value::Untyped(v) => {
                 if sample.metric == name {
@@ -182,11 +204,12 @@ fn find_counter(scrape: &Scrape, name: &str) -> Option<f64> {
 fn compute_throughput(
     scrape: &Scrape,
     metric: &str,
+    workload: Option<&str>,
     prev_count: Option<f64>,
     prev_time: Option<Instant>,
     now: Instant,
 ) -> Option<f64> {
-    let current = find_counter(scrape, metric)?;
+    let current = find_counter(scrape, metric, workload)?;
     let (prev_c, prev_t) = match (prev_count, prev_time) {
         (Some(c), Some(t)) => (c, t),
         _ => return None, // first scrape — no baseline
@@ -209,7 +232,12 @@ fn compute_throughput(
 /// cumulative count exceeds `quantile × total`.
 ///
 /// Assumes the histogram unit is seconds; converts to ms in the return.
-fn extract_latency_ms(scrape: &Scrape, metric: &str, quantile: f64) -> Option<f64> {
+fn extract_latency_ms(
+    scrape: &Scrape,
+    metric: &str,
+    workload: Option<&str>,
+    quantile: f64,
+) -> Option<f64> {
     // Aggregate buckets across all label sets that match this metric.
     // Map le → summed-count.
     let mut bucket_sum: std::collections::BTreeMap<u64, f64> = std::collections::BTreeMap::new();
@@ -218,6 +246,11 @@ fn extract_latency_ms(scrape: &Scrape, metric: &str, quantile: f64) -> Option<f6
     for sample in &scrape.samples {
         if sample.metric != metric {
             continue;
+        }
+        if let Some(w) = workload {
+            if sample.labels.get("workload").map(|v| v != w).unwrap_or(false) {
+                continue;
+            }
         }
         if let Value::Histogram(entries) = &sample.value {
             found = true;
