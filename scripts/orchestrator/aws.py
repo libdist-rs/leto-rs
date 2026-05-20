@@ -227,3 +227,47 @@ def destroy() -> None:
     ec2.terminate_instances(InstanceIds=ids)
     save_state({"instances": [], "region": region})
     print(f"destroy initiated for {len(ids)} instance(s)")
+
+
+def scale_down(target_nodes: int, target_clients: int) -> int:
+    """Terminate excess instances beyond `target_nodes` + `target_clients`.
+
+    Used by reverse-scaling sweeps: provision the largest cluster once,
+    run the largest-t row, then incrementally trim the cluster as t
+    shrinks so idle hosts stop billing.
+
+    Preserves the first `target_nodes` node instances and the first
+    `target_clients` client instances (the same ones bench.py uses
+    when only the leading N hosts of the cluster are needed for a
+    given t).  Returns the number of instances terminated.  Idempotent.
+    """
+    s = load_state()
+    instances = s.get("instances", [])
+    nodes = [i for i in instances if i.get("role") == "node"]
+    clients = [i for i in instances if i.get("role") == "client"]
+
+    keep_nodes = nodes[:target_nodes]
+    keep_clients = clients[:target_clients]
+    terminate = nodes[target_nodes:] + clients[target_clients:]
+
+    if not terminate:
+        print(
+            f"scale_down: cluster already at {len(nodes)} nodes + "
+            f"{len(clients)} clients (target {target_nodes}n + "
+            f"{target_clients}c); nothing to do"
+        )
+        return 0
+
+    region = s.get("region", DEFAULT_REGION)
+    ec2 = _ec2_client(region)
+    ids = [i["instance_id"] for i in terminate]
+    ec2.terminate_instances(InstanceIds=ids)
+
+    s["instances"] = keep_nodes + keep_clients
+    save_state(s)
+
+    print(
+        f"scale_down: terminated {len(terminate)} instance(s); kept "
+        f"{len(keep_nodes)} nodes + {len(keep_clients)} clients"
+    )
+    return len(terminate)

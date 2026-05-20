@@ -370,19 +370,28 @@ def install_remote(
     # --- per-protocol clone + checkout (skipped if cache hit) ---
     from orchestrator import binstore
     _, cf = _fabric_imports()
+    # Node 0's private IP is needed for the intra-AWS HTTP fanout.
+    # Connection objects only know the public IP; pull the private IP
+    # from the persisted aws.json state, ordered nodes-first to match
+    # `_connections`.
+    instances = state.get("instances", [])
+    ordered_instances = (
+        [i for i in instances if i.get("role") == "node"]
+        + [i for i in instances if i.get("role") == "client"]
+    )
+    node0_private_ip = ordered_instances[0]["private_ip"] if ordered_instances else None
     for proto in protocols:
         if binstore.is_cached(proto):
-            # Cache hit: push the cached tarball to every host and untar.
-            # Skip the clone — we don't need source for protocols whose
-            # binaries we'll just deploy verbatim.
+            # Cache hit: fan out via node 0 over the AWS internal network.
+            # One upload over the home uplink + N-1 curls inside the VPC
+            # is ~20× faster than N parallel SFTP streams from home.
             print(
                 f"[install] CACHE HIT {proto.name}@{proto.git_sha[:7]} — "
-                f"pushing binaries to {len(conns)} hosts"
+                f"upload to node 0 + fan out to {len(conns) - 1} hosts"
             )
-            def _push(c, p=proto):
-                binstore.push_to_host(c, p, REMOTE_ROOT)
-            with cf.ThreadPoolExecutor(max_workers=max(1, len(conns))) as ex:
-                list(ex.map(_push, conns))
+            binstore.fanout_from_node0(
+                conns[0], conns[1:], proto, REMOTE_ROOT, node0_private_ip
+            )
             continue
 
         target = f"{REMOTE_ROOT}/repos/{proto.name}"
@@ -643,8 +652,16 @@ def launch_remote(
         print(f"[launch] {protocol.name} is self-contained (no config push)")
 
     # --- launch nodes in detached tmux ---
-    print(f"[launch] starting {n} {protocol.name} nodes")
-    for i, c in enumerate(node_conns):
+    # Mysticeti dry-run special case: all authorities must share localhost
+    # (their network table is hardcoded to 127.0.0.1:1500+i). Run ALL
+    # authorities on node_conns[0] in separate tmux windows; the other
+    # node hosts sit idle.
+    mysticeti_single_host = protocol.name == "mysticeti"
+    print(f"[launch] starting {n} {protocol.name} nodes"
+          + (" (all on host-0; dry-run mode)" if mysticeti_single_host else ""))
+    for i in range(n):
+        # For mysticeti, always use node_conns[0]; for others, node_conns[i].
+        c = node_conns[0] if mysticeti_single_host else node_conns[i]
         # Build per-protocol substitution dict with ALL keys that any
         # node_run_cmd template may reference (missing keys surface as
         # KeyError at format time — preferable to silent wrong output).
@@ -662,20 +679,43 @@ def launch_remote(
         node_cmd = protocol.node_run_cmd.format(**node_subs)
         log_path = f"{log_remote}/node-{i}.log"
         # tmux -d detaches; the inner bash -c wrap keeps the pipe redirect.
-        cmd = (
-            f"source $HOME/.cargo/env 2>/dev/null; "
-            f"tmux new-session -d -s {TMUX_SESSION} "
-            f"-n node-{i} bash -c "
-            f"{shlex.quote(node_cmd + ' > ' + log_path + ' 2>&1')}"
-        )
+        # For nodes 1..n-1, use new-window inside the existing session
+        # (session already created by node 0 on this host for mysticeti).
+        if mysticeti_single_host and i > 0:
+            cmd = (
+                f"source $HOME/.cargo/env 2>/dev/null; "
+                f"tmux new-window -t {TMUX_SESSION} -n node-{i} "
+                f"bash -c "
+                f"{shlex.quote(node_cmd + ' > ' + log_path + ' 2>&1')}"
+            )
+        else:
+            cmd = (
+                f"source $HOME/.cargo/env 2>/dev/null; "
+                f"tmux new-session -d -s {TMUX_SESSION} "
+                f"-n node-{i} bash -c "
+                f"{shlex.quote(node_cmd + ' > ' + log_path + ' 2>&1')}"
+            )
         c.run(cmd)
 
     # Give nodes a moment to bind before launching clients.
     time.sleep(2)
 
+    # Per-protocol client count: apollo/artemis are single-client by
+    # design (client.json hardcodes my_id: 0); mysticeti generates its
+    # own load internally. Mirror the effective_clients logic from
+    # launch_local so remote runs don't try to launch a second apollo
+    # client with the same my_id on a different host.
+    if protocol.name in ("apollo", "artemis"):
+        effective_num_clients = 1
+    elif protocol.name == "mysticeti":
+        effective_num_clients = 0
+    else:
+        effective_num_clients = num_clients
+    effective_client_conns = client_conns[:effective_num_clients]
+
     # --- launch clients ---
-    print(f"[launch] starting {num_clients} {protocol.name} clients")
-    for i, c in enumerate(client_conns):
+    print(f"[launch] starting {effective_num_clients} {protocol.name} clients")
+    for i, c in enumerate(effective_client_conns):
         client_id = n + i
         client_cmd = protocol.client_run_cmd.format(
             bin_dir=bin_dir,
@@ -712,9 +752,16 @@ def launch_remote(
             extra="",
         )
         sidecar_log = f"{log_remote}/sidecar.log"
+        # Use new-session if no leto-bench session exists yet, otherwise
+        # new-window (safe when mysticeti already created the session).
         node_conns[0].run(
-            f"tmux new-session -d -s {TMUX_SESSION} -n sidecar bash -c "
-            f"{shlex.quote(sidecar_cmd + ' > ' + sidecar_log + ' 2>&1')}",
+            f"if tmux has-session -t {TMUX_SESSION} 2>/dev/null; then "
+            f"  tmux new-window -t {TMUX_SESSION} -n sidecar bash -c "
+            f"  {shlex.quote(sidecar_cmd + ' > ' + sidecar_log + ' 2>&1')}; "
+            f"else "
+            f"  tmux new-session -d -s {TMUX_SESSION} -n sidecar bash -c "
+            f"  {shlex.quote(sidecar_cmd + ' > ' + sidecar_log + ' 2>&1')}; "
+            f"fi",
             warn=True,
         )
 
@@ -735,8 +782,10 @@ def launch_remote(
     print(f"[launch] fetching {protocol.name} logs to {log_dir}")
     def _fetch_node_log(idx_and_conn):
         i, c = idx_and_conn
+        # For mysticeti, all logs live on node_conns[0].
+        fetch_conn = node_conns[0] if mysticeti_single_host else c
         try:
-            c.get(f"{log_remote}/node-{i}.log", str(log_dir / f"node-{i}.log"))
+            fetch_conn.get(f"{log_remote}/node-{i}.log", str(log_dir / f"node-{i}.log"))
         except Exception as e:
             print(f"  warn: fetch node-{i}.log failed: {e}")
 
@@ -751,9 +800,18 @@ def launch_remote(
         except Exception as e:
             print(f"  warn: fetch client-{client_id}.log failed: {e}")
 
-    with cf.ThreadPoolExecutor(max_workers=max(1, len(conns))) as ex:
-        list(ex.map(_fetch_node_log, enumerate(node_conns)))
-        list(ex.map(_fetch_client_log, enumerate(client_conns)))
+    if mysticeti_single_host:
+        # All mysticeti node logs live on node_conns[0].  Fabric
+        # Connection is NOT thread-safe for concurrent SFTP — fetch
+        # sequentially to avoid connection corruption and hangs.
+        for pair in enumerate(node_conns):
+            _fetch_node_log(pair)
+        for pair in enumerate(effective_client_conns):
+            _fetch_client_log(pair)
+    else:
+        with cf.ThreadPoolExecutor(max_workers=max(1, len(conns))) as ex:
+            list(ex.map(_fetch_node_log, enumerate(node_conns)))
+            list(ex.map(_fetch_client_log, enumerate(effective_client_conns)))
 
     if protocol.sidecar_run_cmd:
         try:

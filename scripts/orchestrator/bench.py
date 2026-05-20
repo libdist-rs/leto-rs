@@ -61,6 +61,11 @@ def run_sweep(cfg: SweepConfig, total_txs: int = 0, window: int = 0) -> Path:
         "runs": [],
     }
     samples: list[parse.Sample] = []
+    # Open results.jsonl up front and append per-run so a long sweep is
+    # tailable in real time. Final `parse.write_jsonl` at the end is a
+    # full rewrite for consistency (dedups partial-write rows on rerun).
+    out_jsonl = out_root / "results.jsonl"
+    out_jsonl.touch()
 
     # For AWS runs, load the instance list once so every iteration can
     # build a real-IP committee without re-reading state.json each time.
@@ -112,46 +117,66 @@ def run_sweep(cfg: SweepConfig, total_txs: int = 0, window: int = 0) -> Path:
         # smoke shows 5_000 works for apollo-class protocols at n=4.
         effective_window = window or max(5_000, load // 10)
 
-        if cfg.target == "local":
-            deploy.kill_session()
-            deploy.launch_local(
-                protocol=protocol,
-                config_dir=config_dir,
-                n=n,
-                num_clients=num_clients,
-                log_dir=run_dir,
-                rate=load,
-                total_txs=effective_total_txs,
-                window=effective_window,
-            )
-            # launch_local is non-blocking — sleep for the run window
-            # here, then kill the session.
-            time.sleep(cfg.warmup_secs + cfg.measure_secs)
-            deploy.kill_session()
-        else:
-            if not cfg.ssh_key_path:
-                raise ValueError(
-                    "target='aws' requires ssh_key_path in SweepConfig"
+        # Wrap each run in try/except so a transient failure (laptop
+        # network flip, mid-run SSH RST, ephemeral AWS hiccup) costs
+        # exactly one row instead of killing the whole 4-hour sweep.
+        # Local-mode failures are also captured; the cost of a missed
+        # row is the same in both targets.
+        try:
+            if cfg.target == "local":
+                deploy.kill_session()
+                deploy.launch_local(
+                    protocol=protocol,
+                    config_dir=config_dir,
+                    n=n,
+                    num_clients=num_clients,
+                    log_dir=run_dir,
+                    rate=load,
+                    total_txs=effective_total_txs,
+                    window=effective_window,
                 )
-            # Remote launch is blocking: it sleeps warmup+measure inside
-            # launch_remote and tears down + fetches logs before
-            # returning.  No extra sleep needed in the caller.
-            from orchestrator import aws as _aws
-            state = _aws.load_state()
-            deploy.launch_remote(
-                state=state,
-                protocol=protocol,
-                config_dir=config_dir,
-                n=n,
-                num_clients=num_clients,
-                log_dir=run_dir,
-                rate=load,
-                total_txs=effective_total_txs,
-                window=effective_window,
-                ssh_key_path=cfg.ssh_key_path,
-                warmup_secs=cfg.warmup_secs,
-                measure_secs=cfg.measure_secs,
+                # launch_local is non-blocking — sleep for the run window
+                # here, then kill the session.
+                time.sleep(cfg.warmup_secs + cfg.measure_secs)
+                deploy.kill_session()
+            else:
+                if not cfg.ssh_key_path:
+                    raise ValueError(
+                        "target='aws' requires ssh_key_path in SweepConfig"
+                    )
+                # Remote launch is blocking: it sleeps warmup+measure inside
+                # launch_remote and tears down + fetches logs before
+                # returning.  No extra sleep needed in the caller.
+                from orchestrator import aws as _aws
+                state = _aws.load_state()
+                deploy.launch_remote(
+                    state=state,
+                    protocol=protocol,
+                    config_dir=config_dir,
+                    n=n,
+                    num_clients=num_clients,
+                    log_dir=run_dir,
+                    rate=load,
+                    total_txs=effective_total_txs,
+                    window=effective_window,
+                    ssh_key_path=cfg.ssh_key_path,
+                    warmup_secs=cfg.warmup_secs,
+                    measure_secs=cfg.measure_secs,
+                )
+        except Exception as e:
+            print(
+                f"  ! {protocol_name} n={n} f={t} load={load} trial={trial}: "
+                f"LAUNCH FAILED — {type(e).__name__}: {e}"
             )
+            with (out_root / "errors.log").open("a") as ef:
+                ef.write(
+                    f"{datetime.utcnow().isoformat()} {run_id} "
+                    f"{type(e).__name__}: {e}\n"
+                )
+            # The next run's launch_remote starts with `tmux kill-session`
+            # on every host (deploy.py:540), so leftover processes from a
+            # crashed run get cleaned up automatically. Carry on.
+            continue
 
         manifest["runs"].append({
             "protocol": protocol_name,
@@ -172,9 +197,18 @@ def run_sweep(cfg: SweepConfig, total_txs: int = 0, window: int = 0) -> Path:
         )
         if sample is not None:
             samples.append(sample)
+            with out_jsonl.open("a") as f:
+                f.write(json.dumps(asdict(sample)) + "\n")
+            print(
+                f"  → {protocol_name} n={n} f={t} load={load} trial={trial}: "
+                f"thr={sample.throughput:.0f} tx/s  lat={sample.latency_ms:.1f} ms"
+            )
+        else:
+            print(
+                f"  → {protocol_name} n={n} f={t} load={load} trial={trial}: NO DP[] PARSED"
+            )
 
     (out_root / "manifest.json").write_text(json.dumps(manifest, indent=2))
-    out_jsonl = out_root / "results.jsonl"
     count = parse.write_jsonl(samples, out_jsonl)
     print(f"sweep complete: {count} samples → {out_jsonl}")
     return out_jsonl

@@ -1,0 +1,76 @@
+# Scalability sweep: 5 protocols × t ∈ {1,2,5,10,20} × 1 saturating load × 3 trials.
+#
+# n = 3t+1 ∈ {4, 7, 16, 31, 61}; clients ⌈n/3⌉ ∈ {2, 3, 6, 11, 21}.
+# Largest cluster (t=20): 61 nodes + 21 clients = 82 hosts × 2 vCPU = 164 vCPU.
+# Fits comfortably under the us-west-2 quota of 300.
+#
+# Reverse-scaling strategy: provision the LARGEST cluster (t=20, 82 hosts)
+# once, run t=20, then trim the cluster as t shrinks so idle hosts stop
+# billing.  Sequence:
+#
+#   provision 82  →  run t=20  →  scale down to 42  →  run t=10  →
+#   scale down to 22  →  run t=5  →  scale down to 10  →  run t=2  →
+#   scale down to 6   →  run t=1  →  destroy
+#
+# Saves ~$3 vs running every t on the full 82-host cluster.  Wall ~3 h
+# total, cost ~$3-4.
+#
+# Run end-to-end:
+#   fab run --config experiments/scalability.toml
+#
+# Or run any single step:
+#   fab provision --config experiments/scalability.toml
+#   fab install   --config experiments/scalability.toml
+#   fab scaling   --config experiments/scalability.toml
+#   fab plot      --config experiments/scalability.toml --x-axis n
+#   fab destroy   --config experiments/scalability.toml
+#
+# Each scaling phase produces its own results dir tagged `scaling-v1-t<N>`;
+# `fab plot --tag scaling-v1` picks the latest.  To aggregate across all t
+# phases, manually concat the per-phase results.jsonl files.
+
+[meta]
+tag = "scaling-v1"
+steps = ["provision", "install", "build", "smoke", "scaling", "plot", "destroy"]
+
+[aws]
+key_name           = "leto-bench"
+security_group_id  = "sg-00e60e97deb4c41cc"
+subnet_id          = "subnet-0e31e6c0b1430bdc2"
+ssh_key_path       = "~/.ssh/leto-bench.pem"
+instance_type      = "c8g.large"
+az                 = "us-west-2d"
+spot               = false
+# 61 nodes + 21 clients = 82 hosts (largest t=20 point).
+num_nodes          = 61
+num_clients        = 21
+root_volume_gb     = 30
+
+[install]
+protocols = ["apollo", "artemis", "leto", "zeus", "mysticeti"]
+
+[build]
+protocols = ["apollo", "artemis", "leto", "zeus", "mysticeti"]
+
+[smoke]
+# Validate the cluster end-to-end at the smallest scale (n=4) before
+# burning hours on the full t sweep.
+protocol = "leto"
+rate     = 2000
+duration = 30
+
+[bench]
+protocols    = ["apollo", "artemis", "leto", "zeus", "mysticeti"]
+t_values     = [1, 2, 5, 10, 20]
+# Single saturating load per row; each protocol is expected to absorb
+# 50 k tx/s offered and report whatever its actual sustained throughput is.
+# (Open-loop protocols treat this as offered; closed-loop apollo/artemis
+# ignore --rate and burst at saturation.)
+loads        = [50000]
+runs         = 3
+warmup_secs  = 10
+measure_secs = 110
+
+[plot]
+# Scaling figure: x = n, y = throughput, one line per protocol.
+x_axis = "n"

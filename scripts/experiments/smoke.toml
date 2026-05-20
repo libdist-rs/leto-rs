@@ -1,0 +1,23 @@
+# Wiring-validation experiment: 1 protocol, 1 load, 1 trial, short window.
+# Useful after `provision`+`install`+`build` to confirm the cluster works
+# before kicking off a multi-hour sweep.
+#
+#   fab run --config experiments/smoke.toml
+
+[meta]
+tag = "smoke-v1"
+steps = ["smoke"]
+
+[aws]
+key_name           = "leto-bench"
+security_group_id  = "sg-00e60e97deb4c41cc"
+subnet_id          = "subnet-0e31e6c0b1430bdc2"
+ssh_key_path       = "~/.ssh/leto-bench.pem"
+instance_type      = "c8g.xlarge"
+num_nodes          = 4
+num_clients        = 2
+
+[smoke]
+protocol = "leto"
+rate     = 2000
+duration = 30

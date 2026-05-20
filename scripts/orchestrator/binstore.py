@@ -35,8 +35,10 @@ naturally.
 
 from __future__ import annotations
 
+import concurrent.futures as cf
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -90,6 +92,11 @@ def push_to_host(conn, protocol: "Protocol", remote_root: str) -> bool:
     untar into `<remote_root>/bin/<protocol>/`.
 
     Returns True if the cache was used, False if no entry existed.
+
+    Note: SFTP from a home network is single-stream and uplink-bound.
+    For multi-host distribution prefer `fanout_from_node0` which uploads
+    once to node 0 over the home uplink and then fans out over the AWS
+    internal network.
     """
     src = cache_path(protocol.name, protocol.git_sha)
     if not src.exists():
@@ -102,6 +109,96 @@ def push_to_host(conn, protocol: "Protocol", remote_root: str) -> bool:
         f"&& rm -f {remote_tar}",
         hide=True,
     )
+    return True
+
+
+def fanout_from_node0(
+    c0,
+    others: list,
+    protocol: "Protocol",
+    remote_root: str,
+    node0_private_ip: str,
+) -> bool:
+    """Distribute the cached tarball to a whole cluster efficiently.
+
+    Strategy:
+      1. SFTP-upload the local cache tarball to node 0 (one upload over
+         the user's home uplink — the only slow leg).
+      2. Untar on node 0 into `<remote_root>/bin/<protocol>/`.
+      3. Start a one-shot `python3 -m http.server` on node 0 in a tmux
+         session, serving the tarball to the AWS internal network.
+      4. Have every other host `curl` the tarball over the same-AZ AWS
+         backbone (~5 Gbps, sub-second per ~100 MB), untar, delete.
+      5. Tear down the http server on node 0.
+
+    Requires the cluster's security group to allow intra-SG traffic on
+    the chosen port (the leto-bench SG opens all intra-SG traffic).
+
+    Returns True on cache hit + successful fanout; False if no cache
+    entry exists for this (protocol, sha).
+    """
+    src = cache_path(protocol.name, protocol.git_sha)
+    if not src.exists():
+        return False
+
+    remote_tar = f"/tmp/{protocol.name}-bin.tar.gz"
+    # Step 1 — single upload from home uplink → node 0.
+    c0.put(str(src), remote_tar)
+    # Step 2 — untar on node 0.
+    c0.run(
+        f"mkdir -p {remote_root}/bin "
+        f"&& tar xzf {remote_tar} -C {remote_root}/bin",
+        hide=True,
+    )
+
+    if not others:
+        c0.run(f"rm -f {remote_tar}", hide=True)
+        return True
+
+    # Stable per-protocol port (avoids collisions if two fanouts ever
+    # overlap, though install_remote runs them serially).
+    port = 18000 + (sum(ord(ch) for ch in protocol.name) % 100)
+    serve_dir = f"/tmp/binstore_{protocol.name}_serve"
+    session = f"binstore-{protocol.name}"
+
+    # Step 3 — move tarball into a clean serve dir + start http.server
+    # under tmux so we can kill it reliably afterwards.
+    c0.run(
+        f"rm -rf {serve_dir} && mkdir -p {serve_dir} && "
+        f"mv {remote_tar} {serve_dir}/bin.tar.gz && "
+        f"tmux kill-session -t {session} 2>/dev/null || true; "
+        f"tmux new-session -d -s {session} -n http "
+        f"'cd {serve_dir} && python3 -m http.server {port}'",
+        hide=True,
+    )
+    # Give python3 a moment to bind the socket.
+    time.sleep(1)
+
+    # Step 4 — fan out over AWS internal network in parallel.
+    def _fetch(c):
+        c.run(
+            f"curl -sSf --retry 5 --retry-delay 1 "
+            f"http://{node0_private_ip}:{port}/bin.tar.gz "
+            f"-o /tmp/{protocol.name}-bin.tar.gz && "
+            f"mkdir -p {remote_root}/bin && "
+            f"tar xzf /tmp/{protocol.name}-bin.tar.gz -C {remote_root}/bin && "
+            f"rm -f /tmp/{protocol.name}-bin.tar.gz",
+            hide=True,
+        )
+
+    try:
+        with cf.ThreadPoolExecutor(max_workers=max(1, len(others))) as ex:
+            list(ex.map(_fetch, others))
+    finally:
+        # Step 5 — always clean up the http server + serve dir, even on
+        # partial failure, so a retried run isn't blocked by a stale port.
+        c0.run(
+            f"tmux kill-session -t {session} 2>/dev/null || true; "
+            f"rm -rf {serve_dir}",
+            hide=True,
+            warn=True,
+        )
+
     return True
 
 

@@ -1,0 +1,55 @@
+# Pareto headline experiment: 5 protocols × 8 loads × 3 trials at n=4.
+#
+# Run end-to-end with:
+#   fab run --config experiments/pareto.toml
+#
+# Or run any single step:
+#   fab provision --config experiments/pareto.toml
+#   fab install   --config experiments/pareto.toml
+#   fab bench     --config experiments/pareto.toml
+#   fab plot      --config experiments/pareto.toml
+#   fab destroy   --config experiments/pareto.toml
+#
+# CLI flags override config values, e.g.:
+#   fab bench --config experiments/pareto.toml --runs 1
+
+[meta]
+tag = "pareto-v2"
+# Steps executed in order by `fab run`. Comment out to skip.
+steps = ["provision", "install", "build", "smoke", "bench", "plot", "destroy"]
+
+[aws]
+# Cluster-wide settings reused by provision/install/build/smoke/bench/destroy.
+key_name           = "leto-bench"
+security_group_id  = "sg-00e60e97deb4c41cc"
+subnet_id          = "subnet-0e31e6c0b1430bdc2"
+ssh_key_path       = "~/.ssh/leto-bench.pem"
+instance_type      = "c8g.large"   # homogeneous across Pareto + scalability figures
+az                 = "us-west-2d"
+spot               = false
+num_nodes          = 4
+num_clients        = 2
+root_volume_gb     = 30
+
+[install]
+protocols = ["apollo", "artemis", "leto", "zeus", "mysticeti"]
+
+[build]
+protocols = ["apollo", "artemis", "leto", "zeus", "mysticeti"]
+
+[smoke]
+# Quick wiring validation before the full sweep.
+protocol = "leto"
+rate     = 2000
+duration = 30
+
+[bench]
+protocols    = ["apollo", "artemis", "leto", "zeus", "mysticeti"]
+t_values     = [1]
+loads        = [1000, 2500, 5000, 10000, 25000, 50000, 100000, 200000]
+runs         = 3
+warmup_secs  = 10
+measure_secs = 110
+
+[plot]
+x_axis = "throughput"

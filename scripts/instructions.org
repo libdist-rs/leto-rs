@@ -1,0 +1,406 @@
+#+TITLE: Leto Multi-Protocol Benchmark — Operating Instructions
+#+OPTIONS: toc:2 num:t
+
+* Overview
+
+End-to-end runbook for the leto-rs multi-protocol AWS benchmark
+orchestrator.  Drives 5 protocols (apollo, artemis, leto, zeus,
+mysticeti) through provision → install → build → smoke → bench → plot
+→ destroy, with a TOML-config-driven workflow.
+
+Working directory for every command: =~/Github/leto-rs/scripts=.
+
+* Prerequisites (one-time)
+
+** Tooling
+- Python 3.11+ (=tomllib= stdlib required); 3.13 known-working.
+- =pip install fabric paramiko boto3 matplotlib= (already in
+  =pyproject.toml=).
+- AWS CLI v2 + credentials configured in =~/.aws/= (the
+  =macbook-personal= IAM user is what we've been using).
+
+** SSH key
+The shared key for every cluster is =~/.ssh/leto-bench.pem=.  To derive
+the matching public key (needed when bootstrapping a new region):
+
+#+BEGIN_SRC bash
+ssh-keygen -y -f ~/.ssh/leto-bench.pem > ~/.ssh/leto-bench.pub
+chmod 644 ~/.ssh/leto-bench.pub
+#+END_SRC
+
+** vCPU quota check
+The standard-instance quota (L-1216C47A) caps total running vCPUs per
+region.  Survey US regions:
+
+#+BEGIN_SRC bash
+for region in us-east-1 us-east-2 us-west-1 us-west-2; do
+  VAL=$(aws service-quotas get-service-quota --region "$region" \
+    --service-code ec2 --quota-code L-1216C47A \
+    --query 'Quota.Value' --output text 2>/dev/null)
+  echo "$region : ${VAL:-?} vCPU"
+done
+#+END_SRC
+
+Request an increase:
+
+#+BEGIN_SRC bash
+aws service-quotas request-service-quota-increase --region <REGION> \
+  --service-code ec2 --quota-code L-1216C47A --desired-value <N>
+#+END_SRC
+
+Check the status of a pending request:
+
+#+BEGIN_SRC bash
+aws service-quotas list-requested-service-quota-change-history \
+  --region <REGION> --service-code ec2 \
+  --query 'RequestedQuotas[?QuotaCode==`L-1216C47A`].[Created,Status,DesiredValue]' \
+  --output table
+#+END_SRC
+
+** vCPU planning
+Per scalability point (t → n=3t+1, ⌈n/3⌉ clients):
+
+| t  | n  | hosts | c8g.large vCPU | c8g.xlarge vCPU |
+|----+----+-------+----------------+-----------------|
+|  1 |  4 |     6 |             12 |              24 |
+|  2 |  7 |    10 |             20 |              40 |
+|  5 | 16 |    22 |             44 |              88 |
+| 10 | 31 |    42 |             84 |             168 |
+| 20 | 61 |    82 |            164 |             328 |
+
+Current state (us-west-2): **300 vCPU**.  Fits everything at c8g.large
+(homogeneous instance type) including n=61.  c8g.xlarge at n=61 needs
+328 vCPU; would require another bump.
+
+* One-time region bootstrap
+
+When using a brand-new region (no SG, no key), bootstrap once.
+Replace =<REGION>= and =<AZ>= as appropriate.
+
+** Identify a default-VPC subnet in the chosen AZ
+#+BEGIN_SRC bash
+aws ec2 describe-subnets --region <REGION> \
+  --filters "Name=default-for-az,Values=true" \
+  --query 'Subnets[].[AvailabilityZone,SubnetId,VpcId,CidrBlock]' --output table
+#+END_SRC
+Note the =SubnetId= for your =<AZ>= and the =VpcId=.
+
+** Import the SSH public key into the region
+#+BEGIN_SRC bash
+aws ec2 import-key-pair --region <REGION> \
+  --key-name leto-bench \
+  --public-key-material fileb://$HOME/.ssh/leto-bench.pub
+#+END_SRC
+
+** Create the security group
+#+BEGIN_SRC bash
+SG_ID=$(aws ec2 create-security-group --region <REGION> \
+  --group-name leto-bench --description "leto-bench cluster" \
+  --vpc-id <VPC_ID> --query 'GroupId' --output text)
+echo "SG_ID=$SG_ID"
+#+END_SRC
+
+** Add ingress rules
+SSH from your home IP, and intra-SG all-traffic (so cluster nodes can
+talk to each other on any port — used by libnet-rs ports 18000+,
+mysticeti 1500+, binstore HTTP fanout 18000+).
+
+#+BEGIN_SRC bash
+MYIP=$(curl -s https://checkip.amazonaws.com)
+aws ec2 authorize-security-group-ingress --region <REGION> \
+  --group-id $SG_ID --protocol tcp --port 22 --cidr ${MYIP}/32
+
+aws ec2 authorize-security-group-ingress --region <REGION> \
+  --group-id $SG_ID --ip-permissions \
+  "IpProtocol=-1,UserIdGroupPairs=[{GroupId=$SG_ID}]"
+#+END_SRC
+
+** Update aws.py defaults (or pass via config)
+=scripts/orchestrator/aws.py= hardcodes =DEFAULT_REGION= and
+=DEFAULT_AZ=.  Either edit those, or supply =az= per experiment in the
+TOML config (region is derived from AZ).
+
+* Experiments
+
+** Config file location
+=scripts/experiments/<name>.toml=.  Three provided:
+
+- =pareto.toml=      — 5 protocols × 8 loads × 3 trials at n=4 (headline)
+- =scalability.toml= — 5 protocols × 5 t-values × 1 load × 3 trials, n up to 61, reverse-scaling
+- =smoke.toml=       — 1 protocol, 1 load, 1 trial (wiring validation)
+
+Recommended order: =pareto.toml= first (6 hosts, ~4 h, ~$1), then
+=scalability.toml= (82 → 6 hosts via reverse scaling, ~3 h, ~$3-4).
+Each owns its own provision + destroy.
+
+** Reverse-scaling sweep (scalability.toml)
+
+The =fab scaling= task runs t-values in descending order: provision
+once at the largest size (82 hosts for t=20), execute the t=20 row,
+then terminate excess hosts before the next-smaller t.  Each phase
+runs on a cluster exactly sized for its t.
+
+Sequence:
+
+#+BEGIN_EXAMPLE
+provision 82  →  t=20 sweep  →  terminate to 42  →
+t=10 sweep    →  terminate to 22  →  t=5 sweep   →
+terminate to 10 →  t=2 sweep  →  terminate to 6  →
+t=1 sweep     →  destroy
+#+END_EXAMPLE
+
+Saves ~$3 vs running every t on the full 82-host cluster.  Each phase
+produces its own results dir tagged =scaling-v1-t<N>=.
+
+** Editing a config for a new region/cluster
+Open the experiment's TOML and update the =[aws]= block.  Example:
+
+#+BEGIN_SRC toml
+[aws]
+key_name           = "leto-bench"
+security_group_id  = "<SG_ID from bootstrap>"
+subnet_id          = "<SUBNET_ID from bootstrap>"
+ssh_key_path       = "~/.ssh/leto-bench.pem"
+instance_type      = "c8g.xlarge"   # or c8g.large if quota tight
+az                 = "<AZ from bootstrap>"
+spot               = false
+num_nodes          = 4
+num_clients        = 2
+root_volume_gb     = 30
+#+END_SRC
+
+Refresh SSH SG ingress for your *current* home IP before any run
+(home IP may have changed):
+
+#+BEGIN_SRC bash
+MYIP=$(curl -s https://checkip.amazonaws.com)
+aws ec2 authorize-security-group-ingress --region <REGION> \
+  --group-id <SG_ID> --protocol tcp --port 22 --cidr ${MYIP}/32 2>/dev/null
+#+END_SRC
+
+** Step-by-step (recommended for paper-grade runs)
+
+Open *terminal 1* and leave running:
+#+BEGIN_SRC bash
+caffeinate -dimsu
+#+END_SRC
+
+Open *terminal 2* and start a tmux session — sweep survives terminal
+close, laptop disconnect, etc.:
+#+BEGIN_SRC bash
+tmux new -s bench
+cd ~/Github/leto-rs/scripts
+#+END_SRC
+
+Then phase by phase:
+
+#+BEGIN_SRC bash
+# 1. Provision (~90 s, ~$0.01)
+PYTHONUNBUFFERED=1 fab provision --config experiments/pareto.toml
+fab status     # verify 6 instances RUNNING with public IPs
+
+# 2. Install (~3-5 min from binstore cache via HTTP fanout from node 0)
+PYTHONUNBUFFERED=1 fab install --config experiments/pareto.toml
+# expect: "[install] CACHE HIT <protocol>@<sha> — upload to node 0
+#          + fan out to 5 hosts" for each of the 5 protocols
+
+# 3. Build (~10 s if cache hits everywhere)
+PYTHONUNBUFFERED=1 fab build --config experiments/pareto.toml
+# expect: "[build] SKIP <protocol>@<sha> — deployed from local cache"
+# if any protocol actually builds, your cache is stale (it'll
+# repopulate, takes 5-25 min depending on protocol)
+
+# 4. Smoke (~1 min) — BAIL FAST if this returns NaN
+PYTHONUNBUFFERED=1 fab smoke --config experiments/pareto.toml
+# baseline: leto at 2k offered → ~39k tx/s, ~83 ms on c8g.large
+
+# 5. Bench (~4 h at n=4, 5 protocols × 8 loads × 3 trials = 120 runs)
+PYTHONUNBUFFERED=1 fab bench --config experiments/pareto.toml \
+  2>&1 | tee /tmp/bench.log
+# per-run line printed; results.jsonl appended live (tailable);
+# any failed run logs to errors.log and the sweep continues
+
+# Detach tmux: Ctrl-b d.  Reattach later: tmux attach -t bench.
+
+# 6. Plot (~5 s)
+fab plot --config experiments/pareto.toml
+open state/results/pareto-v2-*/plots/pareto.png
+
+# 7. Destroy (~10 s)
+fab destroy --config experiments/pareto.toml
+#+END_SRC
+
+** One-shot (no checkpoints)
+For trusted re-runs, =fab run= walks =meta.steps= in order:
+
+#+BEGIN_SRC bash
+PYTHONUNBUFFERED=1 fab run --config experiments/pareto.toml 2>&1 | tee /tmp/run.log
+#+END_SRC
+
+** CLI overrides
+CLI flags always win over the config file.  Useful for ad-hoc tweaks
+without editing the TOML:
+
+#+BEGIN_SRC bash
+fab bench --config experiments/pareto.toml --runs 1
+fab bench --config experiments/pareto.toml --loads 1k,10k
+fab smoke --config experiments/pareto.toml --protocol mysticeti --duration 60
+fab provision --config experiments/pareto.toml --instance-type c8g.large
+#+END_SRC
+
+* Monitoring a live sweep
+
+From any terminal (works over SSH from your phone):
+
+#+BEGIN_SRC bash
+cd ~/Github/leto-rs/scripts
+NEWEST=$(ls -td state/results/pareto-v2-*/ | head -1)
+
+# count finished runs (have non-empty client log)
+find "$NEWEST" -name "client-*.log" -size +0 | wc -l
+
+# live tail of parsed results
+tail -f "$NEWEST"results.jsonl
+
+# any failures
+tail -f "$NEWEST"errors.log 2>/dev/null
+
+# DP[] lines from the most recent finished client
+LAST_CLIENT=$(find "$NEWEST" -name "client-*.log" -size +0 \
+  -exec ls -t {} + 2>/dev/null | head -1)
+grep "DP\[" "$LAST_CLIENT" | tail -20
+#+END_SRC
+
+* Failure modes
+
+** Network blip / laptop sleep / SSH RST
+Per-run try/except in =bench.py= absorbs single failures — the row is
+logged to =errors.log= and the sweep continues.  The orchestrator does
+*not* retry a failed row.  Use =caffeinate= + tmux to minimise these.
+
+** Mid-sweep crash, partial results
+There is no built-in resume.  Options:
+1. If only a handful of rows lost: accept the gap, parse manually.
+2. If many rows lost: re-run with a fresh =[meta].tag= and start over.
+3. Cluster is still alive from before the crash — verify with
+   =fab status= and either re-run =fab bench= against it (re-runs all
+   120 rows under a new tag) or =fab destroy= and start fresh.
+
+** VcpuLimitExceeded on =fab provision=
+Account vCPU quota is too low for the requested =instance_type= ×
+=num_nodes + num_clients=.  Either lower =instance_type= in the config,
+or request a quota bump (see Prerequisites).
+
+** Apollo runs report only =DP[Latency]=, no =DP[Throughput]=
+Expected.  Apollo's =consensus::statistics= emits =DP[Start]=,
+=DP[End]=, =DP[Latency]=.  The parser derives throughput from the
+Start/End delta + tx count.  Verify post-sweep that apollo rows in
+=results.jsonl= have real throughput, not NaN.
+
+** Apollo's run window collapses to ~1 s
+Apollo's closed-loop client drains =total_txs= as fast as the saturated
+chain allows, ignoring offered =--rate=.  Apollo Pareto points at low
+loads will all converge to the same saturating throughput.  This is
+apollo behaviour, not an orchestrator bug.
+
+** SSH "Can't assign requested address" / [Errno 49]
+Local laptop network interface flipped (WiFi reconnect, VPN bounce,
+sleep+wake).  The bound socket's source IP no longer exists.  Re-run
+with =caffeinate= and inside tmux to prevent reoccurrence.  Cluster
+itself is unaffected.
+
+** Mysticeti OOM on first build
+Mysticeti's LLVM codegen needs >8 GB free disk during build.  Default
+root volume is 30 GB to absorb this.  If you see disk-full errors,
+=root_volume_gb= in =[aws]= is the lever.
+
+* Resilience patterns built in
+
+- =deploy.py:297= — paramiko 30 s SSH keepalive on long-lived
+  connections; survives short outages mid-sweep.
+- =bench.py= — per-run try/except; one network blip = 1 row lost,
+  not the whole sweep.
+- =bench.py= — =results.jsonl= appended per-run (tailable from row 1);
+  =errors.log= captures failed runs with stack trace.
+- =binstore.py= — local-disk binary cache keyed by =(protocol, git_sha)=
+  under =scripts/state/cache/=, so cluster re-provisions skip the
+  ~25 min build.
+- =binstore.py:fanout_from_node0= — cache deploys via 1 SFTP upload
+  to node 0 + parallel curl from the other hosts over the AWS internal
+  network.  ~25 min → ~3 min on cache hits.
+
+* Current AWS state (us-west-2)
+
+These resources persist across cluster bring-ups; reused by all
+experiment configs in =scripts/experiments/=.
+
+- Region    : =us-west-2=  (AZ =us-west-2d=)
+- vCPU quota: **300** for L-1216C47A (standard on-demand bucket)
+- Key pair  : =leto-bench=  (private key at =~/.ssh/leto-bench.pem=)
+- Security group: =sg-00e60e97deb4c41cc=  (intra-SG + SSH from home IP)
+- Subnet    : =subnet-0e31e6c0b1430bdc2= (us-west-2d, default VPC)
+
+* Costs (us-west-2 on-demand reference; us-east-2 within ±5%)
+
+| Instance     | $/hr/host | 6-host cluster $/hr | 4 h sweep cost |
+|--------------+-----------+---------------------+----------------|
+| c8g.large    |    0.0398 |              0.2388 |          ~$1.0 |
+| c8g.xlarge   |    0.0796 |              0.4776 |          ~$2.0 |
+| c8g.2xlarge  |    0.1592 |              0.9552 |          ~$4.0 |
+
+Scalability sweep cost (per the plan, 1,215 node-hr):
+
+- c8g.large : ~$48
+- c8g.xlarge: ~$96
+
+Practical bring-up cost (one 82-host cluster, ~3 h wall):
+82 × $0.0398 × 3 ≈ ~$10.
+
+* Cleanup
+
+End-of-day:
+
+#+BEGIN_SRC bash
+fab destroy --config experiments/pareto.toml
+aws ec2 describe-instances --region <REGION> \
+  --filters "Name=tag:Project,Values=leto-bench" \
+            "Name=instance-state-name,Values=running,pending" \
+  --query 'Reservations[].Instances[].InstanceId'
+# expect: []
+
+# kill caffeinate (Ctrl-C in terminal 1, or:)
+pkill caffeinate
+#+END_SRC
+
+The binstore cache (=scripts/state/cache/=) is preserved — keep it
+between cluster re-provisions to skip the build phase.
+
+* Files
+
+| Path                                        | Purpose                                         |
+|---------------------------------------------+-------------------------------------------------|
+| =fabfile.py=                                | CLI entrypoint; one task per phase + =fab run=  |
+| =orchestrator/config.py=                    | TOML loader; =cli_or=, =lookup=, =as_list=      |
+| =orchestrator/aws.py=                       | boto3 provisioning + state in =state/aws.json=  |
+| =orchestrator/deploy.py=                    | install / build / launch over SSH               |
+| =orchestrator/bench.py=                     | sweep loop; per-run try/except + incremental jsonl |
+| =orchestrator/binstore.py=                  | local binary cache + HTTP fanout                |
+| =orchestrator/genconfig.py=                 | canonical committee generator (local + AWS)     |
+| =orchestrator/translators/{apollo,leto,mysticeti}.py= | canonical committee → protocol-native config |
+| =orchestrator/protocols.py=                 | per-protocol Protocol entries + pinned SHAs     |
+| =orchestrator/parse.py=                     | =DP[…]= log parser; emits =Sample= rows         |
+| =orchestrator/plot.py=                      | matplotlib renderers (pareto/scaling/crash)     |
+| =bridges/mysticeti_dpbridge/=               | Prometheus → =DP[…]= sidecar for Mysticeti      |
+| =experiments/pareto.toml=                   | Headline figure config                          |
+| =experiments/smoke.toml=                    | Wiring validation config                        |
+| =state/cache/=                              | binstore tarballs (gitignored)                  |
+| =state/results/<tag>-<stamp>/=              | per-sweep results + per-run logs                |
+| =state/aws.json=                            | live cluster state (instance IDs + IPs)         |
+
+* Pinned protocol SHAs
+
+Do not change without bumping the cache entries.
+
+- leto + zeus  : =0fb04e3= (leto-rs)
+- apollo + artemis : =9320466= (libapollo-rs)
+- mysticeti    : =3b78b12= (MystenLabs/mysticeti)
