@@ -268,14 +268,36 @@ def _connections(state: dict, ssh_key_path: str) -> list:
     nodes = [i for i in instances if i.get("role") == "node"]
     clients = [i for i in instances if i.get("role") == "client"]
     ordered = nodes + clients
-    return [
-        Connection(
+    conns = []
+    for inst in ordered:
+        conn = Connection(
             host=inst["public_ip"],
             user=REMOTE_USER,
             connect_kwargs={"key_filename": ssh_key_path},
         )
-        for inst in ordered
-    ]
+        conns.append(conn)
+    return conns
+
+
+def _fresh_connections(state: dict, ssh_key_path: str) -> list:
+    """Same as _connections but also sets SSH keepalive on the underlying
+    paramiko transport immediately after opening. Use this for long-lived
+    connections (sweep runs > 60s) so the server doesn't RST idle TCP
+    sessions mid-sweep.
+
+    Keepalive every 30s means the connection survives 120s measure windows
+    with margin.
+    """
+    conns = _connections(state, ssh_key_path)
+    for c in conns:
+        # Force-open the transport so we can configure keepalive before
+        # any commands run. Fabric opens lazily; this is idempotent.
+        try:
+            c.open()
+            c.client.get_transport().set_keepalive(30)
+        except Exception:
+            pass   # if open fails, the first real command will surface it
+    return conns
 
 
 def _run_parallel(conns, cmd: str, warn: bool = False) -> list:
@@ -496,7 +518,7 @@ def launch_remote(
     clients after).
     """
     log_dir.mkdir(parents=True, exist_ok=True)
-    conns = _connections(state, ssh_key_path)
+    conns = _fresh_connections(state, ssh_key_path)
     if len(conns) < n + num_clients:
         raise RuntimeError(
             f"provisioned {len(conns)} hosts; need {n + num_clients} "
