@@ -382,10 +382,28 @@ where
                 if self.emit_dp {
                     self.committed_tx_count += payload.len() as u64;
                 }
+                // Drain the eleader's mempool and advance high_committed_nonce
+                // for replay protection.  Uses the data-block height as the
+                // mempool round tag — must match the round threaded through
+                // BCM::NewRound at the propose sites (eleader_proposed_height+1
+                // at NewRound time corresponds to height h here).
+                //
+                // Fires on every node, not just the eleader: non-eleader nodes
+                // have no inflight to drain, but the high_committed_nonce
+                // update protects them too if a client misroutes traffic.
+                let payload_owned: Vec<Tx> = (*payload).clone();
+                let _ = self.tx_consensus_to_batcher.send(
+                    crate::server::BatcherConsensusMsg::Committed {
+                        batch: Batch {
+                            payload: payload_owned.clone(),
+                        },
+                        round: h,
+                    },
+                );
                 if self
                     .tx_data_commit
                     .send(Arc::new(Batch {
-                        payload: (*payload).clone(),
+                        payload: payload_owned,
                     }))
                     .is_err()
                 {

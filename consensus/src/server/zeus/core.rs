@@ -504,11 +504,12 @@ where
         {
             let n = self.settings.committee_config.num_nodes();
             let initial_eleader = super::chain_state::eleader(self.current_epoch, n);
+            // round = next-block height (genesis is 0; first proposal is 1).
             let _ = self
                 .tx_consensus_to_batcher
                 .send(BatcherConsensusMsg::NewRound {
                     leader: initial_eleader,
-                    round: 0, // Zeus follow-up: proper round threading not yet wired
+                    round: self.eleader_proposed_height + 1,
                 });
         }
 
@@ -959,13 +960,15 @@ where
         self.arm_data_timer(DataTimerKind::TimerDataRoundEntry);
 
         // Notify batcher if this node is the new eleader.
+        // round = next-block height (eleader_proposed_height was reset to
+        // d_star_height above; first proposal of new epoch is d_star + 1).
         let n = self.settings.committee_config.num_nodes();
         if self.my_id == eleader_fn(new_epoch, n) {
             let _ = self
                 .tx_consensus_to_batcher
                 .send(BatcherConsensusMsg::NewRound {
                     leader: self.my_id,
-                    round: 0, // Zeus follow-up: proper round threading not yet wired
+                    round: self.eleader_proposed_height + 1,
                 });
         }
 

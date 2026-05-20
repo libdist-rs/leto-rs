@@ -178,13 +178,16 @@ where
         // ----------------------------------------------------------------
         // Prime the batcher for the next block immediately.
         // ----------------------------------------------------------------
+        // round = height of the *next* block this make_batch will produce.
+        // `eleader_proposed_height` was just bumped to the block we proposed
+        // above (line 175), so the next one is eleader_proposed_height + 1.
         if in_flight + 1 < self.eleader_pipeline_depth as u64 {
             let n = self.settings.committee_config.num_nodes();
             let _ =
                 self.tx_consensus_to_batcher
                     .send(crate::server::BatcherConsensusMsg::NewRound {
                         leader: crate::server::zeus::chain_state::eleader(self.current_epoch, n),
-                        round: 0, // Zeus follow-up: proper round threading not yet wired
+                        round: self.eleader_proposed_height + 1,
                     });
         }
 
@@ -617,7 +620,7 @@ where
                 let _ = self.tx_consensus_to_batcher.send(
                     crate::server::BatcherConsensusMsg::NewRound {
                         leader: crate::server::zeus::chain_state::eleader(self.current_epoch, n),
-                        round: 0, // Zeus follow-up: proper round threading not yet wired
+                        round: self.eleader_proposed_height + 1,
                     },
                 );
             }
