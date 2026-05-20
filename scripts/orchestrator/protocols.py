@@ -153,21 +153,23 @@ MYSTICETI = Protocol(
     git_url="https://github.com/MystenLabs/mysticeti.git",
     git_sha="3b78b12af94986abbced89e662eedf157248b465",
     build_cmd="cargo build --release --bin mysticeti",
-    # Mysticeti's single binary; `dry-run` self-generates committee +
-    # keys + load (no separate client binary). TPS env controls the
-    # built-in generator's rate.  Substitute {rate} into TPS at launch
-    # time via the shell prefix.
+    # Mysticeti `run` mode: distributed authorities driven by
+    # benchmark-genesis-produced committee.yaml / parameters.yaml /
+    # private/<i>.yaml.  Each authority runs its own transaction
+    # generator at TPS tx/s independently, so we divide the offered
+    # system load by n (mirrors the upstream orchestrator at
+    # mysticeti/orchestrator/src/protocol/mysticeti.rs:160).
     node_run_cmd=(
-        "TPS={rate} {bin_dir}/mysticeti dry-run "
-        "--committee-size {n} --authority {id}"
+        "TPS={rate_per_node} {bin_dir}/mysticeti run "
+        "--authority {id} "
+        "--committee-path {mysticeti_committee} "
+        "--parameters-path {mysticeti_parameters} "
+        "--private-config-path {mysticeti_private}"
     ),
-    # Mysticeti's dryrun mode has no separate client — the node binary
-    # generates load internally.  We use a no-op client_run_cmd that
-    # exits immediately; effective_clients=0 in deploy keeps it from
-    # being launched.
+    # No separate client — each authority self-generates load.
     client_run_cmd="true",
     sidecar_run_cmd=(
-        "{bridges_dir}/mysticeti_dpbridge/target/release/mysticeti-dpbridge "
+        "{bridges_dir}/mysticeti-dpbridge "
         "--metrics-url {metrics_url} --interval-ms 1000 --max-secs {max_secs}"
     ),
     translator_module="orchestrator.translators.mysticeti",

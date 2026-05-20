@@ -118,16 +118,23 @@ def launch_local(
 
         # Per-protocol substitution map.  All keys defined for every
         # protocol so missing-key surface bugs hard during str.format.
+        mysticeti_committee = config_dir / "mysticeti" / "committee.yaml"
+        mysticeti_parameters = config_dir / "mysticeti" / "parameters.yaml"
+        mysticeti_private = config_dir / "mysticeti" / "private" / f"{node_id}.yaml"
         subs: dict[str, str] = {
             "bin_dir": str(bin_dir),
             "id": str(node_id),
             "n": str(n),
             "rate": str(rate),
+            "rate_per_node": str(max(1, rate // n)),
             "extra": protocol.node_extra_args,
             "config": str(server_config) if server_config.exists() else "",
             "node_config": str(config_dir / f"nodes-{node_id}.json"),
             "ip_file": str(apollo_ip_file),
             "key_file": "",
+            "mysticeti_committee": str(mysticeti_committee) if mysticeti_committee.exists() else "",
+            "mysticeti_parameters": str(mysticeti_parameters) if mysticeti_parameters.exists() else "",
+            "mysticeti_private": str(mysticeti_private) if mysticeti_private.exists() else "",
         }
         if leto_keys_dir is not None:
             kf = leto_keys_dir / f"keys-{node_id}.json"
@@ -188,19 +195,16 @@ def launch_local(
         _tmux(["send-keys", "-t", f"{session}:{window_name}", full, "C-m"])
         processes.append(LocalProcess(tmux_window=window_name, log_path=log_path))
 
-    # Optional sidecar (Mysticeti's dpbridge).  Scrapes the metrics
-    # endpoint of authority 0 (matching the node-0 metrics convention
-    # for leto/zeus/apollo/artemis).  Mysticeti's Prometheus port
-    # follows: validator i binds 1500 + i for network, 1504 + i for
-    # metrics.  Authority 0 → metrics port 1504.
+    # Optional sidecar (Mysticeti's dpbridge).  Scrapes authority 0's
+    # Prometheus endpoint.  Per mysticeti-core/src/config.rs:124-125:
+    #   network_port = 1500 + i
+    #   metrics_port = n + network_port  (= n + 1500 + i)
+    # so authority 0 → 1500 + n.
     if protocol.sidecar_run_cmd:
-        # Give the validator generators ~15s past their built-in 10s
-        # warmup so the histograms have populated bucket counts the
-        # bridge can usefully sample.  This roughly matches the
-        # orchestrator's warmup window for the chain-style protocols.
-        bridges_dir = Path(__file__).resolve().parent.parent / "bridges"
+        bridges_local_root = Path(__file__).resolve().parent.parent / "bridges"
+        bridges_dir = bridges_local_root / "mysticeti_dpbridge" / "target" / "release"
         log_path = log_dir / "sidecar.log"
-        metrics_url = "http://127.0.0.1:1504/metrics"
+        metrics_url = f"http://127.0.0.1:{1500 + n}/metrics"
         max_secs = 600  # bridge auto-exits; orchestrator tears down earlier
         cmd = protocol.sidecar_run_cmd.format(
             bridges_dir=bridges_dir,
@@ -499,6 +503,51 @@ def build_remote(
             list(ex.map(_push, other))
         local_stage.unlink(missing_ok=True)
 
+    # --- mysticeti dpbridge: build on node 0 (Linux ARM), ship to node 0 ---
+    # The sidecar only runs on node_conns[0], so we just need the bridge
+    # binary at {REMOTE_ROOT}/bin/mysticeti/mysticeti-dpbridge there.
+    if any(p.name == "mysticeti" for p in protocols):
+        import tarfile
+        scripts_dir = Path(__file__).resolve().parent.parent
+        bridge_src = scripts_dir / "bridges" / "mysticeti_dpbridge"
+        if not (bridge_src / "Cargo.toml").exists():
+            raise FileNotFoundError(f"missing dpbridge source at {bridge_src}")
+
+        local_tar = Path("/tmp") / "mysticeti-dpbridge-src.tar.gz"
+        if local_tar.exists():
+            local_tar.unlink()
+        with tarfile.open(local_tar, "w:gz") as tf:
+            # Exclude target/ so we don't ship host-built artifacts.
+            def _filter(ti):
+                parts = Path(ti.name).parts
+                if "target" in parts:
+                    return None
+                return ti
+            tf.add(str(bridge_src), arcname="mysticeti_dpbridge", filter=_filter)
+
+        remote_tar = f"{REMOTE_ROOT}/repos/mysticeti-dpbridge-src.tar.gz"
+        remote_src = f"{REMOTE_ROOT}/repos/mysticeti_dpbridge"
+        bridge_bin_dir = f"{REMOTE_ROOT}/bin/mysticeti"
+        print("[build] uploading mysticeti_dpbridge source to node 0")
+        c0.run(f"mkdir -p {REMOTE_ROOT}/repos {bridge_bin_dir}")
+        c0.put(str(local_tar), remote_tar)
+        c0.run(
+            f"rm -rf {remote_src} && "
+            f"tar xzf {remote_tar} -C {REMOTE_ROOT}/repos && "
+            f"rm -f {remote_tar}"
+        )
+        local_tar.unlink(missing_ok=True)
+
+        print("[build] building mysticeti_dpbridge on node 0")
+        c0.run(
+            f"source $HOME/.cargo/env && cd {remote_src} && cargo build --release",
+            hide=False,
+        )
+        c0.run(
+            f"cp {remote_src}/target/release/mysticeti-dpbridge "
+            f"{bridge_bin_dir}/mysticeti-dpbridge"
+        )
+
 
 # ---------------------------------------------------------------------------
 # launch_remote — run one sweep on the cluster
@@ -554,7 +603,7 @@ def launch_remote(
     # leto/zeus: server.json + per-node keys-{i}.json
     # apollo/artemis: entire genconfig output dir (nodes-*.json, ip_file,
     #   cli_ip_file, client.json, *.pem, …)
-    # mysticeti: self-contained dry-run; nothing to push.
+    # mysticeti: distributed authorities — push committee/parameters + private/<i>.
     if protocol.name in ("leto", "zeus"):
         server_config = config_dir / f"{protocol.name}-server.json"
         if not server_config.exists():
@@ -648,20 +697,36 @@ def launch_remote(
             list(ex.map(_push_apollo_node, enumerate(node_conns)))
             list(ex.map(_push_apollo_client, enumerate(client_conns)))
     else:
-        # mysticeti dry-run: no config files needed.
-        print(f"[launch] {protocol.name} is self-contained (no config push)")
+        # mysticeti (distributed): push committee.yaml + parameters.yaml
+        # to every node host, plus authority i's private/<i>.yaml.
+        mysticeti_dir = config_dir / "mysticeti"
+        committee_yaml = mysticeti_dir / "committee.yaml"
+        parameters_yaml = mysticeti_dir / "parameters.yaml"
+        if not committee_yaml.exists() or not parameters_yaml.exists():
+            raise FileNotFoundError(
+                f"missing mysticeti configs under {mysticeti_dir}; "
+                "run the mysticeti translator first"
+            )
+
+        def _push_mysticeti_node(idx_and_conn):
+            i, c = idx_and_conn
+            c.run(f"mkdir -p {run_dir}/private", hide=True)
+            c.put(str(committee_yaml), f"{run_dir}/committee.yaml")
+            c.put(str(parameters_yaml), f"{run_dir}/parameters.yaml")
+            private_yaml = mysticeti_dir / "private" / f"{i}.yaml"
+            if not private_yaml.exists():
+                raise FileNotFoundError(f"missing {private_yaml}")
+            c.put(str(private_yaml), f"{run_dir}/private/{i}.yaml")
+
+        print("[launch] distributing mysticeti committee/parameters/private configs")
+        with cf.ThreadPoolExecutor(max_workers=max(1, len(node_conns))) as ex:
+            list(ex.map(_push_mysticeti_node, enumerate(node_conns)))
 
     # --- launch nodes in detached tmux ---
-    # Mysticeti dry-run special case: all authorities must share localhost
-    # (their network table is hardcoded to 127.0.0.1:1500+i). Run ALL
-    # authorities on node_conns[0] in separate tmux windows; the other
-    # node hosts sit idle.
-    mysticeti_single_host = protocol.name == "mysticeti"
-    print(f"[launch] starting {n} {protocol.name} nodes"
-          + (" (all on host-0; dry-run mode)" if mysticeti_single_host else ""))
+    # Mysticeti now runs on real distributed hosts (one authority per node host).
+    print(f"[launch] starting {n} {protocol.name} nodes")
     for i in range(n):
-        # For mysticeti, always use node_conns[0]; for others, node_conns[i].
-        c = node_conns[0] if mysticeti_single_host else node_conns[i]
+        c = node_conns[i]
         # Build per-protocol substitution dict with ALL keys that any
         # node_run_cmd template may reference (missing keys surface as
         # KeyError at format time — preferable to silent wrong output).
@@ -673,28 +738,21 @@ def launch_remote(
             id=i,
             n=n,
             rate=rate,
+            rate_per_node=max(1, rate // n),
             key_file=f"{run_dir}/keys-{i}.json",
             extra=protocol.node_extra_args,
+            mysticeti_committee=f"{run_dir}/committee.yaml",
+            mysticeti_parameters=f"{run_dir}/parameters.yaml",
+            mysticeti_private=f"{run_dir}/private/{i}.yaml",
         )
         node_cmd = protocol.node_run_cmd.format(**node_subs)
         log_path = f"{log_remote}/node-{i}.log"
-        # tmux -d detaches; the inner bash -c wrap keeps the pipe redirect.
-        # For nodes 1..n-1, use new-window inside the existing session
-        # (session already created by node 0 on this host for mysticeti).
-        if mysticeti_single_host and i > 0:
-            cmd = (
-                f"source $HOME/.cargo/env 2>/dev/null; "
-                f"tmux new-window -t {TMUX_SESSION} -n node-{i} "
-                f"bash -c "
-                f"{shlex.quote(node_cmd + ' > ' + log_path + ' 2>&1')}"
-            )
-        else:
-            cmd = (
-                f"source $HOME/.cargo/env 2>/dev/null; "
-                f"tmux new-session -d -s {TMUX_SESSION} "
-                f"-n node-{i} bash -c "
-                f"{shlex.quote(node_cmd + ' > ' + log_path + ' 2>&1')}"
-            )
+        cmd = (
+            f"source $HOME/.cargo/env 2>/dev/null; "
+            f"tmux new-session -d -s {TMUX_SESSION} "
+            f"-n node-{i} bash -c "
+            f"{shlex.quote(node_cmd + ' > ' + log_path + ' 2>&1')}"
+        )
         c.run(cmd)
 
     # Give nodes a moment to bind before launching clients.
@@ -740,13 +798,13 @@ def launch_remote(
     # --- optional sidecar (Mysticeti dpbridge) on node 0 ---
     if protocol.sidecar_run_cmd:
         sidecar_max_secs = warmup_secs + measure_secs + 60   # grace period
-        # Mysticeti dry-run port layout (mysticeti-core/src/config.rs):
+        # Mysticeti port layout (mysticeti-core/src/config.rs):
         #   network_port  = BENCHMARK_PORT_OFFSET + authority_id   (1500 + i)
         #   metrics_port  = n + network_port                       (n + 1500 + i)
         # For authority 0 with n nodes: metrics_port = 1500 + n.
         mysticeti_metrics_port = 1500 + n
         sidecar_cmd = protocol.sidecar_run_cmd.format(
-            bridges_dir=f"{REMOTE_ROOT}/bin/{protocol.name}_dpbridge",
+            bridges_dir=f"{REMOTE_ROOT}/bin/{protocol.name}",
             metrics_url=f"http://127.0.0.1:{mysticeti_metrics_port}/metrics",
             max_secs=sidecar_max_secs,
             extra="",
@@ -782,10 +840,8 @@ def launch_remote(
     print(f"[launch] fetching {protocol.name} logs to {log_dir}")
     def _fetch_node_log(idx_and_conn):
         i, c = idx_and_conn
-        # For mysticeti, all logs live on node_conns[0].
-        fetch_conn = node_conns[0] if mysticeti_single_host else c
         try:
-            fetch_conn.get(f"{log_remote}/node-{i}.log", str(log_dir / f"node-{i}.log"))
+            c.get(f"{log_remote}/node-{i}.log", str(log_dir / f"node-{i}.log"))
         except Exception as e:
             print(f"  warn: fetch node-{i}.log failed: {e}")
 
@@ -800,18 +856,9 @@ def launch_remote(
         except Exception as e:
             print(f"  warn: fetch client-{client_id}.log failed: {e}")
 
-    if mysticeti_single_host:
-        # All mysticeti node logs live on node_conns[0].  Fabric
-        # Connection is NOT thread-safe for concurrent SFTP — fetch
-        # sequentially to avoid connection corruption and hangs.
-        for pair in enumerate(node_conns):
-            _fetch_node_log(pair)
-        for pair in enumerate(effective_client_conns):
-            _fetch_client_log(pair)
-    else:
-        with cf.ThreadPoolExecutor(max_workers=max(1, len(conns))) as ex:
-            list(ex.map(_fetch_node_log, enumerate(node_conns)))
-            list(ex.map(_fetch_client_log, enumerate(effective_client_conns)))
+    with cf.ThreadPoolExecutor(max_workers=max(1, len(conns))) as ex:
+        list(ex.map(_fetch_node_log, enumerate(node_conns)))
+        list(ex.map(_fetch_client_log, enumerate(effective_client_conns)))
 
     if protocol.sidecar_run_cmd:
         try:
