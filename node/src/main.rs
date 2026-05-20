@@ -351,7 +351,7 @@ async fn main() -> Result<()> {
                 .map_err(|_| anyhow!("Server already shut down"))?;
             info!("Shutting down server");
         }
-        SubCommand::Client { id, config } => {
+        SubCommand::Client { id, config, rate } => {
             let client_id = id;
 
             // Get the config file, or use a default config file
@@ -361,7 +361,22 @@ async fn main() -> Result<()> {
                 .to_string();
             info!("Using config file: {}", config_file);
 
-            let settings = client::Settings::new(config_file)?;
+            let mut settings = client::Settings::new(config_file)?;
+            if rate > 0 {
+                // Open-loop pacing: derive burst size from offered rate +
+                // configured burst_interval_ms so the orchestrator's
+                // `--rate` knob is the source of truth across all clients.
+                let interval_ms = settings.bench_config.burst_interval_ms.max(1);
+                let derived = ((rate * interval_ms) / 1000).max(1) as usize;
+                info!(
+                    "Overriding txs_per_burst {} -> {} (rate={} tx/s, burst={} ms)",
+                    settings.bench_config.txs_per_burst,
+                    derived,
+                    rate,
+                    interval_ms,
+                );
+                settings.bench_config.txs_per_burst = derived;
+            }
             info!("Using the settings: {:?}", settings);
 
             // Start the client

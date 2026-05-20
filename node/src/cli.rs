@@ -50,6 +50,12 @@ pub enum SubCommand {
         #[arg(short, long, value_name = "FILE")]
         #[clap(default_value = "examples/client.json")]
         config: PathBuf,
+        /// Offered tx rate per second.  When > 0, overrides
+        /// `bench_config.txs_per_burst` from the config file
+        /// (derived as `rate * burst_interval_ms / 1000`).  Use 0 to
+        /// keep the config-defined rate.
+        #[arg(short, long, default_value_t = 0)]
+        rate: u64,
     },
     /// Generate keypairs for all the servers
     Keys {
