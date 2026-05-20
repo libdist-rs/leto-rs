@@ -3,18 +3,6 @@
 
 * Leto view-change test findings (2026-05-18)                        :Leto:Test:
 
-** DONE Crash-fault smoke: blame→BlameQC→advance_round path verified :Leto:Correctness:Test:
-   CLOSED: [2026-05-18]
-   Test path: Option B (in-process Rust test).
-   File: node/src/test/server/crash_fault_test.rs (test_crash_fault_view_change).
-
-   4 nodes spawned in-process, 1 Stressor client.  Node 1 killed after 6s
-   warmup (node 0 is metrics node, stays up).  Results across 2 runs:
-   - Pre-kill commits (node 0, 6s): 44–46
-   - Post-kill commits (node 0, 25s window): 73–74
-   Protocol recovered cleanly.  No panics.  No bugs found in blame.rs or
-   round_context.rs.
-
 ** TODO examples/server.json stale — missing new BenchConfig fields  :Leto:Refactor:
    :PROPERTIES:
    :Location: examples/server.json, examples/client.json
@@ -39,28 +27,7 @@
    because node-zeus was added.  Add --bin node or set default-run in
    node/Cargo.toml.
 
-* Known regressions (2026-05-18) [2/2]                              :Zeus:
-** DONE Zeus commit-stall in orchestrator local smoke               :Zeus:Correctness:
-   CLOSED: [2026-05-18 Sun]
-   Root cause: eleader proposed empty data blocks on every batcher
-   tick (libmempool seals on batch_timeout even with no txs).  Every
-   committed payload was empty → counter stayed 0.  Sig-chain commit
-   machinery was working all along (~400 FIRING events confirmed via
-   instrumentation).  Fix: on_eleader_propose drops empty batches
-   before they reach the chain (consensus/src/server/zeus/phases/data.rs).
-   Verified: Zeus orchestrator smoke now produces 9.8k tx/s real
-   throughput.  No regression on Leto (still 39k tx/s).
-   Committed in 27e0f16.
-
-** DONE Zeus DP[Latency] NaN — BatchConfirmation hash mismatch       :Zeus:Net:
-   CLOSED: [2026-05-18 Sun]
-   Switched from per-batch BatchConfirmation to per-tx
-   Confirmation(Hash<Tx>) for the roundtrip.  Server now hashes each
-   tx in the committed batch, looks up its originating client, and
-   sends one Confirmation per tx.  Stressor stores per-tx send_ts.
-   Verified: Zeus 68.9 ms latency, Leto 79.5 ms (was NaN).  Committed
-   in 4dfe60e.
-
+* Known regressions (2026-05-18) [0/0] :Zeus:
 ** ARCHIVE-NOTE BatchConfirmation hash mismatch (closed)             :Zeus:Net:
    :PROPERTIES:
    :Location: consensus/src/server/zeus/server.rs::run_confirmation_router
@@ -531,3 +498,689 @@
    differs (data-block-hash vs. attestation's data-block-hash).
    Consider whether to unify the two maps as a follow-up; not in
    scope for this refactor.
+
+* Leto Code                                                       :Leto:Code:
+
+** DONE Implement mempool (nonce-keyed state machine for replay protection) :Leto:Correctness:Refactor:Perf:
+   :PROPERTIES:
+   :Location: consensus/src/types/tx.rs, consensus/src/server/tx_pool.rs,
+              consensus/src/server/rr_batcher.rs,
+              consensus/src/server/leto/{phases/proposal.rs,phases/commit.rs,round_context.rs},
+              consensus/src/server/core.rs,
+              stress-test/src/smr.rs, node/src/smr/tx.rs
+   :END:
+
+   Replace today's single-buffer hash-keyed =Txpool= with a per-tx state
+   machine keyed by =(client_id, nonce)=. Eliminates the n× DP[Throughput]
+   overcount in =LetoBroadcast=, blocks Byzantine-client replays, and
+   carries bounded per-client state (O(#clients), not O(committed txs)).
+
+*** Bug (observed)
+    Server-reported =DP[Throughput]= overcounts by ≈ n× under
+    =LetoBroadcast=.
+
+    *Evidence.* =scripts/state/results/smoke-leto-20260520T060953Z/leto-n4-f1/load-2000/run-0/=:
+    - Offered: 2 clients × 2000 tx/s = 4000 tx/s total.
+    - =node-0.log= reports =DP[Throughput]: ~16,000= -- exactly 4× = n×.
+
+    *Cause.* In =LetoBroadcast= the stressor broadcasts every =NewBatch=
+    to all =n= nodes (=stresser.rs:257=). Every node's client listener
+    pushes those txs into its own batcher channel (=core.rs:239-244=).
+    Only the *proposing* leader's =Txpool::make_batch= removes txs (via
+    =pop_front=, =tx_pool.rs:106-124=). The other =n-1= pools retain the
+    same txs. After leader rotation each of the =n-1= other nodes
+    eventually leads and re-proposes the same txs. Over =n= rounds each
+    tx is committed ≈ =n= times.
+
+    *Dead code that should have caught it.* =BatcherConsensusMsg::Commit
+    { batch }= (=rr_batcher.rs:17=) is defined with a working
+    =clear_batch= handler (=:135-138=) -- but the variant is *never
+    constructed anywhere*. =OptimisticClear= (the only signal sent
+    after a propose) is a no-op (=:139-142=).
+
+*** Design: nonce-keyed state machine
+    Each tx carries =(client_id, nonce)= where =nonce= is monotonically
+    increasing per client. The stresser already does this: =tag= in
+    =ExtraData= is the per-client tx counter (=stresser.rs:234=) and
+    =source= is the client id. They are currently buried in a
+    bincode-serialized =extra: Vec<u8>= and only exposed under
+    =cfg(feature = "benchmark")=; this refactor lifts them to top-level
+    typed fields visible to the always-on trait.
+
+    *Replicated state, per node:*
+    =high_committed_nonce: HashMap<ClientId, Nonce>= -- the maximum
+    nonce committed on the canonical chain for each client. Size
+    O(#clients), not O(#committed txs).
+
+    *Per-tx state machine:*
+
+    | State       | Storage                                 | Eligible for batch? |
+    |-------------+-----------------------------------------+---------------------|
+    | =Unknown=     | (no storage)                            | n/a                 |
+    | =Mineable=    | =BTreeMap<(ClientId, Nonce), (Tx, size)>= | yes                 |
+    | =InFlight(r)= | =HashMap<(c, n), entry>= + by_round idx   | no                  |
+    | =Replayed=    | (no storage; rejected at add_tx)        | no                  |
+
+    The Committed state from the prior LRU/Bloom design is *gone*:
+    its purpose (rejecting late-arriving committed txs) collapses to
+    a u64-compare against =high_committed_nonce[client]=.
+
+    *Transitions:*
+
+    #+begin_example
+                              ┌───────────┐
+                              │  Unknown  │
+                              └─────┬─────┘
+                          add_tx()  │  admit_proposal(batch, r)
+                          (client)  │  -- both gated by:
+                          if n >    │     n > high_committed_nonce[c]
+                          hi_committed[c]
+                                    ▼
+                          ┌──────────────────┐
+                ┌──────►  │     Mineable     │ ◄──── rollback(r) ──────┐
+                │         │   keyed (c, n)   │                          │
+                │         └────────┬─────────┘                          │
+                │      admit_proposal()  /  make_batch()                │
+                │                  │   (both promote, tag with r)       │
+                │                  ▼                                    │
+                │         ┌──────────────────┐                          │
+                │         │   InFlight(r)    │ ◄── idempotent ──────────┤
+                │         │  keyed (c, n)    │     re-admit             │
+                │         └────────┬─────────┘                          │
+                │     ┌────────────┼──────────┐                         │
+                │     │ commit()   │          │ rollback(r)             │
+                │     │ hi[c] :=   │          │ chain-switch            │
+                │     │ max(.,n)   │          │                         │
+                │     ▼            │          ▼                         │
+                │  ┌───────────────┴┐                                   │
+                │  │  GC: drop any  │                                   │
+                │  │  entries with  │ ───────────────────────────────── ┘
+                │  │  n ≤ hi[c]     │     (subsumed orphans dropped,
+                │  └────────────────┘      others returned to Mineable)
+                │
+                └─── add_tx with n ≤ hi[c] is dropped on the floor
+                     (replay, late RTO, Byzantine client all converge here)
+    #+end_example
+
+*** Race traces (all close to no-ops or correct moves)
+
+    *Trace 1 -- common case (client copy arrives first):*
+    #+begin_example
+    t0  client broadcasts T=(c, n=5)
+    t1  X gets T via client                 → add_tx: 5>hi[c]=0 → Mineable[(c,5)]
+    t2  X gets P={T} via consensus          → admit_proposal:
+                                              (c,5) in Mineable → InFlight(r)
+    t3  P commits at round r                → commit:
+                                              hi[c] := 5; remove (c,5)
+    #+end_example
+
+    *Trace 2 -- proposal arrives before client (LAN race):*
+    #+begin_example
+    t0  client broadcasts T=(c, 5)
+    t1  X gets P={T} via consensus first    → admit_proposal:
+                                              5>hi[c]=0; not in any bucket
+                                              → InFlight((c,5), r) direct
+    t2  X gets T via client                 → add_tx: 5>hi[c]; (c,5)
+                                              in InFlight ⇒ NO-OP   ✓
+    #+end_example
+
+    *Trace 3 -- late client after commit (RTO; was the hard case):*
+    #+begin_example
+    t0  X gets P={T=(c,5)}                  → InFlight((c,5), r)
+    t1  P commits                            → hi[c] := 5; remove (c,5)
+    t2  X finally gets T via client (RTO)   → add_tx: 5 ≤ hi[c]=5 ⇒ DROPPED ✓
+    #+end_example
+
+    *Trace 4 -- chain switch orphans round r:*
+    #+begin_example
+    t0  X promoted (c,5) at round r         → InFlight((c,5), r)
+    t1  commit.rs:178-187 fires             → rollback({r}):
+                                              5 > hi[c] (still 0) →
+                                              (c,5) → Mineable
+    #+end_example
+
+    *Trace 5 -- view change commits a different proposal at round r:*
+    #+begin_example
+    t0  X promoted (c,5) at r via P1        → InFlight((c,5), r)
+    t1  canonical chain commits P2 ≠ P1 at r,
+        where P2 contains (c,7)             → commit({(c,7)}, r):
+                                              hi[c] := 7;
+                                              GC sweep: (c,5) ≤ 7
+                                              → drop (c,5)  ✓
+    #+end_example
+
+    *Trace 6 -- Byzantine client replays old nonce:*
+    #+begin_example
+    t0  hi[c] = 10 already
+    t1  Byzantine T'=(c, 3) arrives         → add_tx: 3 ≤ 10 ⇒ DROPPED  ✓
+    #+end_example
+
+    *Trace 7 -- Byzantine leader proposes already-committed nonce:*
+    #+begin_example
+    hi[c] = 10 at honest X
+    Byzantine leader proposes P={(c,3)}
+    X.admit_proposal: 3 ≤ 10 → skip this tx (or reject the whole
+                                proposal -- see "Byzantine proposal
+                                policy" below).
+    #+end_example
+
+    *Trace 8 -- own loopback at proposer L:*
+    #+begin_example
+    t0  L make_batch(r)                     → pops from Mineable,
+                                              moves to InFlight((c,n), r)
+    t1  L handle_proposal (loopback)        → admit_proposal:
+                                              (c,n) in InFlight ⇒ continue ✓
+    #+end_example
+
+    *Trace 9 -- equivocation (same (c,n), different payload):*
+    #+begin_example
+    t0  X gets T_A=(c, 5, payload_A)        → Mineable[(c,5)] = T_A
+    t1  X gets T_B=(c, 5, payload_B)        → BTreeMap::insert overwrites
+                                              → last-write-wins; system commits
+                                              one of them, both have same key.
+    #+end_example
+
+    (For a signed-tx scheme, equivocation would be detectable and
+    slashable; unsigned txs as today accept last-write-wins. Not in
+    scope for this refactor.)
+
+*** State changes in =Txpool=
+
+    Replace the single =linked_hash_map: LinkedHashMap<Hash<Tx>, …>=
+    with:
+
+    #+begin_src rust
+    pub struct Txpool<Tx> {
+        // State: Mineable -- BTreeMap so we can range-scan by client.
+        // Insertion-order FIFO is sacrificed; nonce-ordering within
+        // a client is preserved (BTreeMap iterates sorted by key).
+        mineable: BTreeMap<(ClientId, Nonce), (Tx, /*size*/ usize)>,
+        mineable_bytes: usize,
+
+        // State: InFlight by (client, nonce); secondary index by round.
+        inflight: HashMap<(ClientId, Nonce), InflightEntry<Tx>>,
+        inflight_by_round: HashMap<Round, FnvHashSet<(ClientId, Nonce)>>,
+
+        // Replicated state -- O(#clients).
+        high_committed_nonce: HashMap<ClientId, Nonce>,
+
+        batch_size: usize,
+        timer: Interval,
+    }
+
+    struct InflightEntry<Tx> {
+        tx: Tx,
+        size: usize,
+        round: Round,
+    }
+    #+end_src
+
+    Note: FIFO-by-arrival ordering of =mineable= is dropped. Batches
+    now contain txs in =(client, nonce)= sort order. This is *better*
+    for latency fairness across clients (round-robin-ish) and gives
+    deterministic batch contents.
+
+*** Operations (each amortized O(1) per tx)
+
+    #+begin_src rust
+    impl<Tx: Transaction> Txpool<Tx> {
+        pub fn add_tx(&mut self, tx: Tx, size: usize) {
+            let (c, n) = (tx.client_id(), tx.nonce());
+            if n <= *self.high_committed_nonce.get(&c).unwrap_or(&0) {
+                return; // replay / late RTO / Byzantine
+            }
+            if self.inflight.contains_key(&(c, n)) {
+                return; // proposal-direct race already inserted
+            }
+            // BTreeMap::insert overwrites; in honest case this is idempotent;
+            // in equivocation case it's last-write-wins (see Trace 9).
+            if let Some(prev) = self.mineable.insert((c, n), (tx, size)) {
+                self.mineable_bytes -= prev.1; // adjust for overwrite
+            }
+            self.mineable_bytes += size;
+        }
+
+        pub fn admit_proposal(&mut self, batch: &Batch<Tx>, round: Round) {
+            let by_round = self.inflight_by_round.entry(round).or_default();
+            for tx in &batch.payload {
+                let (c, n) = (tx.client_id(), tx.nonce());
+                if n <= *self.high_committed_nonce.get(&c).unwrap_or(&0) { continue; }
+                if self.inflight.contains_key(&(c, n))                   { continue; }
+                let size = if let Some((_, sz)) = self.mineable.remove(&(c, n)) {
+                    self.mineable_bytes -= sz; sz
+                } else {
+                    bincode::serialized_size(tx).unwrap_or(0) as usize
+                };
+                self.inflight.insert(
+                    (c, n),
+                    InflightEntry { tx: tx.clone(), size, round },
+                );
+                by_round.insert((c, n));
+            }
+        }
+
+        pub fn make_batch(&mut self, round: Round) -> Batch<Tx> {
+            let mut payload = Vec::new();
+            let mut batch_bytes = 0;
+            let by_round = self.inflight_by_round.entry(round).or_default();
+            // BTreeMap iteration is sorted by (client, nonce). Pop the
+            // smallest keys until batch_size satisfied.
+            while batch_bytes < self.batch_size {
+                let key = match self.mineable.keys().next().copied() {
+                    Some(k) => k,
+                    None => break,
+                };
+                let (c, n) = key;
+                let (tx, size) = self.mineable.remove(&key).unwrap();
+                self.mineable_bytes -= size;
+                payload.push(tx.clone());
+                batch_bytes += size;
+                self.inflight.insert((c, n), InflightEntry { tx, size, round });
+                by_round.insert((c, n));
+            }
+            self.reset_timer();
+            Batch { payload }
+        }
+
+        pub fn commit(&mut self, batch: &Batch<Tx>, round: Round) {
+            // 1. Advance high_committed_nonce; remove the committed txs
+            //    from both buckets.
+            let mut touched: FnvHashSet<ClientId> = FnvHashSet::default();
+            for tx in &batch.payload {
+                let (c, n) = (tx.client_id(), tx.nonce());
+                touched.insert(c);
+                if let Some(e) = self.inflight.remove(&(c, n)) {
+                    if let Some(set) = self.inflight_by_round.get_mut(&e.round) {
+                        set.remove(&(c, n));
+                    }
+                }
+                if let Some((_, sz)) = self.mineable.remove(&(c, n)) {
+                    self.mineable_bytes -= sz;
+                }
+                let cur = self.high_committed_nonce.entry(c).or_insert(0);
+                if n > *cur { *cur = n; }
+            }
+            // 2. GC straggler entries beneath the new high-water marks.
+            //    Per client, range-scan mineable -- O(|stale|), not O(|pool|).
+            for c in &touched {
+                let hi = *self.high_committed_nonce.get(c).unwrap();
+                let stale: Vec<_> = self.mineable
+                    .range((*c, 0)..=(*c, hi))
+                    .map(|(k, _)| *k)
+                    .collect();
+                for k in stale {
+                    if let Some((_, sz)) = self.mineable.remove(&k) {
+                        self.mineable_bytes -= sz;
+                    }
+                }
+            }
+            // 3. Inflight stragglers are filtered lazily in admit_proposal
+            //    and rollback; growth is bounded by commit_len rounds of
+            //    in-flight work.
+        }
+
+        pub fn rollback(&mut self, rounds: &[Round]) {
+            for r in rounds {
+                if let Some(set) = self.inflight_by_round.remove(r) {
+                    for (c, n) in set {
+                        let hi = *self.high_committed_nonce.get(&c).unwrap_or(&0);
+                        if n <= hi {
+                            // Subsumed orphan: a different proposal at round r
+                            // already committed a higher nonce from c.  Drop.
+                            self.inflight.remove(&(c, n));
+                            continue;
+                        }
+                        if let Some(e) = self.inflight.remove(&(c, n)) {
+                            self.mineable.insert((c, n), (e.tx, e.size));
+                            self.mineable_bytes += e.size;
+                        }
+                    }
+                }
+            }
+        }
+
+        pub fn ready(&self) -> bool { self.mineable_bytes > self.batch_size }
+    }
+    #+end_src
+
+    *=debug_assert!= invariants:*
+    - =mineable= and =inflight= key sets are disjoint.
+    - For all =(c, n) in inflight=, =n > high_committed_nonce[c]=
+      (after admit_proposal / rollback / commit returns).
+    - =inflight_by_round[r] = { (c, n) | inflight[(c,n)].round == r }=.
+    - =mineable_bytes = Σ size in mineable=.
+
+*** Trait surface
+
+    File: =consensus/src/types/tx.rs=. Promote =is_sample= and =get_id=
+    out of =cfg(feature = "benchmark")= and add the two new accessors:
+
+    #+begin_src rust
+    pub trait Transaction: mempool::Transaction + Unpin {
+        fn client_id(&self) -> Id;     // NEW: always-present
+        fn nonce(&self) -> u64;         // NEW: always-present
+        // Promoted from cfg(benchmark) to always-present:
+        fn is_sample(&self) -> bool;
+        fn get_id(&self) -> u64;
+    }
+    #+end_src
+
+    *Rationale.* =client_id= / =nonce= are correctness primitives, not
+    benchmark plumbing. =is_sample= / =get_id= were already used by the
+    consensus path implicitly via benchmark-feature builds; promoting
+    them simplifies the cfg landscape and matches reality.
+
+    *Default impls* for sample-related getters in the trait so the
+    Zeus =Attestation<Tx>= impl (=zeus.rs:355-367=) can keep its
+    dummy returns by overriding only what it needs.
+
+*** =SimpleTx= refactor (perf-sensitive)
+
+    Today =SimpleTx::extra: Vec<u8>= bincode-encodes =ExtraData {
+    source, sample, sample_id, tag }=. =is_sample()= and =get_id()=
+    bincode-deser =extra= on every call (=node/src/smr/tx.rs:53-69=
+    and =stress-test/src/smr.rs:85-99=). Adding =client_id()= and
+    =nonce()= naively would multiply that overhead.
+
+    *Lift the typed fields out of =extra=:*
+
+    #+begin_src rust
+    #[derive(Serialize, Deserialize, Clone, PartialEq)]
+    pub struct SimpleTx<Data> {
+        pub data: Data,
+        pub source: Id,        // NEW: lifted out of extra (was ExtraData::source)
+        pub nonce: u64,         // NEW: lifted out of extra (was ExtraData::tag, as u64)
+        pub extra: Vec<u8>,    // now: just sample + sample_id (benchmark-only)
+    }
+    #+end_src
+
+    The =SimpleTx::HEADER_SIZE= constant (=stress-test/src/smr.rs:128=)
+    needs adjustment to account for the new fields (Id + u64 = 16 B
+    additional in bincode). The mocker fills =tx_size - HEADER_SIZE=
+    bytes of payload (=smr.rs:137=), so this just shifts the constant.
+
+    Trait impl becomes O(1):
+    #+begin_src rust
+    impl<Data: Data> Transaction for SimpleTx<Data> {
+        fn client_id(&self) -> Id { self.source }
+        fn nonce(&self) -> u64 { self.nonce }
+        fn is_sample(&self) -> bool {
+            #[cfg(feature = "benchmark")] {
+                let e: ExtraData = bincode::deserialize(&self.extra).unwrap();
+                e.sample
+            }
+            #[cfg(not(feature = "benchmark"))] { false }
+        }
+        fn get_id(&self) -> u64 {
+            #[cfg(feature = "benchmark")] {
+                let e: ExtraData = bincode::deserialize(&self.extra).unwrap();
+                e.sample_id
+            }
+            #[cfg(not(feature = "benchmark"))] { 0 }
+        }
+    }
+    #+end_src
+
+    *Both copies* (=stress-test/src/smr.rs= and =node/src/smr/tx.rs=)
+    must be kept in sync. Consider unifying them as a separate
+    follow-up; that's a duplication that already exists pre-refactor.
+
+    =ExtraData= keeps =sample= and =sample_id= only; =source= and =tag=
+    fields are removed.
+
+*** =Attestation<Tx>= impl (Zeus-only)
+
+    File: =consensus/src/types/zeus.rs:352-367=. Attestations are not
+    user txs and don't need replay protection at the Leto mempool
+    level. Add stub impls returning =0= for =client_id= and =nonce=;
+    Zeus's data-chain uses its own admission logic. (The Zeus inflation
+    is tracked separately -- see "Zeus follow-up" below.)
+
+    Promote the impl out of =cfg(benchmark)= since the trait methods
+    are now always-present.
+
+*** Wire protocol (=BatcherConsensusMsg=)
+
+    File: =consensus/src/server/rr_batcher.rs=. Replace the enum:
+
+    #+begin_src rust
+    pub enum BatcherConsensusMsg<Id, Tx> {
+        NewRound { leader: Id, round: Round },                  // EXTENDED: + round
+        Proposed { batch: Batch<Tx>, round: Round },            // NEW
+        Committed { batch: Batch<Tx>, round: Round },           // NEW
+        Rollback { rounds: Vec<Round> },                        // NEW
+    }
+    #+end_src
+
+    *Removed:* =Commit { batch }= (dead, never constructed),
+    =OptimisticClear= (subsumed by =make_batch='s in-place promotion).
+
+    The handlers call the new =Txpool= methods directly:
+    - =NewRound { leader, round }= → set =current_leader=,
+      =current_round=, =proposed=false=, try_propose.
+    - =Proposed { batch, round }= → =pool.admit_proposal(&batch, round)=.
+    - =Committed { batch, round }= → =pool.commit(&batch, round)=.
+    - =Rollback { rounds }= → =pool.rollback(&rounds)=.
+
+*** Round threading (=RRBatcher=)
+
+    Add =current_round: Round= field, set on =NewRound= and threaded
+    into =make_batch(self.current_round)=. =round_context.rs:384=
+    already emits =NewRound= on every round advance; extend its payload
+    to include the round (currently it carries only =leader=).
+
+*** Signal sites in Leto
+
+    1. *Client ingress* -- =server/core.rs:239-244=. Unchanged externally:
+       the per-tx fanout =tx_batcher.send((tx, size))= still happens. The
+       batcher handler now routes through the deduping =add_tx=, which
+       checks =high_committed_nonce= and =inflight= before inserting.
+
+    2. *Proposal admitted* -- =leto/phases/proposal.rs:124-164=
+       (=on_correct_proposal=). After
+       =self.chain_state.update_highest_chain(...).await?= succeeds,
+       send =BCM::Proposed { batch: batch.clone(), round: proposal.round() }=.
+       Fires for both received proposals AND own loopback (the loopback
+       at =:255= calls back into =handle_proposal=); loopback is
+       idempotent (see Trace 8).
+
+    3. *Commit* -- =leto/phases/commit.rs:264=. Alongside
+       =tx_commit.send(Arc::new(element.batch.clone()))=, send
+       =BCM::Committed { batch: element.batch.clone(), round: element.proposal.round() }=.
+       The existing =committed_tx_count += element.batch.payload.len()=
+       at =:260= stays; with the mempool fix it now reports honestly.
+
+    4. *Chain-switch rollback* -- =leto/phases/commit.rs:178-187=.
+       Inside the =if !connected_to_commit_queue= branch, *before*
+       =std::mem::replace(&mut commit_queue, local_queue)=: collect
+       =rounds = commit_queue.values().map(|e| e.proposal.round()).collect()=
+       and send =BCM::Rollback { rounds }=.
+
+    5. *Round advance* -- =leto/round_context.rs:384=. Existing
+       =BCM::NewRound { leader }= → =BCM::NewRound { leader, round }=.
+       =self.round_context.round()= is already at hand.
+
+*** Byzantine proposal policy (decision needed)
+
+    When =admit_proposal= encounters a stale tx (=n ≤ hi[c]=), two
+    policies:
+
+    *(a) Silent skip* (simple): the stale tx is ignored; the rest of
+    the batch is admitted normally. The committed batch will still
+    contain the stale tx (we don't rewrite proposals), and
+    =DP[Throughput]='s payload.len() count will still include it.
+
+    *(b) Reject proposal* (strict): the whole proposal is rejected
+    with =warn!("stale nonce from leader: …")=. This requires
+    extending =handle_proposal='s validity check
+    (=proposal.rs:46-93=) with a per-tx nonce sweep.
+
+    *Recommendation: (a) for v1.* The metric-correctness fix already
+    achieves the main goal (n× → 1×); rejecting Byzantine-leader
+    proposals is a separate hardening pass. For honest runs, no stale
+    nonces ever appear in proposals, so the policy is moot. Leave
+    a TODO and the rejection logic for a follow-up.
+
+*** Persistence
+
+    =high_committed_nonce= is replicated state and *must* be derivable
+    from the chain. For paper experiments: in-memory only; each
+    experiment starts with empty state, clients start at nonce 1.
+    Restart-mid-run is out of scope.
+
+    *Future-proofing.* Storing =high_committed_nonce= as a RocksDB
+    column family (keyed by ClientId, value Nonce, one tiny write per
+    commit) would survive restarts. Add as a follow-up task once
+    paper experiments stabilize.
+
+*** What this refactor does NOT change
+
+    - Wire format on consensus net (=ProtocolMsg::Propose= shape).
+    - =ClientMsg::NewBatch= shape (still carries =batch: Vec<Tx>= +
+      =reply_to: SocketAddr=). Internal =SimpleTx= layout changes;
+      no protocol-level change.
+    - Confirmation routing (=core.rs= confirmation router) -- still
+      hashes per-tx for routing; unaffected.
+    - DP[Latency] (client-side latency histogram).
+    - The =DP[Throughput]= emission site (=commit.rs:260=,
+      =commit.rs:275-280=); only the value it reports changes.
+    - The chain-validity check, QC verification, signature checks.
+    - Zeus's =ZeusEleaderOnly= path; see follow-up below.
+
+*** Risk / open questions
+
+    - *=Mineable= ordering change* (LinkedHashMap FIFO → BTreeMap
+      sorted by (client, nonce)). Per-client FIFO is preserved
+      (nonces are monotonic per client). Across clients, the batch
+      composition shifts from "oldest-arrival first" to "lowest-client-
+      first". This is *better* for fairness but may affect
+      latency-by-client measurements -- verify in tests.
+    - *Trait promotion blast radius.* =Attestation<Tx>= impl needs
+      stubs; verified above. Any other =impl Transaction= will fail
+      to compile until updated. Grep is clean -- only =SimpleTx=
+      (two copies) and =Attestation<Tx>= implement the trait today.
+    - *=ExtraData= wire format change.* =source= and =tag= removed
+      from the serialized blob. Backwards incompatibility with any
+      saved benchmark traces; not a concern (no such artifact set).
+    - *Trait method =get_id= name collision.* =Transaction::get_id=
+      currently returns the sample_id (u64). The newly-added
+      =Transaction::nonce= returns the per-client nonce. *Do not*
+      rename =get_id= even though =nonce= would be a clearer name --
+      the existing name has consumer code in =leto/phases/commit.rs:236=
+      and elsewhere referencing sample tracking.
+
+*** Refactor steps (in dependency order)
+
+    1. *Trait surface* (=consensus/src/types/tx.rs=). Promote =is_sample=
+       and =get_id= out of =cfg(benchmark)=. Add =client_id= and =nonce=
+       as required methods. This is the source of all downstream
+       compile errors; fix them in steps 2-3.
+
+    2. *=SimpleTx= refactor* (=node/src/smr/tx.rs= and
+       =stress-test/src/smr.rs=). Add =source: Id= and =nonce: u64=
+       top-level fields; remove them from =ExtraData=. Implement
+       =client_id()= and =nonce()= as direct field access. Adjust
+       =HEADER_SIZE= (+16 B for Id + u64 in bincode).
+
+    3. *Stresser update* (=consensus/src/client/mod.rs:12-19= and
+       =stresser.rs=). =mock_transaction= already takes =tx_id= and
+       =client_id= as inputs -- now plumb them into the new struct
+       fields instead of =ExtraData=.
+
+    4. *=Attestation<Tx>= stubs* (=consensus/src/types/zeus.rs:352-367=).
+       Add =client_id() -> 0=, =nonce() -> 0=. Promote out of
+       =cfg(benchmark)=. Build the workspace -- everything should
+       compile to here, with the mempool still using the old hash-
+       keyed code path.
+
+    5. *=Txpool= rewrite* (=consensus/src/server/tx_pool.rs=). Implement
+       the (client, nonce)-keyed state machine above. Keep public
+       surface compatible with the existing =RRBatcher= temporarily
+       (=add_tx= signature changes from =(Tx, usize)= → same; behavior
+       changes; =make_batch= takes =round: Round=; =clear_batch= and
+       =clear_batch_count= are deleted). Unit-test each transition
+       and each race trace (1-9).
+
+    6. *=BatcherConsensusMsg= rewrite* (=consensus/src/server/rr_batcher.rs=).
+       Add =Proposed=, =Committed=, =Rollback= variants. Extend
+       =NewRound= with =round=. Remove =Commit= and =OptimisticClear=
+       variants. Update the handlers to call the new =Txpool= methods.
+       Track =current_round=, thread into =make_batch(round)=.
+
+    7. *Signal site: NewRound* (=leto/round_context.rs:384=). Extend
+       payload to include =round=.
+
+    8. *Signal site: proposal admitted* (=leto/phases/proposal.rs=,
+       =on_correct_proposal=). Send =BCM::Proposed= after
+       =update_highest_chain=.
+
+    9. *Signal site: commit* (=leto/phases/commit.rs:264=). Send
+       =BCM::Committed= alongside =tx_commit.send=.
+
+    10. *Signal site: rollback* (=leto/phases/commit.rs:178-187=).
+        Send =BCM::Rollback= before =mem::replace=.
+
+    11. *Cleanup.* Remove =OptimisticClear= sender at
+        =leto/phases/proposal.rs:149=. Verify no =BCM::Commit { batch }=
+        construction remains.
+
+    12. *Smoke test.* Re-run =scripts/state/results/smoke-leto-20260520T060953Z=:
+        expected =DP[Throughput] ≈ 4000= (not 16000) for 2 clients ×
+        2000 tx/s × n=4.
+
+    13. *Profile.* Confirm no regression in peak throughput.
+        =Txpool::admit_proposal= adds per-tx hashmap lookups; verify
+        these stay below the existing per-tx hashing cost in
+        =core.rs:240=. Memory: =high_committed_nonce= is KB-scale;
+        =inflight= bounded by commit_len rounds of in-flight work.
+
+    14. *Documentation.* Update =Readme.md= if it references the
+        throughput metric definition.
+
+*** Test plan
+
+    1. *Unit (=tx_pool.rs=):*
+       - Each of the nine race traces above as a deterministic test
+         driving the four ops in sequence and asserting end-state.
+       - Invariants (=debug_assert!=) checked across each op.
+       - GC sweep correctness: after =commit= advances =hi[c]=, no
+         entry with =n ≤ hi[c]= remains in =mineable= for client =c=.
+       - Rollback correctness: subsumed orphans dropped, others
+         returned to mineable, key uniqueness preserved.
+
+    2. *Integration (in-process harness, =node/src/test/server=):*
+       - n=4, single client, offered =R= tx/s for =T= s. Assert
+         =DP[Throughput] ≈ R= (within 5%) and *not* n×R.
+       - n=7, same.
+       - Multi-client (2, 4 clients) -- each with distinct =Id=,
+         independent nonce sequences. Assert per-client commit
+         ordering is monotonic.
+
+    3. *Fault injection* (=node/src/test/server/crash_fault_test.rs=).
+       Extend to assert *no (client, nonce) pair appears in two
+       distinct committed batches* across the run. The existing
+       chain-switch trigger exercises rollback().
+
+    4. *Race regression test.* Synthetic in-process harness that
+       delays one node's client listener by =D >>= proposal-propagation
+       latency. Inject offered traffic; assert every offered tx is
+       committed exactly once, and no doubled nonces appear.
+
+    5. *Pareto re-run* (=scripts/experiments/pareto.toml= for Leto).
+       Confirm throughput values ≤ offered rate at all load levels.
+       Pre-fix: ~n× over near-saturation.
+
+*** Zeus follow-up (separate task; not in scope)
+
+    =ZeusEleaderOnly= directs every client tx to a single eleader
+    (=stresser.rs:271=, =zeus/server.rs:232-241=). The n× mechanism
+    of LetoBroadcast does *not* apply. If Zeus also shows
+    DP[Throughput] inflation, the cause is elsewhere -- candidates:
+    sig-chain vs data-chain double counting, attestation payload
+    accidentally counted via =Attestation<Tx>=, or accumulator at
+    =zeus/core.rs:600-604= / =zeus/phases/commit.rs:383= firing on
+    a non-canonical path. Reproduce first, then design separately.
+
+    The nonce-keyed =Txpool= can be reused if Zeus exhibits a similar
+    mempool bug, but apply only after identifying the actual
+    mechanism in Zeus.
