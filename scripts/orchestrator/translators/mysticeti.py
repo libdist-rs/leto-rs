@@ -27,6 +27,10 @@ _MYSTICETI_BIN = (
     / "mysticeti"
 )
 
+# Must match deploy.REMOTE_ROOT + "/run".  The validator's storage_path is
+# rewritten to <_REMOTE_RUN_PREFIX>/mysticeti/val-<i> (deploy mkdirs it).
+_REMOTE_RUN_PREFIX = "/home/ec2-user/leto-bench/run"
+
 
 def translate(
     committee: Committee, out_dir: Path, protocol: str = "mysticeti"
@@ -79,5 +83,33 @@ def translate(
             "mysticeti benchmark-genesis succeeded but expected artifacts "
             f"are missing (likely a Mysticeti version mismatch): {missing}"
         )
+
+    # AWS post-processing: benchmark-genesis bakes the orchestrator's
+    # LOCAL absolute path into each `private/<i>.yaml` (`storage_path:
+    # <local_dir>/private/val-<i>`). Shipping that file to AWS makes
+    # mysticeti panic at startup with "Failed to open wal file: NotFound"
+    # because the local path doesn't exist on the remote host.  Detect
+    # AWS mode (any non-loopback IP) and rewrite each private/<i>.yaml's
+    # storage_path to the path deploy.launch_remote actually mkdirs on
+    # the AWS host: `<REMOTE_RUN_PREFIX>/mysticeti/val-<i>`.
+    is_aws = any(
+        m.endpoint.host not in ("127.0.0.1", "localhost")
+        for m in committee.members
+    )
+    if is_aws:
+        for i in range(committee.n):
+            yml = work_dir / "private" / f"{i}.yaml"
+            text = yml.read_text()
+            # YAML is exactly two lines: authority_index + storage_path.
+            # Rewrite the latter without pulling in a YAML dep.
+            new_lines = []
+            for ln in text.splitlines():
+                if ln.startswith("storage_path:"):
+                    new_lines.append(
+                        f"storage_path: {_REMOTE_RUN_PREFIX}/mysticeti/val-{i}"
+                    )
+                else:
+                    new_lines.append(ln)
+            yml.write_text("\n".join(new_lines) + "\n")
 
     return artifacts

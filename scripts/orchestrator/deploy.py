@@ -733,7 +733,13 @@ def launch_remote(
 
         def _push_mysticeti_node(idx_and_conn):
             i, c = idx_and_conn
-            c.run(f"mkdir -p {run_dir}/private", hide=True)
+            # `val-<i>` is mysticeti's per-authority storage dir; the
+            # translator rewrites private/<i>.yaml's storage_path to
+            # `<run_dir>/val-<i>` so this mkdir + the validator's
+            # `open_file_for_wal(<storage>/wal).create(true)` succeed.
+            # Without the mkdir, validator panics at startup with
+            # "Failed to open wal file: NotFound".
+            c.run(f"mkdir -p {run_dir}/private {run_dir}/val-{i}", hide=True)
             c.put(str(committee_yaml), f"{run_dir}/committee.yaml")
             c.put(str(parameters_yaml), f"{run_dir}/parameters.yaml")
             private_yaml = mysticeti_dir / "private" / f"{i}.yaml"
