@@ -148,6 +148,18 @@ def _fixup_aws_configs(
     for client_json in client_files:
         if not client_json.exists():
             continue
+        # Identify which committee.clients[] entry this file belongs to.
+        # `client-{j}.json` -> j; `client.json` -> 0 (genconfig's alias).
+        stem = client_json.stem  # "client-3" or "client"
+        if stem == "client":
+            client_idx = 0
+        else:
+            client_idx = int(stem.split("-", 1)[1])
+        if client_idx >= len(committee.clients):
+            # Shouldn't happen unless genconfig over-mints; skip safely.
+            continue
+        this_client_ip = committee.clients[client_idx].endpoint.host
+
         cfg = json.loads(client_json.read_text())
         # net_map in client.json references server IPs (same as nodes).
         if "net_map" in cfg:
@@ -160,10 +172,19 @@ def _fixup_aws_configs(
                 new_map[node_id_str] = f"{ip}:{port}"
             cfg["net_map"] = new_map
         cfg = _rewrite_cert_paths(cfg, node_idx=None, is_client=True)
-        # my_listen_addr: bind to 0.0.0.0 so the server can push to us.
+        # my_listen_addr serves DOUBLE duty in libapollo-rs's apollo
+        # client: it's both the bind address AND the `reply_to`
+        # advertised inside every `ClientMsg::NewBatch`, which the
+        # server's ConfirmationRouter uses to route per-tx
+        # `Confirmation(Hash<Tx>)` back. Setting it to 0.0.0.0 makes
+        # the bind succeed but kills the confirmation flow (no
+        # routable destination), producing lat=nan. Use the client's
+        # actual private IP so it's both bindable on the host (Linux
+        # accepts a bind to the host's own IP) and routable from the
+        # nodes.
         if "my_listen_addr" in cfg:
             _, port_str = cfg["my_listen_addr"].rsplit(":", 1)
-            cfg["my_listen_addr"] = f"0.0.0.0:{port_str}"
+            cfg["my_listen_addr"] = f"{this_client_ip}:{port_str}"
         client_json.write_text(json.dumps(cfg, indent=2))
 
 

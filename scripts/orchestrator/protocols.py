@@ -78,7 +78,7 @@ class Protocol:
 APOLLO = Protocol(
     name="apollo",
     git_url="https://github.com/libdist-rs/libapollo-rs.git",
-    git_sha="d7f02fd381806d4c9c63e89ca0dc7cd00be23d5f",
+    git_sha="2747ce3d87ab609e34629074f2f40a527f8d36b2",
     build_cmd="cargo build --release --bin node-apollo --bin client-apollo --bin genconfig",
     # libapollo-rs node-apollo CLI: `-c nodes-<i>.json -i ip_file -s --sleep N --delta MS`.
     # {node_config} and {ip_file} are substituted by deploy.launch_*.
@@ -100,7 +100,7 @@ APOLLO = Protocol(
 ARTEMIS = Protocol(
     name="artemis",
     git_url="https://github.com/libdist-rs/libapollo-rs.git",
-    git_sha="d7f02fd381806d4c9c63e89ca0dc7cd00be23d5f",
+    git_sha="2747ce3d87ab609e34629074f2f40a527f8d36b2",
     build_cmd="cargo build --release --bin node-artemis --bin client-artemis --bin genconfig",
     node_run_cmd=(
         "{bin_dir}/node-artemis -c {node_config} -i {ip_file} "
