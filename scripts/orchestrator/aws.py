@@ -90,6 +90,106 @@ def _resolve_ami(region: str) -> str:
     return images[0]["ImageId"]
 
 
+def _list_live_by_tag(ec2, tag: str) -> list[dict]:
+    """Return raw EC2 Instance dicts (running + pending) matching tag:Project=<tag>."""
+    resp = ec2.describe_instances(Filters=[
+        {"Name": "tag:Project", "Values": [tag]},
+        {"Name": "instance-state-name", "Values": ["running", "pending"]},
+    ])
+    return [i for r in resp.get("Reservations", []) for i in r.get("Instances", [])]
+
+
+def _role_from_tags(inst: dict) -> Optional[str]:
+    for t in inst.get("Tags", []) or []:
+        if t.get("Key") == "Role":
+            return t.get("Value")
+    return None
+
+
+def _wait_and_fill(ec2, instances: list[Instance]) -> None:
+    """Wait until instances are running + status_ok, then populate IPs in place."""
+    ids = [i.instance_id for i in instances]
+    if not ids:
+        return
+    ec2.get_waiter("instance_running").wait(InstanceIds=ids)
+    ec2.get_waiter("instance_status_ok").wait(InstanceIds=ids)
+    described = ec2.describe_instances(InstanceIds=ids)["Reservations"]
+    by_id: dict[str, dict] = {}
+    for r in described:
+        for inst in r["Instances"]:
+            by_id[inst["InstanceId"]] = inst
+    for i in instances:
+        live = by_id[i.instance_id]
+        i.public_ip = live.get("PublicIpAddress")
+        i.private_ip = live.get("PrivateIpAddress", i.private_ip)
+
+
+def _launch_batch(
+    ec2,
+    ami_id: str,
+    role: str,
+    count: int,
+    instance_type: str,
+    az: str,
+    spot: bool,
+    key_name: str,
+    security_group_id: str,
+    subnet_id: str,
+    tag: str,
+    root_volume_gb: int,
+) -> list[Instance]:
+    """run_instances for one role's worth of hosts. Role-tagged at create
+    so subsequent idempotent provisions can recover the node/client split
+    without consulting aws.json."""
+    if count <= 0:
+        return []
+    market_options = (
+        {"MarketType": "spot", "SpotOptions": {"SpotInstanceType": "one-time"}}
+        if spot
+        else None
+    )
+    run_args = {
+        "ImageId": ami_id,
+        "InstanceType": instance_type,
+        "MinCount": count,
+        "MaxCount": count,
+        "KeyName": key_name,
+        "SecurityGroupIds": [security_group_id],
+        "SubnetId": subnet_id,
+        "Placement": {"AvailabilityZone": az},
+        "BlockDeviceMappings": [{
+            "DeviceName": "/dev/xvda",
+            "Ebs": {
+                "VolumeSize": root_volume_gb,
+                "VolumeType": "gp3",
+                "DeleteOnTermination": True,
+            },
+        }],
+        "TagSpecifications": [{
+            "ResourceType": "instance",
+            "Tags": [
+                {"Key": "Name", "Value": f"{tag}-{role}-{instance_type}"},
+                {"Key": "Project", "Value": tag},
+                {"Key": "Role", "Value": role},
+            ],
+        }],
+    }
+    if market_options:
+        run_args["InstanceMarketOptions"] = market_options
+    resp = ec2.run_instances(**run_args)
+    out: list[Instance] = []
+    for inst in resp["Instances"]:
+        out.append(Instance(
+            instance_id=inst["InstanceId"],
+            public_ip=None,
+            private_ip=inst.get("PrivateIpAddress", ""),
+            role=role,
+            instance_type=instance_type,
+            az=az,
+        ))
+    return out
+
+
 def provision(
     # NOTE: the cluster is homogeneous by design — every host (nodes +
     # clients, every protocol) runs on `instance_type`. Per-protocol
@@ -108,13 +208,26 @@ def provision(
     tag: str = DEFAULT_TAG,
     root_volume_gb: int = DEFAULT_ROOT_VOLUME_GB,
 ) -> list[Instance]:
-    """Launch EC2 instances; persist state to scripts/state/aws.json.
+    """Idempotent EC2 provisioning.
+
+    Behavior:
+    1. Query EC2 for live instances tagged ``Project=<tag>`` in this region.
+    2. If the live set already matches the requested shape (count,
+       instance_type, az, role split — derived from each instance's
+       ``Role`` tag), refresh aws.json from EC2 truth and return.
+       No new instances launched.
+    3. If a live set exists but mismatches the request — count, type, az,
+       or any instance lacks the ``Role`` tag — refuse and tell the
+       caller to either ``fab destroy`` or use a different ``--tag`` so
+       the two clusters don't pile up. (Previously this path silently
+       launched a second cluster, doubling billing and orphaning the
+       original.)
+    4. Otherwise launch fresh: two ``run_instances`` calls so each host
+       gets a precise ``Role={node,client}`` tag at create time.
 
     Caller must have AWS credentials configured (env or ~/.aws/).
     Requires an existing key_name + security_group_id + subnet_id in
-    the chosen region. provisioning a VPC/SG/subnet is out of scope of
-    this skeleton — wire in fabfile.py's `provision` task or document
-    one-time setup steps.
+    the chosen region.
     """
     if key_name is None or security_group_id is None or subnet_id is None:
         raise ValueError(
@@ -124,72 +237,86 @@ def provision(
         )
     region = az[:-1]   # us-west-2d → us-west-2
     ec2 = _ec2_client(region)
-    ami_id = _resolve_ami(region)
-
     total = num_nodes + num_clients
-    market_options = (
-        {"MarketType": "spot", "SpotOptions": {"SpotInstanceType": "one-time"}}
-        if spot
-        else None
+
+    # ---- Idempotency: reuse-or-refuse ---------------------------------
+    live = _list_live_by_tag(ec2, tag)
+    if live:
+        types = {i.get("InstanceType") for i in live}
+        azs = {i.get("Placement", {}).get("AvailabilityZone") for i in live}
+        roles = [_role_from_tags(i) for i in live]
+        node_ids = [i["InstanceId"] for i, r in zip(live, roles) if r == "node"]
+        client_ids = [i["InstanceId"] for i, r in zip(live, roles) if r == "client"]
+        untagged = [i["InstanceId"] for i, r in zip(live, roles) if r is None]
+
+        exact_match = (
+            len(live) == total
+            and types == {instance_type}
+            and azs == {az}
+            and len(node_ids) == num_nodes
+            and len(client_ids) == num_clients
+            and not untagged
+        )
+        if exact_match:
+            print(
+                f"provision: reusing {total} existing instances tagged Project={tag} "
+                f"({num_nodes} nodes + {num_clients} clients, {instance_type} in {az})"
+            )
+            instances: list[Instance] = []
+            for inst in live:
+                role = _role_from_tags(inst) or "node"
+                instances.append(Instance(
+                    instance_id=inst["InstanceId"],
+                    public_ip=inst.get("PublicIpAddress"),
+                    private_ip=inst.get("PrivateIpAddress", ""),
+                    role=role,
+                    instance_type=inst.get("InstanceType", instance_type),
+                    az=inst.get("Placement", {}).get("AvailabilityZone", az),
+                ))
+            # Sort nodes first then clients (launch_remote expects this order).
+            instances.sort(key=lambda i: (0 if i.role == "node" else 1, i.instance_id))
+            _wait_and_fill(ec2, instances)
+            save_state({
+                "region": region,
+                "az": az,
+                "instance_type": instance_type,
+                "spot": spot,
+                "tag": tag,
+                "instances": [asdict(i) for i in instances],
+            })
+            return instances
+
+        # Mismatch — refuse to add to the pile.
+        details = (
+            f"found {len(live)} live instance(s) tagged Project={tag}:\n"
+            f"  types={types}, azs={azs}, "
+            f"nodes={len(node_ids)}, clients={len(client_ids)}, "
+            f"untagged={len(untagged)}\n"
+            f"requested: {num_nodes} nodes + {num_clients} clients "
+            f"({instance_type} in {az})"
+        )
+        suggestion = (
+            "Resolve one of:\n"
+            "  (a) `fab destroy --config <toml>` to terminate the existing cluster\n"
+            "  (b) re-run with --tag <other> to provision a parallel cluster\n"
+            "  (c) match the request to the live cluster (same counts/type/az)"
+        )
+        raise RuntimeError(f"provision: cluster shape mismatch.\n{details}\n{suggestion}")
+
+    # ---- No live set — fresh launch -----------------------------------
+    ami_id = _resolve_ami(region)
+    nodes = _launch_batch(
+        ec2, ami_id, "node", num_nodes,
+        instance_type, az, spot, key_name, security_group_id, subnet_id,
+        tag, root_volume_gb,
     )
-    run_args = {
-        "ImageId": ami_id,
-        "InstanceType": instance_type,
-        "MinCount": total,
-        "MaxCount": total,
-        "KeyName": key_name,
-        "SecurityGroupIds": [security_group_id],
-        "SubnetId": subnet_id,
-        "Placement": {"AvailabilityZone": az},
-        "BlockDeviceMappings": [{
-            "DeviceName": "/dev/xvda",   # AL2023 root EBS device
-            "Ebs": {
-                "VolumeSize": root_volume_gb,
-                "VolumeType": "gp3",
-                "DeleteOnTermination": True,
-            },
-        }],
-        "TagSpecifications": [{
-            "ResourceType": "instance",
-            "Tags": [
-                {"Key": "Name", "Value": f"{tag}-{instance_type}"},
-                {"Key": "Project", "Value": tag},
-            ],
-        }],
-    }
-    if market_options:
-        run_args["InstanceMarketOptions"] = market_options
-
-    resp = ec2.run_instances(**run_args)
-    raw = resp["Instances"]
-    instances: list[Instance] = []
-    for i, inst in enumerate(raw):
-        role = "node" if i < num_nodes else "client"
-        instances.append(Instance(
-            instance_id=inst["InstanceId"],
-            public_ip=None,           # filled in after polling
-            private_ip=inst.get("PrivateIpAddress", ""),
-            role=role,
-            instance_type=instance_type,
-            az=az,
-        ))
-
-    # Wait for running + IP assignment, then for status checks to pass
-    # so cloud-init is done before any install/SSH work hits the host.
-    # Without the status_ok wait, `dnf install` from install_remote can
-    # race cloud-init's package locks.
-    ids = [i.instance_id for i in instances]
-    ec2.get_waiter("instance_running").wait(InstanceIds=ids)
-    ec2.get_waiter("instance_status_ok").wait(InstanceIds=ids)
-    described = ec2.describe_instances(InstanceIds=ids)["Reservations"]
-    by_id: dict[str, dict] = {}
-    for r in described:
-        for inst in r["Instances"]:
-            by_id[inst["InstanceId"]] = inst
-    for i in instances:
-        live = by_id[i.instance_id]
-        i.public_ip = live.get("PublicIpAddress")
-        i.private_ip = live.get("PrivateIpAddress", i.private_ip)
+    clients = _launch_batch(
+        ec2, ami_id, "client", num_clients,
+        instance_type, az, spot, key_name, security_group_id, subnet_id,
+        tag, root_volume_gb,
+    )
+    instances = nodes + clients
+    _wait_and_fill(ec2, instances)
 
     state = {
         "region": region,
@@ -224,15 +351,27 @@ def status() -> None:
         )
 
 
-def destroy() -> None:
-    """Terminate all instances tracked in state. Idempotent."""
+def destroy(tag: str = DEFAULT_TAG) -> None:
+    """Terminate every live instance tagged Project=<tag>. Idempotent.
+
+    Sourced from EC2 (tag query), NOT just aws.json — so orphans left
+    by a crashed provision or out-of-band launch get cleaned up too.
+    The state.json is reset on success.
+    """
     s = load_state()
-    ids = [i["instance_id"] for i in s.get("instances", [])]
-    if not ids:
-        print("no instances to destroy")
-        return
     region = s.get("region", DEFAULT_REGION)
     ec2 = _ec2_client(region)
+    live = _list_live_by_tag(ec2, tag)
+    ids = [i["InstanceId"] for i in live]
+    # Also include anything in state.json (defensive: handles a stale
+    # state pointing at instances that lost their Project tag somehow).
+    for inst in s.get("instances", []):
+        if inst["instance_id"] not in ids:
+            ids.append(inst["instance_id"])
+    if not ids:
+        print("no instances to destroy")
+        save_state({"instances": [], "region": region})
+        return
     ec2.terminate_instances(InstanceIds=ids)
     save_state({"instances": [], "region": region})
     print(f"destroy initiated for {len(ids)} instance(s)")

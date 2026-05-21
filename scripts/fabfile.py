@@ -392,15 +392,21 @@ def status(c, config=None):
 
 
 @task
-def destroy(c, config=None, target="aws"):
-    """Terminate all provisioned AWS instances. Idempotent."""
+def destroy(c, config=None, target="aws", tag=None):
+    """Terminate all live AWS instances tagged Project=<tag>. Idempotent.
+
+    Sourced from EC2 (tag query), not just aws.json — orphans without
+    a matching state entry get cleaned up too.
+    """
     if target == "local":
         from orchestrator.deploy import kill_session
         kill_session()
         print("local tmux session killed")
         return
+    cfg = _load_cfg(config)
     from orchestrator import aws
-    aws.destroy()
+    tag_v = cfg_lib.cli_or(tag, cfg, "aws", "tag", default=aws.DEFAULT_TAG)
+    aws.destroy(tag=tag_v)
 
 
 # ---------------------------------------------------------------------------
