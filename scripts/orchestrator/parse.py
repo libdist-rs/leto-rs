@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import re
 import statistics
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -29,17 +29,32 @@ _DP_LINE = re.compile(r"DP\[(?P<key>Throughput|Latency)\]\s*[:=]\s*(?P<value>[-+
 
 @dataclass
 class Sample:
-    """One DP[…] reading from one client process."""
+    """One DP[…] reading from one client process.
+
+    Carries both the run-level point estimate (`throughput`, `latency_ms`
+    — medians) AND the underlying per-emission-window readings
+    (`throughputs_raw`, `latencies_raw`) so downstream consumers can
+    compute confidence intervals or run statistical tests across windows
+    rather than only across trials. Top-tier-conference reviewers
+    typically want CIs; preserving the raw stream costs ~few KB per row
+    and keeps results.jsonl self-contained.
+
+    `throughputs_raw` / `latencies_raw` are post-warmup-drop (see
+    parse_log) and aggregated across all logs in the run dir, in the
+    order they were read.
+    """
 
     protocol: str
     n: int
     f: int
     trial: int
     rate_target: float           # offered tx/s (the load level being driven)
-    throughput: float            # committed tx/s
-    latency_ms: float            # end-to-end client-side latency
+    throughput: float            # committed tx/s — median over post-warmup windows
+    latency_ms: float            # end-to-end client-side latency — median over windows
     run_id: str                  # results-tag/<protocol>-n<n>-f<f>/run-<trial>
     source_file: str             # path to the client log this sample came from
+    throughputs_raw: list[float] = field(default_factory=list)
+    latencies_raw: list[float] = field(default_factory=list)
 
 
 # Number of leading DP windows to drop as "warmup" before computing the
@@ -52,21 +67,27 @@ class Sample:
 WARMUP_DROP = 1
 
 
-def parse_log(path: Path) -> dict[str, float | None]:
-    """Pull the steady-state median of DP[Throughput] and DP[Latency]
-    from a single log.
+def parse_log(path: Path) -> dict:
+    """Pull the per-emission-window readings of DP[Throughput] and
+    DP[Latency] from a single log, plus their steady-state medians.
 
     Filters:
     - Drop zero readings ("no data this window" — covers post-client-
       finish windows and pre-load windows).
     - Drop the first WARMUP_DROP non-zero readings per stream (warmup
       transient — Zeus's first commit window is famously high-latency).
-    - Median over what remains.
 
     If after warmup-drop fewer than 1 reading remains for a stream,
     the warmup-drop is skipped for that stream (don't lose the data
     for protocols that only emit a few windows, e.g. apollo's closed-
     loop client).
+
+    Returns: {
+      "throughput": median or None,
+      "latency_ms": median or None,
+      "throughputs_raw": post-warmup-drop list (may be empty),
+      "latencies_raw":   post-warmup-drop list (may be empty),
+    }
     """
     throughputs: list[float] = []
     latencies: list[float] = []
@@ -102,6 +123,8 @@ def parse_log(path: Path) -> dict[str, float | None]:
     return {
         "throughput": statistics.median(throughputs) if throughputs else None,
         "latency_ms": statistics.median(latencies) if latencies else None,
+        "throughputs_raw": throughputs,
+        "latencies_raw": latencies,
     }
 
 
@@ -127,6 +150,8 @@ def parse_run_dir(
     """
     thrs: list[float] = []
     lats: list[float] = []
+    thrs_raw: list[float] = []
+    lats_raw: list[float] = []
     seen: list[Path] = []
     for log_path in sorted(run_dir.glob("*.log")):
         readings = parse_log(log_path)
@@ -134,6 +159,8 @@ def parse_run_dir(
             thrs.append(readings["throughput"])
         if readings["latency_ms"] is not None:
             lats.append(readings["latency_ms"])
+        thrs_raw.extend(readings.get("throughputs_raw", []))
+        lats_raw.extend(readings.get("latencies_raw", []))
         if readings["throughput"] is not None or readings["latency_ms"] is not None:
             seen.append(log_path)
     if not thrs and not lats:
@@ -148,6 +175,8 @@ def parse_run_dir(
         latency_ms=statistics.median(lats) if lats else float("nan"),
         run_id=run_id,
         source_file=";".join(str(p) for p in seen),
+        throughputs_raw=thrs_raw,
+        latencies_raw=lats_raw,
     )
 
 

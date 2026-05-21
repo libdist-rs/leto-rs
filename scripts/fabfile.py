@@ -251,7 +251,7 @@ def bench(c, config=None,
 
     tag_v = cfg_lib.cli_or(tag, cfg, "meta", "tag", default="untagged")
     warm_v = int(cfg_lib.cli_or(warmup_secs, cfg, "bench", "warmup_secs", default=60))
-    meas_v = int(cfg_lib.cli_or(measure_secs, cfg, "bench", "measure_secs", default=120))
+    meas_v = int(cfg_lib.cli_or(measure_secs, cfg, "bench", "measure_secs", default=180))
     ssh = _expand(cfg_lib.cli_or(ssh_key_path, cfg, "aws", "ssh_key_path"))
 
     sweep_cfg = SweepConfig(
@@ -315,7 +315,7 @@ def scaling(c, config=None, runs=None, protocols=None,
 
     tag_base = cfg_lib.cli_or(tag, cfg, "meta", "tag", default="scaling")
     warm_v = int(cfg_lib.cli_or(warmup_secs, cfg, "bench", "warmup_secs", default=10))
-    meas_v = int(cfg_lib.cli_or(measure_secs, cfg, "bench", "measure_secs", default=110))
+    meas_v = int(cfg_lib.cli_or(measure_secs, cfg, "bench", "measure_secs", default=180))
     ssh = _expand(cfg_lib.cli_or(ssh_key_path, cfg, "aws", "ssh_key_path"))
 
     skip_scale_down = _to_bool(no_scale_down)

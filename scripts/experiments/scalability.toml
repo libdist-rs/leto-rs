@@ -69,7 +69,7 @@ t_values     = [1, 2, 5, 10, 20]
 loads        = [50000]
 runs         = 3
 warmup_secs  = 10
-measure_secs = 110
+measure_secs = 180
 
 [plot]
 # Scaling figure: x = n, y = throughput, one line per protocol.

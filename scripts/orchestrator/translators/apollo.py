@@ -142,9 +142,12 @@ def _fixup_aws_configs(
         cfg = _rewrite_cert_paths(cfg, node_idx=i, is_client=False)
         node_json.write_text(json.dumps(cfg, indent=2))
 
-    # Rewrite client.json
-    client_json = out_dir / "client.json"
-    if client_json.exists():
+    # Rewrite each per-client config (client-0.json, client-1.json, …)
+    # plus the legacy `client.json` alias (= client 0) for backward compat.
+    client_files = sorted(out_dir.glob("client-*.json")) + [out_dir / "client.json"]
+    for client_json in client_files:
+        if not client_json.exists():
+            continue
         cfg = json.loads(client_json.read_text())
         # net_map in client.json references server IPs (same as nodes).
         if "net_map" in cfg:
@@ -191,6 +194,7 @@ def translate(committee: Committee, out_dir: Path, protocol: str = "apollo") -> 
     node_ips = ",".join(sorted({m.endpoint.host for m in committee.members}))
     client_ips = ",".join(sorted({c.endpoint.host for c in committee.clients})) or "127.0.0.1"
 
+    num_clients = max(1, len(committee.clients))
     cmd = [
         str(genconfig),
         "-n", str(committee.n),
@@ -201,9 +205,10 @@ def translate(committee: Committee, out_dir: Path, protocol: str = "apollo") -> 
         "-C", str(client_base),
         "-M", str(mempool_base),
         "-L", str(client_listen),
+        "-c", str(num_clients),                  # mint N client identities
         "--node_ips", node_ips,
         "--client_ips", client_ips,
-        "--payload", "0",
+        "--payload", "512",                      # match leto/zeus tx_size=512
         "--target", str(out_dir),
     ]
     subprocess.run(cmd, check=True)
@@ -242,15 +247,17 @@ def translate(committee: Committee, out_dir: Path, protocol: str = "apollo") -> 
     paths: dict[str, Path] = {
         "ip_file": out_dir / "ip_file",
         "cli_ip_file": out_dir / "cli_ip_file",
-        "client_config": out_dir / "client.json",
+        "client_config": out_dir / "client.json",       # backward-compat alias = client 0
         "root_cert": out_dir / "root-cert.pem",
     }
     for i in range(committee.n):
         paths[f"node_config_{i}"] = out_dir / f"nodes-{i}.json"
         paths[f"node_chain_{i}"] = out_dir / f"node-{i}.chain.pem"
         paths[f"node_key_{i}"] = out_dir / f"node-{i}.key.pem"
-    paths["client_chain"] = out_dir / "client-0.chain.pem"
-    paths["client_key"] = out_dir / "client-0.key.pem"
+    for j in range(num_clients):
+        paths[f"client_config_{j}"] = out_dir / f"client-{j}.json"
+        paths[f"client_chain_{j}"] = out_dir / f"client-{j}.chain.pem"
+        paths[f"client_key_{j}"] = out_dir / f"client-{j}.key.pem"
 
     # Verify everything genconfig was supposed to produce actually exists.
     for label, p in paths.items():

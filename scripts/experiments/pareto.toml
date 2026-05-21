@@ -49,7 +49,7 @@ t_values     = [1]
 loads        = [1000, 2500, 5000, 10000, 25000, 50000, 100000, 200000]
 runs         = 3
 warmup_secs  = 10
-measure_secs = 110
+measure_secs = 180
 
 [plot]
 x_axis = "throughput"

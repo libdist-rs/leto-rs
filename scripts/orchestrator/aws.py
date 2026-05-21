@@ -4,8 +4,9 @@ Defaults from [[project_zeus_steady_state]] + the leto-aws-experimenter
 agent:
 - Instance type: c8g.large (Graviton 4, 2 vCPU, 4 GiB, EBS-only).
 - Region/AZ: us-west-2d (cheapest spot).
-- AMI: Ubuntu 24.04 LTS arm64, Canonical owner 099720109477.
-- Spot by default.
+- AMI: Amazon Linux 2023 arm64 (owner: amazon, name filter
+  `al2023-ami-2023.*-kernel-*-arm64`). REMOTE_USER is `ec2-user`.
+- On-demand by default (spot=False) for paper-grade run guarantees.
 
 State persisted to scripts/state/aws.json across fab invocations so
 provision/install/build/bench/destroy can hand off cleanly.
@@ -90,6 +91,12 @@ def _resolve_ami(region: str) -> str:
 
 
 def provision(
+    # NOTE: the cluster is homogeneous by design — every host (nodes +
+    # clients, every protocol) runs on `instance_type`. Per-protocol
+    # `Protocol.instance_type` overrides in orchestrator/protocols.py are
+    # NOT consulted here; the fair cross-protocol comparison depends on
+    # identical hardware. If a future sweep needs heterogeneous instance
+    # types, split the provision call by role.
     num_nodes: int,
     num_clients: int,
     instance_type: str = DEFAULT_INSTANCE_TYPE,
@@ -167,12 +174,14 @@ def provision(
             az=az,
         ))
 
-    # Wait for running + IP assignment
-    waiter = ec2.get_waiter("instance_running")
-    waiter.wait(InstanceIds=[i.instance_id for i in instances])
-    described = ec2.describe_instances(
-        InstanceIds=[i.instance_id for i in instances]
-    )["Reservations"]
+    # Wait for running + IP assignment, then for status checks to pass
+    # so cloud-init is done before any install/SSH work hits the host.
+    # Without the status_ok wait, `dnf install` from install_remote can
+    # race cloud-init's package locks.
+    ids = [i.instance_id for i in instances]
+    ec2.get_waiter("instance_running").wait(InstanceIds=ids)
+    ec2.get_waiter("instance_status_ok").wait(InstanceIds=ids)
+    described = ec2.describe_instances(InstanceIds=ids)["Reservations"]
     by_id: dict[str, dict] = {}
     for r in described:
         for inst in r["Instances"]:

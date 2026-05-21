@@ -160,13 +160,10 @@ def launch_local(
     time.sleep(8)
 
     # Per-protocol client count:
-    # - apollo/artemis: single closed-loop client by design.
     # - mysticeti: no separate client (node binary self-generates load
     #   via the TPS env var); skip client launches entirely.
-    # - leto/zeus: orchestrator-defined num_clients.
-    if protocol.name in ("apollo", "artemis"):
-        effective_clients = 1
-    elif protocol.name == "mysticeti":
+    # - apollo/artemis/leto/zeus: orchestrator-defined num_clients.
+    if protocol.name == "mysticeti":
         effective_clients = 0
     else:
         effective_clients = num_clients
@@ -175,7 +172,15 @@ def launch_local(
         client_id = n + cli_idx
         log_path = log_dir / f"client-{client_id}.log"
 
-        per_client = config_dir / f"{protocol.name}-client-{client_id}.json"
+        # Per-protocol client config naming:
+        # - leto/zeus: `<protocol>-client-<client_id>.json` (leto translator
+        #   writes one per client.id, which already starts at n).
+        # - apollo/artemis: `client-<cli_idx>.json` (libapollo-rs genconfig
+        #   mints client identities 0..num_clients-1, indexed from 0).
+        if protocol.name in ("apollo", "artemis"):
+            per_client = config_dir / f"client-{cli_idx}.json"
+        else:
+            per_client = config_dir / f"{protocol.name}-client-{client_id}.json"
         subs = {
             "bin_dir": str(bin_dir),
             "id": str(client_id),
@@ -184,7 +189,7 @@ def launch_local(
             "window": str(window),
             "extra": protocol.client_extra_args,
             "config": str(per_client) if per_client.exists() else "",
-            "client_config": str(apollo_client_config),
+            "client_config": str(per_client) if per_client.exists() else str(apollo_client_config),
             "cli_ip_file": str(apollo_cli_ip_file),
         }
 
@@ -567,6 +572,7 @@ def launch_remote(
     ssh_key_path: str,
     warmup_secs: int = 5,
     measure_secs: int = 30,
+    skip_config_push: bool = False,
 ) -> None:
     """Launch `n` nodes + `num_clients` clients on the provisioned AWS
     cluster for ONE sweep, wait for warmup + measure, tear down, fetch
@@ -574,6 +580,13 @@ def launch_remote(
 
     `state` must have at least `n + num_clients` instances (nodes first,
     clients after).
+
+    When `skip_config_push=True`, the per-host config + cert + key file
+    distribution (and any remote keygen) is skipped — the caller asserts
+    that a prior call with the same (protocol, committee) already placed
+    these files on every host. Only the rate-dependent binary launch +
+    wait + teardown + log fetch run. Used by bench.run_sweep to avoid
+    re-SCPing identical configs across every (load, trial) in a sweep.
     """
     log_dir.mkdir(parents=True, exist_ok=True)
     conns = _fresh_connections(state, ssh_key_path)
@@ -604,7 +617,14 @@ def launch_remote(
     # apollo/artemis: entire genconfig output dir (nodes-*.json, ip_file,
     #   cli_ip_file, client.json, *.pem, …)
     # mysticeti: distributed authorities — push committee/parameters + private/<i>.
-    if protocol.name in ("leto", "zeus"):
+    #
+    # All three branches are skipped when skip_config_push is set; the
+    # caller (typically bench.run_sweep across (load, trial) iterations
+    # with a fixed (protocol, t)) has already placed identical files on
+    # every host in a prior launch_remote call.
+    if skip_config_push:
+        pass
+    elif protocol.name in ("leto", "zeus"):
         server_config = config_dir / f"{protocol.name}-server.json"
         if not server_config.exists():
             raise FileNotFoundError(f"missing server config: {server_config}")
@@ -681,16 +701,19 @@ def launch_remote(
                     c.put(str(pem), f"{run_dir}/node-{i}.{ext}")
 
         def _push_apollo_client(idx_and_conn):
-            _i, c = idx_and_conn
+            i, c = idx_and_conn
             for sf in shared_files:
                 c.put(str(sf), f"{run_dir}/{sf.name}")
-            client_cfg = config_dir / "client.json"
+            # Push this client's per-identity config + TLS cert pair.
+            # libapollo-rs's genconfig mints client identities 0..num_clients-1;
+            # client host `i` runs identity `i`.
+            client_cfg = config_dir / f"client-{i}.json"
             if client_cfg.exists():
-                c.put(str(client_cfg), f"{run_dir}/client.json")
+                c.put(str(client_cfg), f"{run_dir}/client-{i}.json")
             for ext in ("chain.pem", "key.pem"):
-                pem = config_dir / f"client-0.{ext}"
+                pem = config_dir / f"client-{i}.{ext}"
                 if pem.exists():
-                    c.put(str(pem), f"{run_dir}/client-0.{ext}")
+                    c.put(str(pem), f"{run_dir}/client-{i}.{ext}")
 
         print("[launch] distributing apollo/artemis genconfig files")
         with cf.ThreadPoolExecutor(max_workers=max(1, len(conns))) as ex:
@@ -758,14 +781,12 @@ def launch_remote(
     # Give nodes a moment to bind before launching clients.
     time.sleep(2)
 
-    # Per-protocol client count: apollo/artemis are single-client by
-    # design (client.json hardcodes my_id: 0); mysticeti generates its
-    # own load internally. Mirror the effective_clients logic from
-    # launch_local so remote runs don't try to launch a second apollo
-    # client with the same my_id on a different host.
-    if protocol.name in ("apollo", "artemis"):
-        effective_num_clients = 1
-    elif protocol.name == "mysticeti":
+    # Per-protocol client count: mysticeti generates its own load
+    # internally; all other protocols use the orchestrator-defined
+    # num_clients.  Apollo/Artemis now ship a per-client config
+    # (`client-<j>.json`) so multiple clients can coexist without my_id
+    # collisions.
+    if protocol.name == "mysticeti":
         effective_num_clients = 0
     else:
         effective_num_clients = num_clients
@@ -775,10 +796,15 @@ def launch_remote(
     print(f"[launch] starting {effective_num_clients} {protocol.name} clients")
     for i, c in enumerate(effective_client_conns):
         client_id = n + i
+        # Per-protocol per-client config naming.
+        if protocol.name in ("apollo", "artemis"):
+            apollo_per_client = f"{run_dir}/client-{i}.json"
+        else:
+            apollo_per_client = f"{run_dir}/client.json"
         client_cmd = protocol.client_run_cmd.format(
             bin_dir=bin_dir,
             config=f"{run_dir}/{protocol.name}-client-{client_id}.json",
-            client_config=f"{run_dir}/client.json",
+            client_config=apollo_per_client,
             cli_ip_file=f"{run_dir}/cli_ip_file",
             id=client_id,
             rate=rate,

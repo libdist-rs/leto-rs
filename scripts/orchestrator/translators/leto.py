@@ -73,7 +73,7 @@ def translate(committee: Committee, out_dir: Path, protocol: str = "leto") -> di
             "delay_in_ms": 2000,
             "eleader_pipeline_depth": 16,
             "data_timer_duration_ms": 1000,
-            "bench_emit_window_secs": 5,
+            "bench_emit_window_secs": 1,
             "bench_metrics_node": 0,
         },
     }
@@ -113,7 +113,7 @@ def translate(committee: Committee, out_dir: Path, protocol: str = "leto") -> di
                 "tx_size": 512,
                 "burst_interval_ms": 100,
                 "txs_per_burst": 488,             # ~250 KB at 512B/tx
-                "bench_emit_window_secs": 5,
+                "bench_emit_window_secs": 1,
                 "emit_dp": True,
             },
             "client_mode": client_mode,

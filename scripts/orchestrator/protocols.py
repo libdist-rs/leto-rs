@@ -78,7 +78,7 @@ class Protocol:
 APOLLO = Protocol(
     name="apollo",
     git_url="https://github.com/libdist-rs/libapollo-rs.git",
-    git_sha="4b5efa60e8646b8bb94b1559a19c095a7e711707",
+    git_sha="d7f02fd381806d4c9c63e89ca0dc7cd00be23d5f",
     build_cmd="cargo build --release --bin node-apollo --bin client-apollo --bin genconfig",
     # libapollo-rs node-apollo CLI: `-c nodes-<i>.json -i ip_file -s --sleep N --delta MS`.
     # {node_config} and {ip_file} are substituted by deploy.launch_*.
@@ -100,7 +100,7 @@ APOLLO = Protocol(
 ARTEMIS = Protocol(
     name="artemis",
     git_url="https://github.com/libdist-rs/libapollo-rs.git",
-    git_sha="4b5efa60e8646b8bb94b1559a19c095a7e711707",
+    git_sha="d7f02fd381806d4c9c63e89ca0dc7cd00be23d5f",
     build_cmd="cargo build --release --bin node-artemis --bin client-artemis --bin genconfig",
     node_run_cmd=(
         "{bin_dir}/node-artemis -c {node_config} -i {ip_file} "
@@ -116,7 +116,7 @@ ARTEMIS = Protocol(
 LETO = Protocol(
     name="leto",
     git_url="https://github.com/libdist-rs/leto-rs.git",
-    git_sha="9c647e4e1da1a0bfe5dd8f6c07b148b755cf7663",
+    git_sha="a045f11aaef1734362908b41eb9f9a2f34071c6e",
     build_cmd="cargo build --release --bin node",
     # `node` + `node server --id N --config <cfg> --key-file <key>` —
     # client mode reuses the same binary's `client` subcommand which
@@ -134,7 +134,7 @@ LETO = Protocol(
 ZEUS = Protocol(
     name="zeus",
     git_url="https://github.com/libdist-rs/leto-rs.git",
-    git_sha="9c647e4e1da1a0bfe5dd8f6c07b148b755cf7663",
+    git_sha="a045f11aaef1734362908b41eb9f9a2f34071c6e",
     build_cmd="cargo build --release --bin node-zeus --bin node",
     node_run_cmd=(
         "{bin_dir}/node-zeus server --id {id} --config {config} "
@@ -173,7 +173,11 @@ MYSTICETI = Protocol(
         "--metrics-url {metrics_url} --interval-ms 1000 --max-secs {max_secs}"
     ),
     translator_module="orchestrator.translators.mysticeti",
-    instance_type="c8g.xlarge",   # DAG nodes heavier than chain-BFT
+    # No instance_type override: the cluster is provisioned homogeneously
+    # by orchestrator/aws.py from the `[aws].instance_type` config, and
+    # every protocol runs on the same hardware so cross-protocol
+    # comparisons are fair. The Protocol.instance_type field is retained
+    # for future heterogeneous sweeps but is not consulted by provision().
 )
 
 

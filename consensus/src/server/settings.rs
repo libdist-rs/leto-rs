@@ -138,7 +138,7 @@ impl Default for BenchConfig {
             delay_in_ms: 500,
             eleader_pipeline_depth: 16,
             data_timer_duration_ms: 1000,
-            bench_emit_window_secs: 5,
+            bench_emit_window_secs: 1,
             bench_metrics_node: 0,
         }
     }
