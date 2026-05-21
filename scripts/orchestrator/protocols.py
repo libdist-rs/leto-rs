@@ -116,7 +116,7 @@ ARTEMIS = Protocol(
 LETO = Protocol(
     name="leto",
     git_url="https://github.com/libdist-rs/leto-rs.git",
-    git_sha="8253829445a76281a146ade3cf1a2b6537d65721",
+    git_sha="8a29ce6c284c8a9d4c44cfa11ddae77121753edc",
     build_cmd="cargo build --release --bin node",
     # `node` + `node server --id N --config <cfg> --key-file <key>` —
     # client mode reuses the same binary's `client` subcommand which
@@ -134,7 +134,7 @@ LETO = Protocol(
 ZEUS = Protocol(
     name="zeus",
     git_url="https://github.com/libdist-rs/leto-rs.git",
-    git_sha="8253829445a76281a146ade3cf1a2b6537d65721",
+    git_sha="8a29ce6c284c8a9d4c44cfa11ddae77121753edc",
     build_cmd="cargo build --release --bin node-zeus --bin node",
     node_run_cmd=(
         "{bin_dir}/node-zeus server --id {id} --config {config} "
