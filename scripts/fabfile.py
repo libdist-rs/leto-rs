@@ -226,10 +226,17 @@ def bench(c, config=None,
           runs=None, faults_t=None, protocols=None,
           loads=None, load_mode="ramp", faults="none", tag=None,
           target="aws", ssh_key_path=None,
-          warmup_secs=None, measure_secs=None):
+          warmup_secs=None, measure_secs=None,
+          crashes=None):
     """Run a sweep matrix: protocols × scales × loads × trials.
 
     AWS mode requires `ssh_key_path` (CLI or [aws].ssh_key_path).
+
+    --crashes N: static crash-fault — don't spawn the last N nodes of
+    each cell.  Committee config still names all n nodes (so alive ones
+    know full peer set); only n-N actually run.  Equivalent to
+    instantaneous crash at t=-1.  Useful for steady-state under-fault
+    throughput numbers without mid-run injection complexity.
     """
     cfg = _load_cfg(config)
     from orchestrator.bench import SweepConfig, run_sweep
@@ -261,6 +268,7 @@ def bench(c, config=None,
     warm_v = int(cfg_lib.cli_or(warmup_secs, cfg, "bench", "warmup_secs", default=60))
     meas_v = int(cfg_lib.cli_or(measure_secs, cfg, "bench", "measure_secs", default=180))
     ssh = _expand(cfg_lib.cli_or(ssh_key_path, cfg, "aws", "ssh_key_path"))
+    crashes_v = int(cfg_lib.cli_or(crashes, cfg, "bench", "crashes", default=0))
 
     sweep_cfg = SweepConfig(
         protocols=proto_list,
@@ -272,6 +280,7 @@ def bench(c, config=None,
         target=target,
         tag=tag_v,
         ssh_key_path=ssh,
+        crashes=crashes_v,
     )
     out = run_sweep(sweep_cfg)
     print(f"sweep results: {out}")

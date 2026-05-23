@@ -38,6 +38,14 @@ class SweepConfig:
     # Path to the SSH private key used by fabric for AWS hosts.
     # Required when target == "aws". Ignored otherwise.
     ssh_key_path: str | None = None
+    # Static crash-fault: don't spawn the last `crashes` nodes.  The
+    # committee config still names all n nodes (so the alive ones know
+    # the full peer set), but only the first `n - crashes` actually run.
+    # Equivalent to instantaneous crash at t=-1.  Must satisfy
+    # `crashes <= t` for the protocol to be expected to make progress
+    # (n - crashes >= 2t+1), but not enforced — testing past the
+    # threshold is a valid liveness/safety experiment.
+    crashes: int = 0
 
     def num_clients_for(self, n: int) -> int:
         # ⌈n/3⌉ matches the plan; minimum 1.
@@ -161,6 +169,7 @@ def run_sweep(cfg: SweepConfig, total_txs: int = 0, window: int = 0) -> Path:
                         rate=load,
                         total_txs=effective_total_txs,
                         window=effective_window,
+                        crashes=cfg.crashes,
                     )
                     # launch_local is non-blocking — sleep for the run window
                     # here, then kill the session.
@@ -190,6 +199,7 @@ def run_sweep(cfg: SweepConfig, total_txs: int = 0, window: int = 0) -> Path:
                         warmup_secs=cfg.warmup_secs,
                         measure_secs=cfg.measure_secs,
                         skip_config_push=configs_already_generated,
+                        crashes=cfg.crashes,
                     )
             except Exception as e:
                 print(

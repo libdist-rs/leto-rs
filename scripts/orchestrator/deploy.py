@@ -74,8 +74,13 @@ def launch_local(
     window: int,
     session: str = "leto-bench",
     workspace_root: Optional[Path] = None,
+    crashes: int = 0,
 ) -> list[LocalProcess]:
-    """Spawn `n` nodes + `num_clients` clients in tmux windows.
+    """Spawn `n - crashes` nodes + `num_clients` clients in tmux windows.
+
+    The committee config still names all n nodes; only the first
+    `n - crashes` actually run.  Equivalent to instantaneous crash at
+    t=-1 for the last `crashes` nodes.
 
     Returns one LocalProcess per spawned binary. Caller is responsible
     for `kill_session` after the measurement window elapses.
@@ -114,7 +119,12 @@ def launch_local(
     # Key files (leto/zeus only): use repo's examples/ as ground truth.
     leto_keys_dir = workspace_root / "examples" if protocol.name in ("leto", "zeus", "hera") else None
 
-    for node_id in range(n):
+    nodes_alive = max(0, n - crashes)
+    if crashes > 0:
+        print(f"[launch] static crash-fault: spawning {nodes_alive}/{n} nodes "
+              f"(skipping ids {nodes_alive}..{n - 1})")
+
+    for node_id in range(nodes_alive):
         log_path = log_dir / f"node-{node_id}.log"
 
         # Per-protocol substitution map.  All keys defined for every
@@ -574,13 +584,19 @@ def launch_remote(
     warmup_secs: int = 5,
     measure_secs: int = 30,
     skip_config_push: bool = False,
+    crashes: int = 0,
 ) -> None:
-    """Launch `n` nodes + `num_clients` clients on the provisioned AWS
-    cluster for ONE sweep, wait for warmup + measure, tear down, fetch
+    """Launch `n - crashes` nodes + `num_clients` clients on the provisioned
+    AWS cluster for ONE sweep, wait for warmup + measure, tear down, fetch
     per-host logs into `log_dir`.
 
     `state` must have at least `n + num_clients` instances (nodes first,
-    clients after).
+    clients after).  Static crash-fault: when `crashes > 0` the committee
+    config still names all n nodes (so alive ones know the full peer set)
+    but only the first `n - crashes` node binaries are launched.  The
+    abandoned nodes' hosts remain provisioned (we don't terminate them)
+    but no protocol process runs on them.  Equivalent to instantaneous
+    crash at t=-1.
 
     When `skip_config_push=True`, the per-host config + cert + key file
     distribution (and any remote keygen) is skipped — the caller asserts
@@ -773,8 +789,13 @@ def launch_remote(
 
     # --- launch nodes in detached tmux ---
     # Mysticeti now runs on real distributed hosts (one authority per node host).
-    print(f"[launch] starting {n} {protocol.name} nodes")
-    for i in range(n):
+    nodes_alive = max(0, n - crashes)
+    if crashes > 0:
+        print(f"[launch] static crash-fault: starting {nodes_alive}/{n} "
+              f"{protocol.name} nodes (skipping ids {nodes_alive}..{n - 1})")
+    else:
+        print(f"[launch] starting {n} {protocol.name} nodes")
+    for i in range(nodes_alive):
         c = node_conns[i]
         # Build per-protocol substitution dict with ALL keys that any
         # node_run_cmd template may reference (missing keys surface as
