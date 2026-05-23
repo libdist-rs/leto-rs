@@ -47,6 +47,17 @@ def _expand(path):
     return str(Path(str(path)).expanduser())
 
 
+def _parse_load(s: str) -> int:
+    """Parse a single load value: bare int, or suffixed with k/K (×1e3) or M/m (×1e6).
+    "300000" → 300_000 (NOT 300_000_000 as the legacy parser did)."""
+    s = s.strip()
+    if s.endswith("k") or s.endswith("K"):
+        return int(float(s[:-1]) * 1_000)
+    if s.endswith("M") or s.endswith("m"):
+        return int(float(s[:-1]) * 1_000_000)
+    return int(float(s))
+
+
 # ---------------------------------------------------------------------------
 # Tasks
 # ---------------------------------------------------------------------------
@@ -244,10 +255,7 @@ def bench(c, config=None,
     if isinstance(loads_raw, list):
         loads_list = [int(x) for x in loads_raw]
     else:
-        loads_list = [
-            int(float(x.replace("k", "")) * 1000)
-            for x in str(loads_raw).split(",") if x
-        ]
+        loads_list = [_parse_load(x) for x in str(loads_raw).split(",") if x]
 
     tag_v = cfg_lib.cli_or(tag, cfg, "meta", "tag", default="untagged")
     warm_v = int(cfg_lib.cli_or(warmup_secs, cfg, "bench", "warmup_secs", default=60))
@@ -302,10 +310,7 @@ def scaling(c, config=None, runs=None, protocols=None,
     if isinstance(loads_raw, list):
         loads_list = [int(x) for x in loads_raw]
     else:
-        loads_list = [
-            int(float(x.replace("k", "")) * 1000)
-            for x in str(loads_raw).split(",") if x
-        ]
+        loads_list = [_parse_load(x) for x in str(loads_raw).split(",") if x]
 
     protos = cfg_lib.cli_or(
         protocols, cfg, "bench", "protocols",

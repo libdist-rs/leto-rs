@@ -129,10 +129,11 @@ async fn main() -> Result<()> {
             let (tx_commit, rx_commit) = unbounded_channel();
             DummyCommitSink::spawn(rx_commit);
 
-            let make_tx = move |my_id: consensus::Id, nonce: u64, _now_ns: u128| -> TestTx {
-                let mut payload = vec![0u8; tx_size.max(16)];
+            let make_tx = move |my_id: consensus::Id, nonce: u64, now_ns: u128| -> TestTx {
+                let mut payload = vec![0u8; tx_size.max(32)];
                 payload[..8].copy_from_slice(&(my_id as u64).to_le_bytes());
                 payload[8..16].copy_from_slice(&nonce.to_le_bytes());
+                payload[16..32].copy_from_slice(&now_ns.to_le_bytes());
                 TestTx {
                     data: <SimpleData as node::Data>::with_payload(&payload),
                     source: my_id,

@@ -611,7 +611,26 @@ def launch_remote(
         f"mkdir -p {run_dir} {log_remote}",
     )
 
+    # Mysticeti-only: clean prior-run WAL state and re-mkdir the per-authority
+    # val dir.  Without the rm, the 2nd+ run in a sweep hangs in WAL recovery
+    # for tens of seconds (validator opens the existing wal file, replays
+    # committed blocks, only THEN binds the /metrics port), and the dpbridge
+    # scrape window expires producing no DP output.  Per-node mkdir uses
+    # `bash -c` with the host index from a small script (each authority i
+    # owns val-i on node i).
     _, cf = _fabric_imports()
+
+    if protocol.name == "mysticeti":
+        # Each node host i owns the per-authority val-i WAL dir.
+        node_conns_for_wal = conns[:n]
+        def _clean_mysticeti_wal(idx_and_conn):
+            i, c = idx_and_conn
+            c.run(
+                f"rm -rf {run_dir}/val-{i} && mkdir -p {run_dir}/val-{i}",
+                hide=True,
+            )
+        with cf.ThreadPoolExecutor(max_workers=max(1, n)) as ex:
+            list(ex.map(_clean_mysticeti_wal, enumerate(node_conns_for_wal)))
 
     # --- protocol-specific config distribution ---
     # leto/zeus: server.json + per-node keys-{i}.json

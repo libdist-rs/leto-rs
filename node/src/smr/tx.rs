@@ -95,4 +95,22 @@ where
             0
         }
     }
+
+    /// Hera self-load convention: the binary's make_tx writes a u128 little-
+    /// endian timestamp at payload bytes 16..32. We decode it back here so the
+    /// Hera commit loop can compute end-to-end latency without coupling the
+    /// generic consensus crate to SimpleData.
+    fn hera_timestamp_ns(&self) -> Option<u128> {
+        let bytes = bincode::serialize(&self.data).ok()?;
+        // SimpleData is `{ tx: Vec<u8> }`. bincode serializes Vec<u8> as
+        // length-prefix (8 bytes for usize on 64-bit) + raw bytes.  Skip the
+        // length prefix to land at the actual payload bytes.
+        let payload = bytes.get(8..)?;
+        if payload.len() < 32 {
+            return None;
+        }
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&payload[16..32]);
+        Some(u128::from_le_bytes(buf))
+    }
 }

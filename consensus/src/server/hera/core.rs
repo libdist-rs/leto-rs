@@ -223,6 +223,11 @@ pub struct Hera<Tx> {
     pub(crate) bench_emit_interval: tokio::time::Interval,
     pub(crate) emit_dp: bool,
     pub(crate) bench_emit_window_secs: f64,
+    /// Per-window latency samples (ms).  Populated in `on_committed_attestation`
+    /// for txs that carry a `hera_timestamp_ns()`; consumed by the emission
+    /// tick and cleared.  Capacity-bounded to avoid memory blow-up at very high
+    /// commit rates (we down-sample after the cap).
+    pub(crate) latency_samples_ms: Vec<u64>,
 
     // ------------------------------------------------------------------
     // Test hook: max heads len across all committed attestations
@@ -355,6 +360,7 @@ where
             my_last_hash: None,
             prev_attested_heights: FnvHashMap::default(),
             committed_tx_count: 0,
+            latency_samples_ms: Vec::with_capacity(8192),
             bench_emit_interval,
             emit_dp,
             bench_emit_window_secs,
@@ -454,12 +460,22 @@ where
                     }
                 }
 
-                // DP[Throughput] emission.
+                // DP[Throughput] + DP[Latency] emission.
                 _ = self.bench_emit_interval.tick(), if self.emit_dp => {
                     eprintln!(
                         "DP[Throughput]: {}",
                         self.committed_tx_count as f64 / self.bench_emit_window_secs
                     );
+                    if !self.latency_samples_ms.is_empty() {
+                        // Median (50th percentile).  Cheap to compute, robust to
+                        // tail outliers from warmup / GC.  Parser at
+                        // scripts/orchestrator/parse.py averages across windows.
+                        self.latency_samples_ms.sort_unstable();
+                        let mid = self.latency_samples_ms.len() / 2;
+                        let median_ms = self.latency_samples_ms[mid];
+                        eprintln!("DP[Latency]: {}", median_ms);
+                        self.latency_samples_ms.clear();
+                    }
                     self.committed_tx_count = 0;
                 }
             }

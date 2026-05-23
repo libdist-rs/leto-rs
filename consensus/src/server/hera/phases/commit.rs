@@ -345,6 +345,28 @@ where
                 if !payload.is_empty() {
                     if self.emit_dp {
                         self.committed_tx_count += payload.len() as u64;
+                        // Latency tracking: decode the per-tx send-timestamp
+                        // (load_gen embeds it via Transaction::hera_timestamp_ns).
+                        // Cap samples per window at 8192 so very-high-throughput
+                        // runs don't blow memory; down-sample by skipping after
+                        // the cap (statistically OK for median).
+                        if self.latency_samples_ms.len() < 8192 {
+                            let now_ns = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos())
+                                .unwrap_or(0);
+                            for tx in payload.iter() {
+                                if let Some(send_ns) = tx.hera_timestamp_ns() {
+                                    if send_ns > 0 && now_ns >= send_ns {
+                                        let lat_ms = ((now_ns - send_ns) / 1_000_000) as u64;
+                                        self.latency_samples_ms.push(lat_ms);
+                                        if self.latency_samples_ms.len() >= 8192 {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     let payload_owned: Vec<Tx> = (*payload).clone();
                     // Notify batcher of committed round.
