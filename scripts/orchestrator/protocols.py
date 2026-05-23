@@ -181,8 +181,25 @@ MYSTICETI = Protocol(
 )
 
 
+HERA = Protocol(
+    name="hera",
+    git_url="https://github.com/libdist-rs/leto-rs.git",
+    git_sha="8a29ce6c284c8a9d4c44cfa11ddae77121753edc",
+    build_cmd="cargo build --release --bin node-hera",
+    # Self-load: every Hera node generates its own txs at TPS rate.  Mirrors
+    # Mysticeti's pattern — orchestrator divides the offered system rate by
+    # n so total = n * TPS = `rate`.  No separate client process.
+    node_run_cmd=(
+        "TPS={rate_per_node} {bin_dir}/node-hera server --id {id} "
+        "--config {config} --key-file {key_file}"
+    ),
+    client_run_cmd="true",   # self-generated load; no client driver
+    translator_module="orchestrator.translators.hera",
+)
+
+
 REGISTRY: dict[str, Protocol] = {
-    p.name: p for p in (APOLLO, ARTEMIS, LETO, ZEUS, MYSTICETI)
+    p.name: p for p in (APOLLO, ARTEMIS, LETO, ZEUS, MYSTICETI, HERA)
 }
 
 

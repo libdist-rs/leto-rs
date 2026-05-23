@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "node-zeus"
 path = "src/bin/zeus.rs"
 
+[[bin]]
+name = "node-hera"
+path = "src/bin/hera.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]

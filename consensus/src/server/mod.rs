@@ -18,3 +18,6 @@ pub use leto::*;
 
 pub mod zeus;
 pub use zeus::{Zeus, ZeusServer};
+
+pub mod hera;
+pub use hera::{Hera, HeraServer};

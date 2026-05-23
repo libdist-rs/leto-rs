@@ -1,6 +1,8 @@
 mod block;
 mod cert;
 mod element;
+pub mod hera;
+mod hera_msg;
 mod msg;
 mod proposal;
 mod request;
@@ -12,6 +14,8 @@ mod zeus_msg;
 pub use block::*;
 pub use cert::*;
 pub use element::*;
+pub use hera::*;
+pub use hera_msg::*;
 pub use msg::*;
 pub use proposal::*;
 pub use request::*;

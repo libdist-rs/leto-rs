@@ -51,6 +51,7 @@ def kill_session(session: str = "leto-bench") -> None:
     for pattern in (
         "target/release/node ",
         "target/release/node-zeus ",
+        "target/release/node-hera ",
         "target/release/node-apollo ",
         "target/release/client-apollo ",
         "target/release/node-artemis ",
@@ -92,7 +93,7 @@ def launch_local(
         # - apollo / artemis: dev path ~/Github/libapollo-rs (since the
         #   AWS install_remote layout doesn't apply locally).
         # - everything else: state/repos/<name>/ checkout.
-        if protocol.name in ("leto", "zeus"):
+        if protocol.name in ("leto", "zeus", "hera"):
             workspace_root = Path(__file__).resolve().parent.parent.parent
         elif protocol.name in ("apollo", "artemis"):
             workspace_root = Path.home() / "Github" / "libapollo-rs"
@@ -111,7 +112,7 @@ def launch_local(
     apollo_client_config = config_dir / "client.json"
 
     # Key files (leto/zeus only): use repo's examples/ as ground truth.
-    leto_keys_dir = workspace_root / "examples" if protocol.name in ("leto", "zeus") else None
+    leto_keys_dir = workspace_root / "examples" if protocol.name in ("leto", "zeus", "hera") else None
 
     for node_id in range(n):
         log_path = log_dir / f"node-{node_id}.log"
@@ -160,10 +161,10 @@ def launch_local(
     time.sleep(8)
 
     # Per-protocol client count:
-    # - mysticeti: no separate client (node binary self-generates load
+    # - mysticeti, hera: no separate client (node binary self-generates load
     #   via the TPS env var); skip client launches entirely.
     # - apollo/artemis/leto/zeus: orchestrator-defined num_clients.
-    if protocol.name == "mysticeti":
+    if protocol.name in ("mysticeti", "hera"):
         effective_clients = 0
     else:
         effective_clients = num_clients
@@ -624,7 +625,7 @@ def launch_remote(
     # every host in a prior launch_remote call.
     if skip_config_push:
         pass
-    elif protocol.name in ("leto", "zeus"):
+    elif protocol.name in ("leto", "zeus", "hera"):
         server_config = config_dir / f"{protocol.name}-server.json"
         if not server_config.exists():
             raise FileNotFoundError(f"missing server config: {server_config}")
@@ -787,12 +788,12 @@ def launch_remote(
     # Give nodes a moment to bind before launching clients.
     time.sleep(2)
 
-    # Per-protocol client count: mysticeti generates its own load
+    # Per-protocol client count: mysticeti and hera generate their own load
     # internally; all other protocols use the orchestrator-defined
     # num_clients.  Apollo/Artemis now ship a per-client config
     # (`client-<j>.json`) so multiple clients can coexist without my_id
     # collisions.
-    if protocol.name == "mysticeti":
+    if protocol.name in ("mysticeti", "hera"):
         effective_num_clients = 0
     else:
         effective_num_clients = num_clients
