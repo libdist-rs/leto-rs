@@ -74,8 +74,40 @@ where
         let (tx_mem_to_batcher, rx_mem_to_batcher) = unbounded_channel::<(Tx, usize)>();
         let (tx_processor, rx_processor) = unbounded_channel();
 
-        // Clone batcher sender for the client batch listener.
-        let tx_batcher_for_client = tx_mem_to_batcher.clone();
+        // Bounded ingress queue for the Zeus client listener path.
+        //
+        // Why bounded here and not in libmempool's `tx_mem_to_batcher`:
+        // libmempool's `Mempool::spawn` takes an `UnboundedSender` (3rd-party
+        // signature we can't easily change).  Instead we put the bound on the
+        // listener side via a dedicated channel + small forwarder task.
+        //
+        // Back-pressure dynamics: in healthy operation, the forwarder drains
+        // this channel in microseconds (it just relays to libmempool's
+        // unbounded path), so the cap is never hit and the listener never
+        // blocks → baseline throughput is identical to the unbounded path.
+        // Under heavy load + eleader stall (e.g., crash-fault cascading
+        // EleaderBlame), Zeus's main task hogs CPU; tokio scheduling fairness
+        // means the forwarder gets less CPU; the channel fills; the listener's
+        // `send(...).await` blocks; the listener stops polling its TcpReceiver;
+        // TCP recv buffer fills on the client → kernel zero-window-ad → client's
+        // TCP send blocks.  Net: the client slows to whatever the eleader can
+        // actually process, breaking the cascade.
+        //
+        // CAP=1024: ~500 KB at tx_size=512.  Large enough that healthy bursts
+        // never hit it; small enough that backpressure activates within ~10 ms
+        // of CPU starvation at typical bench rates.
+        const CLIENT_INGRESS_CAP: usize = 1024;
+        let (tx_client_bounded, mut rx_client_bounded) =
+            tokio::sync::mpsc::channel::<(Tx, usize)>(CLIENT_INGRESS_CAP);
+        let tx_mem_to_batcher_for_forwarder = tx_mem_to_batcher.clone();
+        tokio::spawn(async move {
+            while let Some(item) = rx_client_bounded.recv().await {
+                if tx_mem_to_batcher_for_forwarder.send(item).is_err() {
+                    break;
+                }
+            }
+        });
+        let tx_batcher_for_client = tx_client_bounded;
 
         // Fan-out: committed batch → app sink + confirmation router.
         let (tx_commit_fanout, mut rx_commit_fanout) = unbounded_channel::<Arc<Batch<Tx>>>();
@@ -215,7 +247,7 @@ where
     /// - `NewTx` (legacy): forward to batcher only.
     async fn run_zeus_client_batch_listener(
         addr: SocketAddr,
-        tx_batcher: tokio::sync::mpsc::UnboundedSender<(Tx, usize)>,
+        tx_batcher: tokio::sync::mpsc::Sender<(Tx, usize)>,
         tx_tx_sender_map: tokio::sync::mpsc::UnboundedSender<(Hash<Tx>, SocketAddr)>,
         num_nodes: usize,
         initial_epoch: u64,
@@ -236,7 +268,16 @@ where
                         let tx_hash: Hash<Tx> = Hash::ser_and_hash(&tx);
                         let _ = tx_tx_sender_map.send((tx_hash, reply_to));
                         let size = bincode::serialized_size(&tx).unwrap_or(0) as usize;
-                        let _ = tx_batcher.send((tx, size));
+                        // Bounded send: under load this awaits when the
+                        // forwarder can't keep up → listener stops polling
+                        // its TcpReceiver → TCP backpressure to the client.
+                        if tx_batcher.send((tx, size)).await.is_err() {
+                            log::warn!(
+                                "Zeus client listener: tx_batcher closed; \
+                                 stopping listener"
+                            );
+                            return;
+                        }
                     }
                 }
                 Ok(ZeusClientMsg::WhoIsEleader) => {
@@ -259,7 +300,12 @@ where
                 }
                 Ok(ZeusClientMsg::NewTx { tx, reply_to: _ }) => {
                     let size = bincode::serialized_size(&tx).unwrap_or(0) as usize;
-                    let _ = tx_batcher.send((tx, size));
+                    if tx_batcher.send((tx, size)).await.is_err() {
+                        log::warn!(
+                            "Zeus client listener: tx_batcher closed (NewTx path)"
+                        );
+                        return;
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
