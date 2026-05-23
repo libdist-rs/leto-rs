@@ -141,19 +141,21 @@ where
     ) -> Result<()> {
         self.current_round += 1;
 
-        // GC cancel handlers only after they've resolved.
-        // Dropping a CancelHandler before the message is transmitted causes
-        // the reliable sender to silently discard the message (is_closed check),
-        // which triggers timeouts, blame cycles, and connection churn.
-        self.cancel_handlers.retain(|_, handlers| {
-            handlers.retain_mut(|h| {
-                matches!(
-                    h.try_recv(),
-                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-                )
-            });
-            !handlers.is_empty()
-        });
+        // GC cancel handlers by round age: drop everything older than
+        // `current_round - GC_DEPTH_ROUNDS` (= 4 * n).  Dropping a
+        // CancelHandler for a permanently-stuck send (e.g., dead peer)
+        // signals the per-peer reliable-sender connection to skip the
+        // message via `cancel_handler.is_closed()`.  This bounds per-peer
+        // memory under sustained crashes — for a perpetually dead peer the
+        // hashmap holds at most `GC_DEPTH_ROUNDS` worth of pending handlers,
+        // not unboundedly many.
+        //
+        // The retain-pending policy that lived here previously held onto
+        // handlers indefinitely whenever the underlying message never resolved
+        // (dead peer in the receive path), causing accumulation across rounds.
+        let gc_depth = crate::server::gc_depth_rounds();
+        let threshold = self.current_round.saturating_sub(gc_depth as Round);
+        self.cancel_handlers.retain(|round, _| *round >= threshold);
 
         // GC old round messages in msg_buf
         self.msg_buf.retain(|r, _| r >= &self.current_round);

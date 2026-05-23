@@ -100,6 +100,7 @@ where
         tx_consensus_to_mem: UnboundedSender<ConsensusMempoolMsg<Id, Round, Tx>>,
         tx_commit: UnboundedSender<Arc<Batch<Tx>>>,
     ) -> Result<()> {
+        crate::server::init_gc_depth_rounds(settings.committee_config.num_nodes());
         let me = settings
             .committee_config
             .get(&my_id)

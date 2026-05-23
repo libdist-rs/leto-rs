@@ -13,7 +13,7 @@ crypto = { package = "libcrypto", git = "https://github.com/libdist-rs/libcrypto
 storage = { package = "libstorage-rs", git = "https://github.com/libdist-rs/libstorage-rs.git" }
 mempool = { package = "libmempool-rs", git = "https://github.com/libdist-rs/libmempool-rs.git" }
 tcp-sender = { git = "https://github.com/libdist-rs/libnet-rs.git" }
-tcp-reliable-sender = { git = "https://github.com/libdist-rs/libnet-rs.git" }
+tcp-reliable-sender = { git = "https://github.com/libdist-rs/libnet-rs.git", features = ["unbounded"] }
 tcp-broadcast = { git = "https://github.com/libdist-rs/libnet-rs.git", features = ["unbounded"] }
 tcp-receiver = { git = "https://github.com/libdist-rs/libnet-rs.git" }
 net-common = { package = "common", git = "https://github.com/libdist-rs/libnet-rs.git" }

@@ -61,7 +61,8 @@ pub struct HeraRoundState<Tx> {
     future_msgs: FnvHashMap<Round, VecDeque<HeraMsg<Tx>>>,
     pub blame_map: FnvHashMap<Id, Signature<Id, Round>>,
     pub got_qc: bool,
-    pub cancel_handlers: Vec<CancelHandler>,
+    /// Per-round cancel handlers (see ZeusRoundState for the contract).
+    pub cancel_handlers: FnvHashMap<Round, Vec<CancelHandler>>,
     #[allow(dead_code)]
     num_nodes: usize,
 }
@@ -74,7 +75,7 @@ impl<Tx> HeraRoundState<Tx> {
             future_msgs: FnvHashMap::default(),
             blame_map: FnvHashMap::default(),
             got_qc: false,
-            cancel_handlers: Vec::new(),
+            cancel_handlers: FnvHashMap::default(),
             num_nodes,
         }
     }
@@ -120,12 +121,10 @@ impl<Tx> HeraRoundState<Tx> {
         self.current_round += 1;
         self.blame_map.clear();
         self.got_qc = false;
-        self.cancel_handlers.retain_mut(|h| {
-            matches!(
-                h.try_recv(),
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-            )
-        });
+        // Round-age GC; see ZeusRoundState::advance_round for rationale.
+        let gc_depth = crate::server::gc_depth_rounds();
+        let threshold = self.current_round.saturating_sub(gc_depth as Round);
+        self.cancel_handlers.retain(|round, _| *round >= threshold);
         if let Some(msgs) = self.future_msgs.remove(&self.current_round) {
             for m in msgs {
                 self.msg_buf.push_back(m);
@@ -140,14 +139,20 @@ impl<Tx> HeraRoundState<Tx> {
         &mut self,
         h: CancelHandler,
     ) {
-        self.cancel_handlers.push(h);
+        self.cancel_handlers
+            .entry(self.current_round)
+            .or_default()
+            .push(h);
     }
 
     pub fn add_handlers(
         &mut self,
         hs: Vec<CancelHandler>,
     ) {
-        self.cancel_handlers.extend(hs);
+        self.cancel_handlers
+            .entry(self.current_round)
+            .or_default()
+            .extend(hs);
     }
 
     pub fn disable_timer(
@@ -269,6 +274,7 @@ where
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug + 'static,
     {
+        crate::server::init_gc_depth_rounds(settings.committee_config.num_nodes());
         let me = settings
             .committee_config
             .get(&my_id)
