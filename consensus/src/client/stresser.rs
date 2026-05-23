@@ -8,7 +8,7 @@ use log::*;
 use rand::{thread_rng, Rng};
 use std::marker::PhantomData;
 use std::time::{Duration, Instant};
-use tcp_sender::TcpSimpleSender;
+use tcp_broadcast::TcpBroadcastSender;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 
@@ -22,7 +22,13 @@ pub struct Stressor<Tx> {
     /// Sends raw serialized message bytes to all servers.  The phantom type is
     /// `Vec<u8>` because we serialize `ClientMsg`/`ZeusClientMsg` manually and
     /// pass raw `Bytes` — the phantom is not used on the wire.
-    consensus_sender: TcpSimpleSender<Id, Vec<u8>>,
+    ///
+    /// Switched from `TcpSimpleSender` to `TcpBroadcastSender` so that
+    /// `broadcast_with_faults` can return after the BFT quorum of `n - t`
+    /// peers has accepted the message, dropping pending sends to slow/dead
+    /// peers via the worker-side cancel flag.  This is what unblocks the
+    /// client when `--crashes N` removes some nodes.
+    consensus_sender: TcpBroadcastSender<Id, Vec<u8>>,
     /// Receives committed per-tx hash `Hash<Tx>` from the confirmation listener
     /// task (server emits `Confirmation(Hash<Tx>)` per committed tx).
     /// The listener deserializes the server reply and forwards the hash here.
@@ -64,7 +70,7 @@ where
 
         // `consensus_sender` is typed with `Vec<u8>` phantom — we serialize
         // manually and pass raw `Bytes`.
-        let consensus_sender = TcpSimpleSender::<Id, Vec<u8>>::with_peers(peer_map);
+        let consensus_sender = TcpBroadcastSender::<Id, Vec<u8>>::with_peers(peer_map);
 
         // Bind confirmation listener on my_confirmation_address:my_confirmation_port.
         // Port 0 lets the OS pick a free ephemeral port (for in-process harness).
@@ -254,8 +260,14 @@ where
                             let bytes = bytes::Bytes::from(
                                 bincode::serialize(&msg).map_err(anyhow::Error::new)?,
                             );
+                            // BFT quorum: f = (n - 1) / 3.  Wait for n - f peers
+                            // to accept the message; cancel pending sends to the
+                            // (up to f) slow/dead peers.  Per-tx Confirmations
+                            // from any n - f alive servers drive forward progress.
+                            let n = all_ids.len();
+                            let fault_threshold = n.saturating_sub(1) / 3;
                             let _ = self.consensus_sender
-                                .broadcast(&all_ids, bytes)
+                                .broadcast_with_faults(&all_ids, bytes, fault_threshold)
                                 .await;
                         }
                         ClientMode::ZeusEleaderOnly { .. } => {
@@ -268,9 +280,16 @@ where
                             let bytes = bytes::Bytes::from(
                                 bincode::serialize(&msg).map_err(anyhow::Error::new)?,
                             );
-                            let _ = self.consensus_sender
-                                .send(eleader, bytes)
-                                .await;
+                            // Single-target enqueue.  `send` returns immediately
+                            // with a CancelHandle; we drop the handle here, which
+                            // is the "fire and forget" path — the worker will
+                            // deliver if the eleader is reachable, or the per-peer
+                            // mpsc fills and subsequent sends drop on the floor
+                            // (best-effort).  If the eleader is dead, Zeus's
+                            // sig-chain eleader-blame mechanism handles recovery;
+                            // the client should re-resolve `target_eleader` after
+                            // a view-change (TODO: not yet wired).
+                            let _ = self.consensus_sender.send(eleader, bytes);
                         }
                     }
 
