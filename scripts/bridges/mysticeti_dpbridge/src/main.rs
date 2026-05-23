@@ -148,19 +148,26 @@ fn scrape(client: &reqwest::blocking::Client, url: &str) -> Result<Scrape> {
 /// Find a counter, gauge, or histogram-count by name; returns the sum
 /// across labels.
 ///
-/// Counter / Gauge / Untyped are matched directly on the series name.
-/// Histograms are matched on either:
-///   - the bare histogram name (`latency_s`) → use the histogram's
-///     sample count (i.e. count of observations, which is what
-///     Mysticeti increments per committed tx);
-///   - the explicit `<name>_count` series (the caller spelled it out)
-///     → same: extract from any Histogram whose bare name matches the
-///     `_count`-stripped requested name.
+/// **Crucial:** prometheus-parse (0.2.5) emits each histogram series in DUAL
+/// representation — for every labelset it produces both:
+///   - `Untyped` samples for `<name>_count` and `<name>_sum` (the per-labelset
+///     count + sum from the exposition lines), AND
+///   - a single `Histogram` sample for `<name>` (bundling all `_bucket` lines).
+/// Both representations carry the SAME observation count for the same
+/// labelset.  Earlier this function matched both branches, double-counting
+/// every observation (see commit msg).
 ///
-/// This handles prometheus-parse's API choice to bundle histogram
-/// count/sum/buckets into a single `Value::Histogram` sample rather
-/// than emitting them as separate counter series.
+/// To pick exactly one representation, this function dispatches on the caller-
+/// supplied name:
+///   - name ends in `_count` (e.g. `latency_s_count`) → ONLY match the
+///     Counter/Untyped branch on the exact `<name>_count` series.
+///   - name has no `_count` suffix (e.g. `latency_s`) → ONLY match the
+///     Histogram branch on `<name>` and read the +Inf bucket count.
+/// Anything else (plain Counter / Gauge with no histogram twin) still works
+/// because the Histogram branch only fires when a matching Histogram sample
+/// exists.
 fn find_counter(scrape: &Scrape, name: &str, workload: Option<&str>) -> Option<f64> {
+    let want_count_series = name.ends_with("_count");
     let histogram_target = name.strip_suffix("_count").unwrap_or(name);
     let mut sum = 0.0f64;
     let mut found = false;
@@ -172,17 +179,13 @@ fn find_counter(scrape: &Scrape, name: &str, workload: Option<&str>) -> Option<f
         }
         match &sample.value {
             Value::Counter(v) | Value::Gauge(v) | Value::Untyped(v) => {
-                if sample.metric == name {
+                if want_count_series && sample.metric == name {
                     sum += *v;
                     found = true;
                 }
             }
             Value::Histogram(hist_samples) => {
-                if sample.metric == histogram_target {
-                    // Histogram total observation count = highest +Inf bucket
-                    // OR equivalently the last cumulative bucket count.  The
-                    // prometheus-parse HistogramCount type exposes the +Inf
-                    // bucket as the last entry; sum() over that gives the count.
+                if !want_count_series && sample.metric == histogram_target {
                     if let Some(last) = hist_samples.last() {
                         sum += last.count;
                         found = true;
