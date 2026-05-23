@@ -1,0 +1,72 @@
+# Crash-fault experiment: 6 protocols × loads × 3 trials at n=4 with
+# 1 node statically crashed (didn't spawn).  Within the f=1 tolerance
+# of n=3t+1 = 4, every protocol is expected to make progress.
+#
+# Methodology: at launch time the orchestrator spawns only `n - crashes`
+# nodes.  The committee config still names all n nodes, so the alive
+# nodes know the full peer set and will try (and fail) to dial the dead
+# ones.  This measures STEADY-STATE throughput-under-fault, not view-
+# change latency or recovery time — those need a mid-run crash injection
+# (not yet implemented; see bench.py).
+#
+# Hera v1 caveat: no per-author dormancy.  The dead author's blames
+# accumulate in every sig-block but the sig-chain continues with n-1
+# data sub-chains.  Expected: degraded throughput + elevated latency
+# vs no-crash baseline, no view-change spike (by design).
+#
+# Run end-to-end:
+#   fab run --config experiments/crashes.toml
+#
+# Or any single step:
+#   fab provision --config experiments/crashes.toml
+#   fab install   --config experiments/crashes.toml
+#   fab build     --config experiments/crashes.toml
+#   fab bench     --config experiments/crashes.toml
+#   fab plot      --config experiments/crashes.toml
+#   fab destroy   --config experiments/crashes.toml
+#
+# CLI flags still override:
+#   fab bench --config experiments/crashes.toml --crashes 2  # past the f=1 threshold
+
+[meta]
+tag = "crashes-v1"
+# Steps executed in order by `fab run`. Comment out to skip.
+steps = ["provision", "install", "build", "smoke", "bench", "plot", "destroy"]
+
+[aws]
+# Same cluster shape as pareto.toml so results are directly comparable.
+key_name           = "leto-bench"
+security_group_id  = "sg-00e60e97deb4c41cc"
+subnet_id          = "subnet-0e31e6c0b1430bdc2"
+ssh_key_path       = "~/.ssh/leto-bench.pem"
+instance_type      = "c8g.large"
+az                 = "us-west-2d"
+spot               = false
+num_nodes          = 4
+num_clients        = 2
+root_volume_gb     = 30
+
+[install]
+protocols = ["apollo", "artemis", "leto", "zeus", "hera", "mysticeti"]
+
+[build]
+protocols = ["apollo", "artemis", "leto", "zeus", "hera", "mysticeti"]
+
+[smoke]
+# Quick wiring validation before the full sweep (no crash yet — confirms
+# baseline launch works against the freshly-provisioned cluster).
+protocol = "leto"
+rate     = 2000
+duration = 30
+
+[bench]
+protocols    = ["apollo", "artemis", "leto", "zeus", "hera", "mysticeti"]
+t_values     = [1]                                  # n = 3t+1 = 4
+crashes      = 1                                    # spawn 3 of 4 nodes
+loads        = [10000, 50000, 100000, 200000]       # mid-to-saturation range
+runs         = 3
+warmup_secs  = 15                                   # +5s vs pareto: more time for sig-chain to settle with a dead peer
+measure_secs = 180
+
+[plot]
+x_axis = "throughput"
