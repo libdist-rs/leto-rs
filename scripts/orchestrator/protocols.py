@@ -184,7 +184,7 @@ MYSTICETI = Protocol(
 HERA = Protocol(
     name="hera",
     git_url="https://github.com/libdist-rs/leto-rs.git",
-    git_sha="8a29ce6c284c8a9d4c44cfa11ddae77121753edc",
+    git_sha="7041b175f1c1fbcd5bf63f82bdd97089969dcdb7",
     build_cmd="cargo build --release --bin node-hera",
     # Self-load: every Hera node generates its own txs at TPS rate.  Mirrors
     # Mysticeti's pattern — orchestrator divides the offered system rate by
