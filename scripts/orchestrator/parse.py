@@ -98,12 +98,22 @@ def parse_log(path: Path) -> dict:
                 continue
             key = m.group("key")
             value = float(m.group("value"))
-            if value <= 0.0:
-                continue
             if key == "Throughput":
+                # KEEP zero-throughput windows. For bursty-commit protocols
+                # (e.g., Hera under faults: data plane keeps minting blocks
+                # but sig-chain stalls until view-change, then commits the
+                # backlog in one burst) the per-window stream is mostly 0
+                # with occasional huge spikes. Filtering zeros and taking
+                # the median would report ~50k for a real ~5k sustained
+                # rate. We keep all windows and take the mean below, so
+                # `throughput = sum(committed_txs) / measure_secs`.
                 throughputs.append(value)
             elif key == "Latency":
-                latencies.append(value)
+                # Latency 0 isn't emitted unless there's at least one
+                # sample in the window; filtering 0 is defensive but
+                # rarely fires.
+                if value > 0.0:
+                    latencies.append(value)
 
     def _trim_warmup(xs: list[float]) -> list[float]:
         # Drop the first WARMUP_DROP readings if at least one remains
@@ -121,7 +131,10 @@ def parse_log(path: Path) -> dict:
     latencies = _trim_warmup(latencies)
 
     return {
-        "throughput": statistics.median(throughputs) if throughputs else None,
+        # MEAN, not median, so bursty protocols (sig-chain stalls then
+        # catches up) report the true `total_txs / measure_secs` rate.
+        # For steady protocols mean ≈ median, so this is a no-op there.
+        "throughput": statistics.mean(throughputs) if throughputs else None,
         "latency_ms": statistics.median(latencies) if latencies else None,
         "throughputs_raw": throughputs,
         "latencies_raw": latencies,
