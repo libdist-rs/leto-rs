@@ -379,9 +379,9 @@ def plot(c, config=None, tag=None, x_axis=None):
     jsonl = target / "results.jsonl"
     plots_dir = target / "plots"
     if x_v == "throughput":
-        render_pareto(jsonl, plots_dir / "pareto.png")
+        render_pareto(jsonl, plots_dir / "pareto.pdf")
     elif x_v == "n":
-        render_scaling(jsonl, plots_dir / "scaling.png")
+        render_scaling(jsonl, plots_dir / "scaling.pdf")
     elif x_v == "crash":
         render_crash_table(jsonl, plots_dir / "crash.csv")
     else:
