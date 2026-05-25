@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn bincode_arc_roundtrip() {
-        use crate::types::{DataBlockEnvelope, DataBlockSig};
+        use crate::types::DataBlockEnvelope;
         // Verify that Arc<Vec<Tx>> survives a bincode round-trip.
         let env = DataBlockEnvelope::<u32> {
             epoch: 1,

@@ -64,6 +64,7 @@ pub struct RoundContext<Tx> {
     pub(crate) got_qc: bool,
 
     // Cache
+    #[allow(dead_code)]
     num_nodes: usize,
 }
 

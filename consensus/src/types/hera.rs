@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 // Hera uses Zeus's data-block types unchanged. They are available via the
 // parent types module (which re-exports zeus::*). We import them here for
 // use within this file.
-use super::zeus::{AttestationSig, DataBlock, DataBlockEnvelope};
+use super::zeus::{AttestationSig, DataBlockEnvelope};
 
 use crate::Round;
 use crypto::hash::Hash;

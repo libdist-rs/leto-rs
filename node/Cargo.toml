@@ -55,6 +55,3 @@ git = "https://github.com/libdist-rs/libnet-rs.git"
 
 [features]
 benchmark = ["consensus/benchmark"]
-
-[profile.release]
-debug = 1

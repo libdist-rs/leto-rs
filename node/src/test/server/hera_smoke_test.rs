@@ -17,7 +17,7 @@ use std::sync::{
 use std::time::Duration;
 
 use crate::{
-    server::{BenchConfig, Config, DummyCommitSink, HeraServer, Party, Settings, StorageConfig},
+    server::{BenchConfig, Config, HeraServer, Party, Settings, StorageConfig},
     Data, Id, KeyConfig, Round, SimpleData, SimpleTx,
 };
 use anyhow::Result;

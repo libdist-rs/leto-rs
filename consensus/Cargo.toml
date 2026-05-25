@@ -35,3 +35,6 @@ once_cell = "1"
 default = []
 microbench = []
 benchmark = []
+# Compile-time signature-scheme selection in keys.rs (`#[cfg(feature = "RSA")]`).
+# Off by default; declared so the cfg checks are recognised.
+RSA = []

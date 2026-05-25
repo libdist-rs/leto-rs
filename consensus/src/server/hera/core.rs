@@ -30,7 +30,7 @@ use tokio::sync::{
 use tokio::time::{interval, Interval};
 
 use super::chain_state::{DataBlockHash, MultiAuthorDataChainState};
-use super::phases::{HeraCommitContext, HeraCommittedAttestation};
+use super::phases::HeraCommitContext;
 
 // ---------------------------------------------------------------------------
 // Type aliases

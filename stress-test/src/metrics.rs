@@ -5,6 +5,7 @@ use std::time::Instant;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // some fields are recorded for completeness but not yet read
 pub struct LevelMetrics {
     pub target_rate: u64,
     pub actual_tps: f64,

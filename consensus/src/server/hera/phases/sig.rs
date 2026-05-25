@@ -9,7 +9,7 @@
 /// is the rleader, because every node is continuously producing data blocks
 /// and there is always something fresh to attest.
 use crate::{
-    server::hera::{phases::commit::HeraCommitMsg, Hera},
+    server::hera::Hera,
     types::{
         hera::MultiAttestation, Block, Certificate, HeraMsg, Proposal, Signature, Transaction,
     },

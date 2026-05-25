@@ -14,6 +14,7 @@ pub struct NodeHarness {
     /// Extra commit receivers for non-metrics nodes (kept alive so channels
     /// don't close)
     _drain_tasks: Vec<tokio::task::JoinHandle<()>>,
+    #[allow(dead_code)] // RAII guard: kept alive so the temp dir isn't deleted early
     pub temp_dir: TempDir,
 }
 

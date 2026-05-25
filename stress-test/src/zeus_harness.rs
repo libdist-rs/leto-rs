@@ -12,12 +12,14 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 
+#[allow(dead_code)] // test harness scaffolding, retained for future zeus stress tests
 pub struct ZeusNodeHarness {
     exit_senders: Vec<oneshot::Sender<()>>,
     _drain_tasks: Vec<tokio::task::JoinHandle<()>>,
     pub temp_dir: TempDir,
 }
 
+#[allow(dead_code)]
 impl ZeusNodeHarness {
     pub fn spawn_nodes(
         config: &StressTestConfig,
