@@ -116,7 +116,7 @@ ARTEMIS = Protocol(
 LETO = Protocol(
     name="leto",
     git_url="https://github.com/libdist-rs/leto-rs.git",
-    git_sha="0345cfdef9633628ead0ac158a912356c93d8c23",
+    git_sha="9c472452ea4e15f40dbe13af495cefabd5a0d997",
     build_cmd="cargo build --release --bin node",
     # `node` + `node server --id N --config <cfg> --key-file <key>` —
     # client mode reuses the same binary's `client` subcommand which
@@ -134,7 +134,7 @@ LETO = Protocol(
 ZEUS = Protocol(
     name="zeus",
     git_url="https://github.com/libdist-rs/leto-rs.git",
-    git_sha="0345cfdef9633628ead0ac158a912356c93d8c23",
+    git_sha="9c472452ea4e15f40dbe13af495cefabd5a0d997",
     build_cmd="cargo build --release --bin node-zeus --bin node",
     node_run_cmd=(
         "{bin_dir}/node-zeus server --id {id} --config {config} "
@@ -184,7 +184,7 @@ MYSTICETI = Protocol(
 HERA = Protocol(
     name="hera",
     git_url="https://github.com/libdist-rs/leto-rs.git",
-    git_sha="0345cfdef9633628ead0ac158a912356c93d8c23",
+    git_sha="9c472452ea4e15f40dbe13af495cefabd5a0d997",
     build_cmd="cargo build --release --bin node-hera",
     # Self-load: every Hera node generates its own txs at TPS rate.  Mirrors
     # Mysticeti's pattern — orchestrator divides the offered system rate by
