@@ -88,11 +88,22 @@ fn build_server_settings(db_dir: &std::path::Path) -> Settings {
         },
         bench_config: BenchConfig {
             batch_size: 50_000,
-            batch_timeout: Duration::from_millis(200),
+            // Override via ZEUS_BATCH_TIMEOUT_MS to reproduce the AWS timing
+            // collision (batch_timeout == data_timer_duration_ms).  Default
+            // 200 ms keeps the original fast-batcher behavior.
+            batch_timeout: Duration::from_millis(
+                std::env::var("ZEUS_BATCH_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(200),
+            ),
             // Short delay → fast blame timer (4 * 200 = 800 ms)
             delay_in_ms: 200,
             eleader_pipeline_depth: 16,
-            data_timer_duration_ms: 1000,
+            data_timer_duration_ms: std::env::var("ZEUS_DATA_TIMER_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1000),
             bench_emit_window_secs: 5,
             bench_metrics_node: 0,
         },
@@ -125,7 +136,18 @@ fn build_client_settings() -> client::Settings {
         consensus_config: client::Config {
             parties: client_parties,
         },
-        client_mode: client::ClientMode::LetoBroadcast,
+        // Override via ZEUS_CLIENT_TARGET=<id> to reproduce the AWS Zeus
+        // client model: all txs go to ONE fixed node (resolved once, never
+        // follows view-changes).  Default LetoBroadcast preserves original.
+        client_mode: match std::env::var("ZEUS_CLIENT_TARGET")
+            .ok()
+            .and_then(|v| v.parse::<Id>().ok())
+        {
+            Some(id) => client::ClientMode::ZeusEleaderOnly {
+                eleader_id: Some(id),
+            },
+            None => client::ClientMode::LetoBroadcast,
+        },
         my_confirmation_address: "0.0.0.0".to_string(),
         my_confirmation_port: STRESSOR_CONFIRMATION_PORT,
     }
@@ -133,6 +155,30 @@ fn build_client_settings() -> client::Settings {
 
 #[tokio::test]
 async fn test_crash_fault_view_change() -> Result<()> {
+    // Logging: root Off, only the `eleader_vc` target prints at Info so we
+    // observe nothing but the eleader view-change events (blame + epoch
+    // advance), per the diagnostic requirement.
+    {
+        use log4rs::append::console::ConsoleAppender;
+        use log4rs::config::{Appender, Config as L4Config, Logger, Root};
+        use log4rs::encode::pattern::PatternEncoder;
+        let stdout = ConsoleAppender::builder()
+            .encoder(Box::new(PatternEncoder::new("{d(%H:%M:%S%.3f)} [VC] {m}{n}")))
+            .build();
+        if let Ok(config) = L4Config::builder()
+            .appender(Appender::builder().build("stdout", Box::new(stdout)))
+            .logger(
+                Logger::builder()
+                    .appender("stdout")
+                    .additive(false)
+                    .build("eleader_vc", log::LevelFilter::Info),
+            )
+            .build(Root::builder().build(log::LevelFilter::Off))
+        {
+            let _ = log4rs::init_config(config);
+        }
+    }
+
     // Shared atomic counters driven by node 0's commit channel.
     let total_commits: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     let post_kill_commits: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));

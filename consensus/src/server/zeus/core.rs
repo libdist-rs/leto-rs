@@ -768,6 +768,7 @@ where
                 };
 
                 info!(
+                    target: "eleader_vc",
                     "Zeus: TimerData expired sig_round={} epoch={}; blaming eleader {} (silence, \
                      last_seen_height={})",
                     r, epoch, eleader_id, last_seen_height
@@ -790,6 +791,7 @@ where
             }
             DataTimerKind::RleaderWaitingFresh => {
                 warn!(
+                    target: "eleader_vc",
                     "Zeus: TimerData expired sig_round={} epoch={}; would-be-blame eleader {} \
                      (rleader waiting for fresh block)",
                     r, self.current_epoch, eleader_id
@@ -895,6 +897,7 @@ where
         use crate::server::BatcherConsensusMsg;
 
         info!(
+            target: "eleader_vc",
             "Zeus: advance_to_epoch {} → {}",
             self.current_epoch, new_epoch
         );

@@ -40,33 +40,41 @@ where
     {
         let r = self.round_state.round();
 
-        // --- Freshness check (attestation-freshness rule) ---
+        // Highest admitted data height.  `latest_h` is monotone and
+        // `last_attested_data_height` only ever holds a previously-pinned
+        // `latest_h`, so `latest_h >= last_attested_data_height` always holds.
         let latest_h = self
             .latest_eleader_block
             .as_ref()
             .map(|b| b.envelope.height)
             .unwrap_or(0);
 
-        if latest_h <= self.last_attested_data_height {
-            // No fresh block available; arm the timer and enter waiting state.
-            debug!(
-                "Zeus: rleader round {}: no fresh block \
-                 (latest_h={} <= last_attested={}); waiting",
-                r, latest_h, self.last_attested_data_height
-            );
-            self.rleader_waiting_fresh = true;
-            self.arm_data_timer(DataTimerKind::RleaderWaitingFresh);
-            return Ok(());
-        }
-
-        // Fresh block available — proceed with the propose.
+        // Sig-chain liveness must NOT depend on data-chain liveness.
+        //
+        // The previous rule gated the propose on a *strictly* fresh block
+        // (`latest_h > last_attested`) and otherwise entered a "waiting"
+        // state, emitting no proposal.  That breaks Leto's core invariant —
+        // every round emits a proposal that pulls all nodes to the next round
+        // in lockstep.  When a live rleader withholds its proposal (data plane
+        // idle), every round must instead be resolved by blame; the per-round
+        // blame timers fire independently, nodes drift onto different rounds,
+        // their blame votes scatter, no single round ever reaches a quorum QC,
+        // and the sig-chain wedges permanently.
+        //
+        // Fix: propose every round (`latest_h >= last_attested`, i.e. always),
+        // re-pinning the current head when no new data block has arrived.  A
+        // repeat pin is a no-op for throughput — the prefix-commit projection
+        // (Def 8.7) skips heights <= `zeus_committed_high` — but it keeps the
+        // sig-chain advancing, exactly as Leto does with (possibly empty)
+        // block proposals.
         self.rleader_waiting_fresh = false;
         self.disarm_data_timer();
 
-        debug!(
-            "Zeus: sig-chain leader proposing attestation for round {} \
-             (latest_h={} last_attested={})",
-            r, latest_h, self.last_attested_data_height
+        info!(
+            target: "sig_dbg",
+            "rleader round {}: PROPOSING attestation \
+             (latest_h={} last_attested={}) my_id={}",
+            r, latest_h, self.last_attested_data_height, self.my_id
         );
 
         // Zeus: FuncMakeAttestation — pin the highest-height admitted block,
@@ -165,6 +173,11 @@ where
     {
         // Zeus: OnSignatureRoundPropose — check correct round
         let cur_round = self.round_state.round();
+        info!(
+            target: "sig_dbg",
+            "recv SigPropose round={} cur_round={} my_id={}",
+            proposal.round(), cur_round, self.my_id,
+        );
         if proposal.round() != cur_round {
             // Future/past round — round context already handled buffering.
             warn!(
@@ -290,7 +303,15 @@ where
         self.try_commit()?;
 
         let new_round = self.round_state.round();
-        info!("Zeus: sig-chain advancing to round {}", new_round);
+        info!(
+            target: "sig_dbg",
+            "advance round={} leader={} next_leader={} timer_enabled={} my_id={}",
+            new_round,
+            self.sig_leader_context.leader(),
+            self.sig_leader_context.next_leader(),
+            self.timer_enabled,
+            self.my_id,
+        );
 
         // Per-node TimerData (zeus.tex Def 8.4): arm on every sig-chain round
         // entry.  If the rleader immediately proposes (fresh block available),
@@ -347,6 +368,11 @@ where
         auth.verify_without_id_check(&blame_hash, pk)?;
 
         self.round_state.blame_map.insert(auth.get_id(), auth);
+        info!(
+            target: "sig_dbg",
+            "SigBlame round={} from={} count={}/{} my_id={}",
+            blame_round, origin, self.round_state.blame_map.len(), qc_len, self.my_id,
+        );
         if self.round_state.blame_map.len() != qc_len {
             return Ok(());
         }
@@ -412,6 +438,13 @@ where
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
     {
+        info!(
+            target: "sig_dbg",
+            "ROUND TIMEOUT round={} leader={}; broadcasting SigBlame, disabling round timer, my_id={}",
+            self.round_state.round(),
+            self.sig_leader_context.leader(),
+            self.my_id,
+        );
         self.round_state.disable_timer(&mut self.timer_enabled);
 
         let blame_msg = self.round_state.round();
