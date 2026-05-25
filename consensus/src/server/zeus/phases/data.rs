@@ -38,11 +38,12 @@ where
     /// Constructs a DataBlock extending the in-flight proposed tip (not the
     /// admitted head) and multicasts it.
     ///
-    /// Pipelining: up to `eleader_pipeline_depth` (W) blocks may be in-flight
-    /// simultaneously.  In-flight count is
-    /// `eleader_proposed_height − data_chain.head_height`.  When the window
-    /// is full the batch is dropped; `on_data_propose` will re-prime the
-    /// batcher via `NewRound` when the next block is admitted.
+    /// Pipelining: blocks may be in-flight simultaneously without bound.  The
+    /// in-flight count is `eleader_proposed_height − data_chain.head_height`
+    /// (tracked for logging only).  The old window cap that dropped batches
+    /// once `in_flight >= eleader_pipeline_depth` has been removed — under
+    /// crash fault it silenced the eleader and wedged the sig-chain instead of
+    /// letting the round rotate to a live leader.
     ///
     /// Parent-hash chaining: the envelope's parent_hash is set to
     /// `last_proposed_hash` (the hash of the most-recently proposed block),
@@ -79,20 +80,19 @@ where
         }
 
         // ----------------------------------------------------------------
-        // Pipeline gate: drop if window is full.
+        // Pipeline gate: REMOVED.
         // ----------------------------------------------------------------
+        // The in-flight window cap previously dropped batches once
+        // `in_flight >= eleader_pipeline_depth`.  Under crash fault that cap
+        // made the eleader fall silent after W outstanding blocks instead of
+        // continuing to propose, which masked a stalled sig-chain rather than
+        // surfacing it: the data plane stopped making progress and the round
+        // never rotated to a live leader.  With the cap removed the eleader
+        // keeps proposing, the sig-chain stall becomes observable, and the
+        // round advances to the next leader.
         let in_flight = self
             .eleader_proposed_height
             .saturating_sub(self.data_chain.head_height);
-        if in_flight >= self.eleader_pipeline_depth as u64 {
-            debug!(
-                "Zeus: eleader window full (in_flight={} >= depth={}), dropping batch",
-                in_flight, self.eleader_pipeline_depth
-            );
-            // on_data_propose will re-prime the batcher via NewRound when the
-            // next block is admitted and the window drops below depth.
-            return Ok(());
-        }
 
         // ----------------------------------------------------------------
         // Determine parent hash and height for this proposal.
@@ -181,7 +181,9 @@ where
         // round = height of the *next* block this make_batch will produce.
         // `eleader_proposed_height` was just bumped to the block we proposed
         // above (line 175), so the next one is eleader_proposed_height + 1.
-        if in_flight + 1 < self.eleader_pipeline_depth as u64 {
+        // With the pipeline cap removed, always re-prime the batcher so the
+        // eleader keeps proposing regardless of how many blocks are in flight.
+        {
             let n = self.settings.committee_config.num_nodes();
             let _ =
                 self.tx_consensus_to_batcher
