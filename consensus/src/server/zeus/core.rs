@@ -20,6 +20,7 @@ use std::pin::Pin;
 use std::{collections::VecDeque, sync::Arc};
 use storage::rocksdb::Storage;
 use tcp_reliable_sender::{CancelHandler, TcpReliableSender};
+use tcp_sender::TcpSimpleSender;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
@@ -200,6 +201,16 @@ pub struct Zeus<Tx> {
     pub(crate) broadcast_peers: Vec<Id>,
     pub(crate) settings: Settings,
     pub(crate) consensus_net: TcpReliableSender<Id, ZeusMsg<Tx>>,
+    /// Best-effort sender for `DataPropose` dissemination only.  Unlike the
+    /// reliable `consensus_net`, this fire-and-forget simple sender keeps no
+    /// per-peer retry queue and emits no `CancelHandler`, so a crashed or
+    /// unreachable peer cannot accumulate an unbounded backlog.  Correctness
+    /// is preserved by the `DataRequest`/`DataResponse` backfill: any node
+    /// that misses a `DataPropose` pulls it on demand from the data-block
+    /// store of a live peer.  Reliable, consensus-critical messages
+    /// (sig-plane, eleader-blame, data-block responses) stay on
+    /// `consensus_net`.
+    pub(crate) data_net: TcpSimpleSender<Id, ZeusMsg<Tx>>,
 
     // ------------------------------------------------------------------
     // Channels
@@ -312,10 +323,6 @@ pub struct Zeus<Tx> {
     /// to `data_chain.head_height`) on epoch/eleader change so the new eleader
     /// starts from the admitted head.
     pub(crate) last_proposed_hash: Option<super::chain_state::DataBlockHash<Tx>>,
-    /// Maximum number of data blocks the eleader may have in-flight (proposed
-    /// but not yet locally admitted).  Sourced from
-    /// `settings.bench_config.eleader_pipeline_depth`.
-    pub(crate) eleader_pipeline_depth: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +379,9 @@ where
         // Outgoing consensus connections
         let consensus_peers = settings.get_consensus_peers(my_id)?;
         let consensus_net = TcpReliableSender::<Id, ZeusMsg<Tx>>::with_peers(consensus_peers);
+        // Best-effort sender for DataPropose (see `data_net` field docs).
+        let data_net =
+            TcpSimpleSender::<Id, ZeusMsg<Tx>>::with_peers(settings.get_consensus_peers(my_id)?);
 
         // TODO(zeus-view-change): non-eleader nodes' tx_pool/batcher is unused in
         // steady state; consider gating construction on `my_id ==
@@ -434,6 +444,7 @@ where
             exit_rx,
             rx_net_to_consensus,
             consensus_net,
+            data_net,
             tx_consensus_to_batcher,
             rx_data_batch,
             tx_msg_loopback,
@@ -483,7 +494,6 @@ where
             zeus_committed_high: 0,
             eleader_proposed_height: 0,
             last_proposed_hash: None,
-            eleader_pipeline_depth: settings.bench_config.eleader_pipeline_depth,
             committed_tx_count: 0,
             bench_emit_interval,
             emit_dp,

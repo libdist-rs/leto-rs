@@ -201,12 +201,16 @@ where
             sender: self.my_id,
         };
         let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
-        let results = self
-            .consensus_net
+        // Best-effort dissemination: DataPropose goes over the unreliable
+        // `data_net` simple sender, not the reliable `consensus_net`.  A
+        // crashed/unreachable peer therefore accumulates no per-peer backlog,
+        // and no round-keyed CancelHandler is retained.  Nodes that miss this
+        // block recover it via the DataRequest/DataResponse backfill once the
+        // sig-chain references it (see on_data_request / on_data_response).
+        let _ = self
+            .data_net
             .broadcast(&self.broadcast_peers, bytes)
             .await;
-        let handlers: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
-        self.round_state.add_handlers(handlers);
 
         // ----------------------------------------------------------------
         // Defer own admission via loopback.
