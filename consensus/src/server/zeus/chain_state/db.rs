@@ -35,8 +35,15 @@ use super::DataBlockHash;
 use crate::server::ChainDB;
 use crate::types::{DataBlock, DataBlockEnvelope};
 
-/// Default resident full-block cache capacity (number of blocks).
-pub const DEFAULT_DATA_BLOCK_CACHE_CAP: usize = 4096;
+/// Default resident full-block cache budget, in bytes of serialized payload.
+///
+/// Sized as a small fraction of the (4 GiB) bench hosts so the cache cannot be
+/// the OOM driver, while comfortably covering the steady-state working set
+/// (recent tips + the commit-prefix window). NOTE: a *block-count* cap is the
+/// wrong unit here — at `tx_size=512`, `batch_size≈1000` a block is ~0.5 MB, so
+/// a 4096-block cap would be a 2 GB ceiling that never evicts in a stall. The
+/// budget is in bytes precisely so it is robust to block size.
+pub const DEFAULT_DATA_BLOCK_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 /// Always-resident, lightweight per-block metadata.
 ///
@@ -69,10 +76,15 @@ pub struct DataBlockDB<Tx> {
     db: ChainDB,
     /// Resident metadata for every admitted block (including genesis).
     meta: FnvHashMap<DataBlockHash<Tx>, DataBlockMeta<Tx>>,
-    /// Bounded resident cache of full blocks. FIFO (insertion-order) eviction.
-    cache: FnvHashMap<DataBlockHash<Tx>, DataBlock<Tx>>,
+    /// Bounded resident cache of full blocks, keyed by hash. Each entry stores
+    /// the block and its serialized byte size. FIFO (insertion-order) eviction
+    /// keyed on a cumulative byte budget, not a block count.
+    cache: FnvHashMap<DataBlockHash<Tx>, (DataBlock<Tx>, usize)>,
     order: VecDeque<DataBlockHash<Tx>>,
-    cap: usize,
+    /// Cumulative serialized bytes of the blocks currently resident in `cache`.
+    resident_bytes: usize,
+    /// Eviction budget in bytes; evict oldest until `resident_bytes <= cap_bytes`.
+    cap_bytes: usize,
     /// Pinned genesis block — always resident, never evicted, never on disk.
     genesis: DataBlock<Tx>,
     genesis_hash: DataBlockHash<Tx>,
@@ -105,6 +117,17 @@ impl<Tx> DataBlockDB<Tx> {
     ) -> Option<u64> {
         self.meta.get(h).map(|m| m.epoch)
     }
+
+    /// Bytes of full blocks currently resident in the cache (excludes genesis
+    /// and the metadata index). Used by tests/metrics to confirm the bound.
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
+    /// Number of full blocks currently resident in the cache.
+    pub fn cached_blocks(&self) -> usize {
+        self.cache.len()
+    }
 }
 
 impl<Tx> DataBlockDB<Tx>
@@ -112,12 +135,12 @@ where
     Tx: Serialize + DeserializeOwned + Clone + 'static,
 {
     pub fn new(store: Storage) -> Self {
-        Self::with_capacity(store, DEFAULT_DATA_BLOCK_CACHE_CAP)
+        Self::with_byte_budget(store, DEFAULT_DATA_BLOCK_CACHE_BYTES)
     }
 
-    pub fn with_capacity(
+    pub fn with_byte_budget(
         store: Storage,
-        cap: usize,
+        cap_bytes: usize,
     ) -> Self {
         let genesis = DataBlock::<Tx>::genesis();
         let genesis_hash = genesis.hash().clone();
@@ -131,7 +154,8 @@ where
             meta,
             cache: FnvHashMap::default(),
             order: VecDeque::new(),
-            cap: cap.max(1),
+            resident_bytes: 0,
+            cap_bytes: cap_bytes.max(1),
             genesis,
             genesis_hash,
         }
@@ -151,7 +175,7 @@ where
         if *h == self.genesis_hash {
             return Ok(Some(self.genesis.clone()));
         }
-        if let Some(b) = self.cache.get(h) {
+        if let Some((b, _)) = self.cache.get(h) {
             return Ok(Some(b.clone()));
         }
         match self
@@ -160,7 +184,8 @@ where
             .await?
         {
             Some(block) => {
-                self.cache_put(h.clone(), block.clone());
+                let size = bincode::serialized_size(&block).unwrap_or(0) as usize;
+                self.cache_put(h.clone(), block.clone(), size);
                 Ok(Some(block))
             }
             None => Ok(None),
@@ -179,31 +204,44 @@ where
             .entry(h.clone())
             .or_insert_with(|| DataBlockMeta::of(&block, h.clone()));
         let serialized = bincode::serialize(&block)?;
+        let size = serialized.len();
         self.db
             .write_serialized::<DataBlockEnvelope<Tx>>(h.clone(), serialized)
             .await?;
-        self.cache_put(h, block);
+        self.cache_put(h, block, size);
         Ok(())
     }
 
-    /// Insert into the bounded cache with FIFO eviction. No-op reorder on a
-    /// repeat insert (we keep insertion order, not true LRU — Zeus's access
-    /// pattern is append-heavy, so the most-recently-admitted window stays
-    /// resident, which is what the hot walks touch).
+    /// Insert into the byte-bounded cache, evicting oldest blocks (FIFO) until
+    /// the cumulative serialized size is within `cap_bytes`. The just-inserted
+    /// block is never evicted in the same call (we keep at least one entry), so
+    /// an immediate read-back hits the cache. We keep insertion order rather
+    /// than true LRU — Zeus's access pattern is append-heavy, so the
+    /// most-recently-admitted window (what the hot walks touch) stays resident.
     fn cache_put(
         &mut self,
         h: DataBlockHash<Tx>,
         block: DataBlock<Tx>,
+        size: usize,
     ) {
-        if self.cache.insert(h.clone(), block).is_none() {
-            self.order.push_back(h);
-            while self.cache.len() > self.cap {
-                match self.order.pop_front() {
-                    Some(old) => {
-                        self.cache.remove(&old);
+        match self.cache.insert(h.clone(), (block, size)) {
+            Some((_, old_size)) => {
+                // Replaced an existing entry; adjust the byte total in place.
+                self.resident_bytes = self.resident_bytes + size - old_size;
+            }
+            None => {
+                self.order.push_back(h);
+                self.resident_bytes += size;
+            }
+        }
+        while self.resident_bytes > self.cap_bytes && self.cache.len() > 1 {
+            match self.order.pop_front() {
+                Some(old) => {
+                    if let Some((_, sz)) = self.cache.remove(&old) {
+                        self.resident_bytes = self.resident_bytes.saturating_sub(sz);
                     }
-                    None => break,
                 }
+                None => break,
             }
         }
     }
@@ -272,10 +310,15 @@ mod tests {
 
     #[tokio::test]
     async fn eviction_reloads_from_disk_and_contains_survives() {
-        // Tiny cache forces eviction; the evicted block must still be
-        // retrievable from RocksDB and remain a member.
-        let mut db = DataBlockDB::<u32>::with_capacity(temp_store(), 2);
+        // Measure one block's serialized size, then set a byte budget that
+        // holds only ~2 blocks so inserting 10 forces eviction. The evicted
+        // blocks must still be retrievable from RocksDB and remain members.
         let g = DataBlock::<u32>::genesis();
+        let probe = block(1, g.hash().clone());
+        let block_bytes = bincode::serialized_size(&probe).unwrap() as usize;
+        let budget = block_bytes * 2 + 1;
+
+        let mut db = DataBlockDB::<u32>::with_byte_budget(temp_store(), budget);
         let mut parent = g.hash().clone();
         let mut hashes = Vec::new();
         for height in 1..=10u64 {
@@ -285,7 +328,10 @@ mod tests {
             hashes.push(h.clone());
             parent = h;
         }
-        // The first block is long evicted from the resident cache (cap 2)...
+        // The byte budget is respected and eviction happened (not all 10 fit).
+        assert!(db.resident_bytes() <= budget, "cache stays within byte budget");
+        assert!(db.cached_blocks() < 10, "eviction occurred");
+        // The first block is long evicted from the resident cache...
         let first = &hashes[0];
         assert!(db.contains(first), "metadata survives eviction");
         // ...but get() reloads it from disk.
