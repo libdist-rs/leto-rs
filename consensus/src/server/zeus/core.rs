@@ -17,6 +17,7 @@ use log::*;
 use mempool::Batch;
 use serde::Serialize;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::VecDeque, sync::Arc};
 use storage::rocksdb::Storage;
 use tcp_reliable_sender::{CancelHandler, TcpReliableSender};
@@ -28,8 +29,8 @@ use tokio::sync::{
 use tokio::time::{interval, sleep, Interval, Sleep};
 
 use super::chain_state::{
-    blame_signed_bytes, eleader_change_qc_valid, AdmittedChangeQCs, DataBlockDB, DataChainState,
-    PendingAttestations,
+    blame_signed_bytes, eleader_change_qc_valid, AdmittedChangeQCs, DataBlockDB, DataBlockHash,
+    DataChainState, PendingAttestations,
 };
 use super::phases::ZeusCommitContext;
 use crate::types::{BlamePayload, BlameReason, EleaderBlame, EleaderChangeQC};
@@ -226,6 +227,10 @@ pub struct Zeus<Tx> {
     /// Data-tx commit output (kept alive to prevent channel close).
     #[allow(dead_code)]
     pub(crate) tx_data_commit: UnboundedSender<Arc<Batch<Tx>>>,
+    /// Ordered data-block hashes to commit, handed to the background committer
+    /// task. The consensus loop only walks metadata (child_of) and advances the
+    /// watermark; the committer reads payloads off-loop and emits them.
+    pub(crate) commit_tx: UnboundedSender<Vec<DataBlockHash<Tx>>>,
 
     // ------------------------------------------------------------------
     // Sig-plane state
@@ -293,12 +298,17 @@ pub struct Zeus<Tx> {
     /// Monotonically increasing.  The prefix-commit walk (zeus.tex Def 8.7)
     /// emits heights `(zeus_committed_high, H]` and updates this watermark.
     pub(crate) zeus_committed_high: u64,
+    /// Hash of the highest committed data block — the committer cursor. The
+    /// commit walk follows `child_of` forward from here toward the head.
+    pub(crate) last_committed_hash: DataBlockHash<Tx>,
 
     // ------------------------------------------------------------------
     // DP[Throughput] emission state
     // ------------------------------------------------------------------
     /// Accumulated committed-tx count since the last emission window tick.
-    pub(crate) committed_tx_count: u64,
+    /// Shared with the background committer (which increments it as it emits)
+    /// and read/reset by the loop's DP[Throughput] branch.
+    pub(crate) committed_tx_count: Arc<AtomicU64>,
     /// Interval that triggers DP[Throughput] emission.
     pub(crate) bench_emit_interval: tokio::time::Interval,
     /// True iff this node is the metrics-emission node.
@@ -428,6 +438,7 @@ where
         // contend with the sig-chain store's single-actor mpsc. Genesis is
         // seeded (and pinned) inside `DataBlockDB::new`.
         let genesis_data_block = DataBlock::<Tx>::genesis();
+        let genesis_data_hash = genesis_data_block.hash().clone();
         let data_store = {
             let mut path = std::path::PathBuf::new();
             path.push(&settings.storage.base);
@@ -438,12 +449,28 @@ where
                     .ok_or_else(|| anyhow!("Invalid path for data-block storage"))?,
             )?
         };
+        // Reader handle for the background committer (shares the data RocksDB).
+        let committer_reader = crate::server::ChainDB::new(data_store.clone());
         let data_block_db = DataBlockDB::<Tx>::new(data_store);
 
         let num_nodes = settings.committee_config.num_nodes();
         let num_faults = settings.committee_config.num_faults();
 
         let emit_dp = my_id == settings.bench_config.bench_metrics_node;
+
+        // Background committer: the consensus loop hands it ordered block
+        // hashes (after advancing the committed watermark via metadata only);
+        // it reads each payload off-loop and emits to the app sink + batcher.
+        let committed_tx_count = Arc::new(AtomicU64::new(0));
+        let (commit_tx, commit_rx) = unbounded_channel::<Vec<DataBlockHash<Tx>>>();
+        Self::spawn_committer(
+            commit_rx,
+            committer_reader,
+            tx_data_commit.clone(),
+            tx_consensus_to_batcher.clone(),
+            committed_tx_count.clone(),
+            emit_dp,
+        );
         let bench_emit_window_secs = settings.bench_config.bench_emit_window_secs.max(1) as f64;
         let bench_emit_interval = interval(std::time::Duration::from_secs(
             settings.bench_config.bench_emit_window_secs.max(1),
@@ -462,6 +489,7 @@ where
             tx_msg_loopback,
             rx_msg_loopback,
             tx_data_commit,
+            commit_tx,
             sig_chain_state: SigChainState::new(store.clone()),
             sig_leader_context: SigLeaderContext::new(
                 settings.committee_config.get_all_ids(),
@@ -504,9 +532,10 @@ where
             rleader_waiting_fresh: false,
             rleader_wakeup_pending: false,
             zeus_committed_high: 0,
+            last_committed_hash: genesis_data_hash,
             eleader_proposed_height: 0,
             last_proposed_hash: None,
-            committed_tx_count: 0,
+            committed_tx_count,
             bench_emit_interval,
             emit_dp,
             bench_emit_window_secs,
@@ -612,9 +641,7 @@ where
                 // Committed attestation feedback from ZeusCommitContext
                 committed = self.zeus_commit_ctx.rx_committed.recv() => {
                     if let Some(c) = committed {
-                        if let Err(e) = self.on_committed_attestation(c).await {
-                            error!("Zeus: on_committed_attestation: {}", e);
-                        }
+                        self.on_committed_attestation(c);
                     } else {
                         warn!("Zeus main: rx_committed closed");
                     }
@@ -637,11 +664,11 @@ where
 
                 // DP[Throughput] emission
                 _ = self.bench_emit_interval.tick(), if self.emit_dp => {
+                    let count = self.committed_tx_count.swap(0, Ordering::Relaxed);
                     eprintln!(
                         "DP[Throughput]: {}",
-                        self.committed_tx_count as f64 / self.bench_emit_window_secs
+                        count as f64 / self.bench_emit_window_secs
                     );
-                    self.committed_tx_count = 0;
                 }
             }
         }

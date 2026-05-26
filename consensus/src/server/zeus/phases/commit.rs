@@ -17,8 +17,11 @@
 /// `on_committed_attestation` looks up the pinned block by `data_block_hash`
 /// from `data_block_store`.
 use crate::{
-    server::zeus::{SigChainState, SigElement, SigElementHash, Zeus},
-    types::Transaction,
+    server::{
+        zeus::{chain_state::DataBlockHash, SigChainState, SigElement, SigElementHash, Zeus},
+        BatcherConsensusMsg, ChainDB,
+    },
+    types::{DataBlock, DataBlockEnvelope, Transaction},
     Id, START_ID,
 };
 use anyhow::{anyhow, Result};
@@ -27,6 +30,7 @@ use linked_hash_map::LinkedHashMap;
 use log::*;
 use mempool::Batch;
 use serde::Serialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -280,47 +284,13 @@ where
     /// If a block in the walk is missing from the store (catch-up race), the
     /// contiguous tail that is present is emitted and a warning is logged.
     /// The gap will be picked up on the next commit cycle.
-    pub(crate) async fn on_committed_attestation(
+    pub(crate) fn on_committed_attestation(
         &mut self,
         committed: ZeusCommittedAttestation<Tx>,
-    ) -> Result<()>
-    where
-        Tx: Clone + Serialize,
-    {
+    ) {
         let new_height = committed.attestation.envelope.data_block_height;
-        let pinned_hash = &committed.attestation.envelope.data_block_hash;
 
-        // Look up the pinned block in the store.  If it is absent (catch-up
-        // gap), update commit_lock but defer prefix emission until next cycle.
-        let pinned_block = match self.data_block_db.get(pinned_hash).await? {
-            Some(b) => b,
-            None => {
-                // Genesis special case: height 0 is always "committed" with
-                // empty payload; skip prefix emission.
-                if new_height == 0 {
-                    return Ok(());
-                }
-                warn!(
-                    "Zeus: on_committed_attestation: pinned block hash={:?} \
-                     height={} not in store (catch-up gap); deferring prefix emission",
-                    pinned_hash, new_height
-                );
-                // Still update commit_lock so conflict checks work.
-                self.commit_lock
-                    .retain(|(_, a)| a.envelope.data_block_height >= new_height);
-                let already_covered = self
-                    .commit_lock
-                    .iter()
-                    .any(|(_, a)| a.envelope.data_block_height >= new_height);
-                if !already_covered {
-                    self.commit_lock
-                        .push((committed.sig_round, committed.attestation));
-                }
-                return Ok(());
-            }
-        };
-
-        // Update commit_lock watermark (monotonic).
+        // Update commit_lock watermark (monotonic) — needed by conflict checks.
         self.commit_lock
             .retain(|(_, a)| a.envelope.data_block_height >= new_height);
         let already_covered = self
@@ -333,92 +303,114 @@ where
                 committed.sig_round, new_height
             );
             self.commit_lock
-                .push((committed.sig_round, committed.attestation.clone()));
+                .push((committed.sig_round, committed.attestation));
         }
 
-        // Prefix projection: emit all data blocks from zeus_committed_high+1 .. H.
+        // Nothing new to commit (genesis, or already at/above this height).
         if new_height <= self.zeus_committed_high {
-            // Already emitted; skip.
-            return Ok(());
+            return;
         }
 
-        // Walk backward from pinned_block via parent hashes, collecting blocks
-        // down to zeus_committed_high + 1.
-        let mut to_emit: Vec<crate::types::DataBlock<Tx>> = Vec::new();
-        let mut current = pinned_block;
+        // Forward-walk `child_of` from the last-committed cursor up to
+        // `new_height`, collecting the ordered block hashes. This is metadata
+        // only — child links + heights, all resident — so the consensus loop
+        // never touches a payload or the disk here. The unique-child invariant
+        // (equivocation is rejected at admit) guarantees a single chain, so we
+        // never commit two blocks for one height. If a child link or its
+        // metadata is missing (block not admitted yet), we stop and defer the
+        // remainder to a later commit cycle.
+        let mut to_commit: Vec<DataBlockHash<Tx>> = Vec::new();
+        let mut cur = self.last_committed_hash.clone();
         loop {
-            let h = current.envelope.height;
-            if h <= self.zeus_committed_high {
+            let child = match self.data_chain.child_of.get(&cur) {
+                Some(c) => c.clone(),
+                None => break,
+            };
+            let child_height = match self.data_block_db.meta(&child) {
+                Some(m) => m.height,
+                None => break,
+            };
+            to_commit.push(child.clone());
+            cur = child;
+            if child_height >= new_height {
                 break;
-            }
-            to_emit.push(current.clone());
-            if h == 0 {
-                break;
-            }
-            let parent_hash = current.envelope.parent_hash.clone();
-            match self.data_block_db.get(&parent_hash).await? {
-                Some(p) => current = p,
-                None => {
-                    warn!(
-                        "Zeus: prefix walk missing block at height {} (parent of h={}); \
-                         emitting contiguous tail only",
-                        h - 1,
-                        h,
-                    );
-                    break;
-                }
             }
         }
 
-        // Reverse to ascending height order before emitting.
-        to_emit.reverse();
+        if to_commit.is_empty() {
+            return;
+        }
 
-        for block in to_emit {
-            let h = block.envelope.height;
-            // Arc::clone is O(1) — no payload copy.
-            let payload = Arc::clone(&block.envelope.payload);
-            if !payload.is_empty() {
-                info!("Zeus-committed height {} with {} txs", h, payload.len(),);
-                // Accumulate for DP[Throughput] emission.
-                if self.emit_dp {
-                    self.committed_tx_count += payload.len() as u64;
-                }
-                // Drain the eleader's mempool and advance high_committed_nonce
-                // for replay protection.  Uses the data-block height as the
-                // mempool round tag — must match the round threaded through
-                // BCM::NewRound at the propose sites (eleader_proposed_height+1
-                // at NewRound time corresponds to height h here).
-                //
-                // Fires on every node, not just the eleader: non-eleader nodes
-                // have no inflight to drain, but the high_committed_nonce
-                // update protects them too if a client misroutes traffic.
-                let payload_owned: Vec<Tx> = (*payload).clone();
-                let _ = self.tx_consensus_to_batcher.send(
-                    crate::server::BatcherConsensusMsg::Committed {
+        // Advance the watermark + cursor to the last collected block.
+        let last = to_commit.last().expect("non-empty").clone();
+        if let Some(m) = self.data_block_db.meta(&last) {
+            self.zeus_committed_high = m.height;
+        }
+        self.last_committed_hash = last;
+
+        // Hand the ordered hashes to the background committer (non-blocking):
+        // it reads each payload off-loop and emits to the app sink + batcher.
+        if self.commit_tx.send(to_commit).is_err() {
+            error!("Zeus: committer channel closed");
+        }
+    }
+
+    /// Spawn the background committer. The consensus loop hands it ordered
+    /// data-block hashes (already past the committed watermark); it reads each
+    /// payload from the data store off the consensus loop and emits it to the
+    /// app sink (`tx_data_commit`) and the batcher (replay/nonce tracking),
+    /// incrementing the shared committed-tx counter for DP[Throughput].
+    pub(crate) fn spawn_committer(
+        mut rx: UnboundedReceiver<Vec<DataBlockHash<Tx>>>,
+        mut reader: ChainDB,
+        tx_data_commit: UnboundedSender<Arc<Batch<Tx>>>,
+        tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Tx>>,
+        committed_tx_count: Arc<AtomicU64>,
+        emit_dp: bool,
+    ) {
+        tokio::spawn(async move {
+            while let Some(hashes) = rx.recv().await {
+                for h in hashes {
+                    // notify_read: returns immediately if the writer already
+                    // persisted the block, else waits for the pending write.
+                    let block: DataBlock<Tx> = match reader
+                        .notify_read_as::<DataBlockEnvelope<Tx>, DataBlock<Tx>>(&h)
+                        .await
+                    {
+                        Ok(b) => b,
+                        Err(e) => {
+                            warn!("Zeus committer: read failed: {}", e);
+                            continue;
+                        }
+                    };
+                    let height = block.envelope.height;
+                    let payload = block.envelope.payload;
+                    if payload.is_empty() {
+                        debug!("Zeus: committed empty data block at height {}", height);
+                        continue;
+                    }
+                    info!("Zeus-committed height {} with {} txs", height, payload.len());
+                    if emit_dp {
+                        committed_tx_count.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    }
+                    let payload_owned: Vec<Tx> = (*payload).clone();
+                    let _ = tx_consensus_to_batcher.send(BatcherConsensusMsg::Committed {
                         batch: Batch {
                             payload: payload_owned.clone(),
                         },
-                        round: h,
-                    },
-                );
-                if self
-                    .tx_data_commit
-                    .send(Arc::new(Batch {
-                        payload: payload_owned,
-                    }))
-                    .is_err()
-                {
-                    error!("Zeus: tx_data_commit closed");
-                    return Ok(());
+                        round: height,
+                    });
+                    if tx_data_commit
+                        .send(Arc::new(Batch {
+                            payload: payload_owned,
+                        }))
+                        .is_err()
+                    {
+                        error!("Zeus committer: tx_data_commit closed");
+                        return;
+                    }
                 }
-            } else {
-                // Should not happen post-fix: on_eleader_propose drops empty
-                // batches before they reach the chain.  Kept as a guard for
-                // future code paths that might admit empty blocks.
-                debug!("Zeus: committed empty data block at height {}", h);
             }
-            self.zeus_committed_high = h;
-        }
-        Ok(())
+        });
     }
 }
