@@ -1,3 +1,10 @@
+//! Content-addressed RocksDB wrapper shared across protocols.
+//!
+//! `ChainDB` maps a typed `Hash<T>` to the bincode-serialized `T` in the
+//! underlying `storage::rocksdb::Storage`.  It is protocol-agnostic: Leto uses
+//! it for its chain/batch store, and Zeus's `DataBlockDB` uses it to spill
+//! data-block payloads to disk.  `notify_read` blocks until a key is written,
+//! which is how a node waits for a batch/block another peer will deliver.
 use anyhow::{Context, Result};
 use crypto::hash::Hash;
 use serde::{de::DeserializeOwned, Serialize};
@@ -41,6 +48,26 @@ impl ChainDB {
             .and_then(|serialized| {
                 bincode::deserialize::<T>(&serialized).map_err(anyhow::Error::new)
             })
+    }
+
+    /// Read a value of type `V` stored under a key hash of a (possibly
+    /// different) type `K`.  `read` ties the key-hash type to the value type;
+    /// this variant decouples them, which Zeus's `DataBlockDB` needs because it
+    /// stores a full `DataBlock` keyed by its envelope hash
+    /// (`Hash<DataBlockEnvelope>`).
+    pub async fn read_as<K, V>(
+        &mut self,
+        hash: &Hash<K>,
+    ) -> Result<Option<V>>
+    where
+        V: DeserializeOwned,
+    {
+        match self.store.read(hash.to_vec()).await? {
+            Some(serialized) => bincode::deserialize::<V>(&serialized)
+                .map(Some)
+                .context("Failed to deserialize value"),
+            None => Ok(None),
+        }
     }
 
     pub async fn write<T>(

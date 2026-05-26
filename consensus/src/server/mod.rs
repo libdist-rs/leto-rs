@@ -3,6 +3,9 @@ use std::sync::OnceLock;
 mod core;
 pub use self::core::*;
 
+mod chain_db;
+pub use chain_db::*;
+
 /// Cancel-handler GC depth (in rounds).  When a protocol's sig-chain is at
 /// round `r`, cancel handlers for messages sent at rounds `< r - GC_DEPTH_ROUNDS`
 /// are dropped, which signals the per-peer `tcp-reliable-sender` connection

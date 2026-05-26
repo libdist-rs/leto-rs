@@ -6,8 +6,7 @@ pub use parent::*;
 
 mod batch;
 
-mod db;
-pub use db::*;
+pub use crate::server::ChainDB;
 
 use crypto::hash::Hash;
 use serde::{Deserialize, Serialize};
