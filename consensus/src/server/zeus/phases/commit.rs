@@ -18,7 +18,10 @@
 /// from `data_block_store`.
 use crate::{
     server::{
-        zeus::{chain_state::DataBlockHash, SigChainState, SigElement, SigElementHash, Zeus},
+        zeus::{
+            chain_state::{CommitItem, DataBlockHash},
+            SigChainState, SigElement, SigElementHash, Zeus,
+        },
         BatcherConsensusMsg, ChainDB,
     },
     types::{DataBlock, DataBlockEnvelope, Transaction},
@@ -319,8 +322,10 @@ where
         // never commit two blocks for one height. If a child link or its
         // metadata is missing (block not admitted yet), we stop and defer the
         // remainder to a later commit cycle.
-        let mut to_commit: Vec<DataBlockHash<Tx>> = Vec::new();
+        let mut to_commit: Vec<CommitItem<Tx>> = Vec::new();
         let mut cur = self.last_committed_hash.clone();
+        let mut last_hash: Option<DataBlockHash<Tx>> = None;
+        let mut last_height = self.zeus_committed_high;
         loop {
             let child = match self.data_chain.child_of.get(&cur) {
                 Some(c) => c.clone(),
@@ -330,26 +335,33 @@ where
                 Some(m) => m.height,
                 None => break,
             };
-            to_commit.push(child.clone());
+            // Resident → hand the block over by value (steady state, no disk);
+            // evicted → hand the hash and let the committer read it off-loop.
+            let item = match self.data_block_db.cache_get(&child) {
+                Some(b) => CommitItem::Resident(b),
+                None => CommitItem::Spilled(child.clone()),
+            };
+            to_commit.push(item);
+            last_height = child_height;
+            last_hash = Some(child.clone());
             cur = child;
             if child_height >= new_height {
                 break;
             }
         }
 
-        if to_commit.is_empty() {
-            return;
-        }
+        let last = match last_hash {
+            Some(h) => h,
+            None => return, // nothing newly committable yet — defer
+        };
 
         // Advance the watermark + cursor to the last collected block.
-        let last = to_commit.last().expect("non-empty").clone();
-        if let Some(m) = self.data_block_db.meta(&last) {
-            self.zeus_committed_high = m.height;
-        }
+        self.zeus_committed_high = last_height;
         self.last_committed_hash = last;
 
-        // Hand the ordered hashes to the background committer (non-blocking):
-        // it reads each payload off-loop and emits to the app sink + batcher.
+        // Hand the ordered items to the background committer (non-blocking):
+        // resident blocks emit straight from memory; spilled ones are read back
+        // off the consensus loop.
         if self.commit_tx.send(to_commit).is_err() {
             error!("Zeus: committer channel closed");
         }
@@ -361,54 +373,64 @@ where
     /// app sink (`tx_data_commit`) and the batcher (replay/nonce tracking),
     /// incrementing the shared committed-tx counter for DP[Throughput].
     pub(crate) fn spawn_committer(
-        mut rx: UnboundedReceiver<Vec<DataBlockHash<Tx>>>,
+        mut rx: UnboundedReceiver<Vec<CommitItem<Tx>>>,
         mut reader: ChainDB,
         tx_data_commit: UnboundedSender<Arc<Batch<Tx>>>,
         tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Tx>>,
         committed_tx_count: Arc<AtomicU64>,
+        emitted_high: Arc<AtomicU64>,
         emit_dp: bool,
     ) {
         tokio::spawn(async move {
-            while let Some(hashes) = rx.recv().await {
-                for h in hashes {
-                    // notify_read: returns immediately if the writer already
-                    // persisted the block, else waits for the pending write.
-                    let block: DataBlock<Tx> = match reader
-                        .notify_read_as::<DataBlockEnvelope<Tx>, DataBlock<Tx>>(&h)
-                        .await
-                    {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!("Zeus committer: read failed: {}", e);
-                            continue;
+            while let Some(items) = rx.recv().await {
+                for item in items {
+                    let block: DataBlock<Tx> = match item {
+                        CommitItem::Resident(b) => b,
+                        CommitItem::Spilled(h) => {
+                            // Spilled to disk during a stall. notify_read returns
+                            // immediately if flushed, else waits for the write.
+                            match reader
+                                .notify_read_as::<DataBlockEnvelope<Tx>, DataBlock<Tx>>(&h)
+                                .await
+                            {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    warn!("Zeus committer: spilled read failed: {}", e);
+                                    continue;
+                                }
+                            }
                         }
                     };
                     let height = block.envelope.height;
                     let payload = block.envelope.payload;
-                    if payload.is_empty() {
+                    if !payload.is_empty() {
+                        info!("Zeus-committed height {} with {} txs", height, payload.len());
+                        if emit_dp {
+                            committed_tx_count
+                                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                        }
+                        let payload_owned: Vec<Tx> = (*payload).clone();
+                        let _ = tx_consensus_to_batcher.send(BatcherConsensusMsg::Committed {
+                            batch: Batch {
+                                payload: payload_owned.clone(),
+                            },
+                            round: height,
+                        });
+                        if tx_data_commit
+                            .send(Arc::new(Batch {
+                                payload: payload_owned,
+                            }))
+                            .is_err()
+                        {
+                            error!("Zeus committer: tx_data_commit closed");
+                            return;
+                        }
+                    } else {
                         debug!("Zeus: committed empty data block at height {}", height);
-                        continue;
                     }
-                    info!("Zeus-committed height {} with {} txs", height, payload.len());
-                    if emit_dp {
-                        committed_tx_count.fetch_add(payload.len() as u64, Ordering::Relaxed);
-                    }
-                    let payload_owned: Vec<Tx> = (*payload).clone();
-                    let _ = tx_consensus_to_batcher.send(BatcherConsensusMsg::Committed {
-                        batch: Batch {
-                            payload: payload_owned.clone(),
-                        },
-                        round: height,
-                    });
-                    if tx_data_commit
-                        .send(Arc::new(Batch {
-                            payload: payload_owned,
-                        }))
-                        .is_err()
-                    {
-                        error!("Zeus committer: tx_data_commit closed");
-                        return;
-                    }
+                    // Advance the emitted watermark so the store may now drop
+                    // this block (and everything below it) from RAM on eviction.
+                    emitted_high.fetch_max(height, Ordering::Relaxed);
                 }
             }
         });

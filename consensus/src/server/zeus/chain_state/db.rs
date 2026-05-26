@@ -6,25 +6,31 @@
 //! `Arc<Vec<Tx>>` payload) in RAM grew the map to ~3.7 GB and OOM-killed the
 //! eleader on 4 GiB hosts.
 //!
-//! `DataBlockDB` bounds resident memory by splitting storage:
+//! `DataBlockDB` is a **write-back** store, so steady-state commit incurs no
+//! disk I/O at all (which is what kept peak throughput high):
 //!   - a **resident metadata index** (`DataBlockMeta`: epoch/height/parent/hash),
-//!     one small entry per admitted block, that answers the synchronous
-//!     membership / chain-validity / equivocation queries without a DB hit;
-//!   - **payloads written through to RocksDB** (via [`ChainDB`]), keyed by the
-//!     block's envelope hash;
-//!   - a **bounded resident cache** of full blocks so hot reads avoid the DB.
+//!     one small entry per admitted block, answers the synchronous membership /
+//!     chain-validity / conflict-walk / epoch queries without a DB hit;
+//!   - a **bounded in-memory cache** of full blocks is the primary payload
+//!     store. `insert` only touches RAM — it does NOT write through to disk.
+//!   - on eviction (cache over budget), a block is **dropped for free if it has
+//!     already been emitted** by the committer (`height <= emitted_high`), and
+//!     **spilled to RocksDB only if not yet emitted** (the uncommitted backlog
+//!     that piles up during a crash-fault stall).
 //!
-//! Eviction is capacity-driven (insertion-order / FIFO), not commit-driven:
-//! during a stall nothing commits, so uncommitted payloads must be evictable
-//! too. Genesis is pinned and never evicted. Because `insert` is write-through,
-//! any block whose metadata is resident is guaranteed present in RocksDB, so a
-//! later `get` always succeeds (`contains(h) ⇒ get(h).await == Some`).
+//! So in steady state — commits keep up, the oldest cached blocks are already
+//! emitted — eviction just frees memory and nothing hits disk. Only a stall
+//! (commits frozen, backlog grows past the budget) spills payloads to disk,
+//! bounding RAM. The committer emits resident blocks directly and reads only
+//! spilled ones back (off the consensus loop). `contains(h)` via the metadata
+//! index never depends on the payload's location.
 //!
-//! NOTE: the metadata index itself still grows with the number of admitted
-//! blocks (~80 bytes/entry). That is orders of magnitude smaller than the
-//! payloads and is acceptable for the target workloads; spilling metadata to
-//! disk too is a possible future extension if a pathological stall demands it.
+//! NOTE: the metadata index still grows with admitted-block count (~80 B/entry)
+//! — orders of magnitude smaller than payloads; spilling it too is a possible
+//! future extension.
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use fnv::FnvHashMap;
@@ -35,6 +41,15 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use super::DataBlockHash;
 use crate::server::ChainDB;
 use crate::types::{DataBlock, DataBlockEnvelope};
+
+/// A block handed to the background committer for emission. In steady state the
+/// block is still resident in the cache and is passed by value (no disk); only
+/// blocks that were spilled to disk during a stall are passed by hash, and the
+/// committer reads those back off the consensus loop.
+pub enum CommitItem<Tx> {
+    Resident(DataBlock<Tx>),
+    Spilled(DataBlockHash<Tx>),
+}
 
 /// Default resident full-block cache budget, in bytes of serialized payload.
 ///
@@ -76,11 +91,14 @@ pub struct DataBlockDB<Tx> {
     /// RocksDB-backed payload store (content-addressed by envelope hash). Used
     /// only for READS on the consensus task; writes go through `write_tx`.
     db: ChainDB,
-    /// Hands (key, serialized-payload) to a background writer task so the
-    /// consensus task never awaits a disk write. The writer drains this and
-    /// persists to the same RocksDB; `get` uses `notify_read` to wait for a
-    /// not-yet-flushed block, so correctness holds despite the async write.
+    /// Hands (key, serialized-payload) to a background writer task. Used ONLY
+    /// to spill not-yet-emitted blocks to disk on eviction (during a stall);
+    /// steady-state inserts never write here.
     write_tx: UnboundedSender<(Vec<u8>, Vec<u8>)>,
+    /// Highest emitted (committed + delivered) data-block height, advanced by
+    /// the background committer. Eviction drops blocks at or below this for
+    /// free (the committer is done with them) and spills the rest to disk.
+    emitted_high: Arc<AtomicU64>,
     /// Resident metadata for every admitted block (including genesis).
     meta: FnvHashMap<DataBlockHash<Tx>, DataBlockMeta<Tx>>,
     /// Bounded resident cache of full blocks, keyed by hash. Each entry stores
@@ -141,13 +159,30 @@ impl<Tx> DataBlockDB<Tx>
 where
     Tx: Serialize + DeserializeOwned + Clone + 'static,
 {
+    /// Convenience constructor with a private `emitted_high` (starts at 0, so
+    /// all evictions spill). Used by unit tests; production uses
+    /// `with_emitted_high` to share the committer's watermark.
     pub fn new(store: Storage) -> Self {
-        Self::with_byte_budget(store, DEFAULT_DATA_BLOCK_CACHE_BYTES)
+        Self::with_byte_budget(
+            store,
+            DEFAULT_DATA_BLOCK_CACHE_BYTES,
+            Arc::new(AtomicU64::new(0)),
+        )
+    }
+
+    /// Production constructor: shares the committer's `emitted_high` watermark
+    /// so eviction can drop already-emitted blocks for free.
+    pub fn with_emitted_high(
+        store: Storage,
+        emitted_high: Arc<AtomicU64>,
+    ) -> Self {
+        Self::with_byte_budget(store, DEFAULT_DATA_BLOCK_CACHE_BYTES, emitted_high)
     }
 
     pub fn with_byte_budget(
         store: Storage,
         cap_bytes: usize,
+        emitted_high: Arc<AtomicU64>,
     ) -> Self {
         let genesis = DataBlock::<Tx>::genesis();
         let genesis_hash = genesis.hash().clone();
@@ -172,6 +207,7 @@ where
         Self {
             db: ChainDB::new(store),
             write_tx,
+            emitted_high,
             meta,
             cache: FnvHashMap::default(),
             order: VecDeque::new(),
@@ -180,6 +216,20 @@ where
             genesis,
             genesis_hash,
         }
+    }
+
+    /// Synchronous, cache-only fetch (no disk). Used by the commit walk on the
+    /// consensus loop: a hit yields the block to hand to the committer by
+    /// value; a miss means the block was spilled to disk and the committer must
+    /// read it back. Never touches RocksDB, so it never blocks the loop.
+    pub fn cache_get(
+        &self,
+        h: &DataBlockHash<Tx>,
+    ) -> Option<DataBlock<Tx>> {
+        if *h == self.genesis_hash {
+            return Some(self.genesis.clone());
+        }
+        self.cache.get(h).map(|(b, _)| b.clone())
     }
 
     // ----------------------------------------------------------------------
@@ -204,21 +254,24 @@ where
         if let Some((b, _)) = self.cache.get(h) {
             return Ok(Some(b.clone()));
         }
-        // Admitted but evicted from the cache. It has been, or will shortly be,
-        // persisted by the background writer; `notify_read` returns immediately
-        // if already on disk, otherwise waits for the pending write to land.
-        let block: DataBlock<Tx> = self
+        // Not in cache: it was either spilled to disk (read it back) or dropped
+        // after emission (gone — only reachable by a hopelessly-behind peer,
+        // who needs full sync, not a point fetch). Use a NON-blocking read so a
+        // dropped block returns None instead of parking forever. The committer
+        // uses a separate blocking read only for blocks it knows were spilled.
+        match self
             .db
-            .notify_read_as::<DataBlockEnvelope<Tx>, DataBlock<Tx>>(h)
-            .await?;
-        let size = bincode::serialized_size(&block).unwrap_or(0) as usize;
-        self.cache_put(h.clone(), block.clone(), size);
-        Ok(Some(block))
+            .read_as::<DataBlockEnvelope<Tx>, DataBlock<Tx>>(h)
+            .await?
+        {
+            Some(block) => Ok(Some(block)),
+            None => Ok(None),
+        }
     }
 
-    /// Admit a block: record metadata (always), write the payload through to
-    /// RocksDB, and place it in the resident cache. Idempotent — RocksDB is
-    /// content-addressed and the metadata entry is keyed by hash.
+    /// Admit a block: record metadata and place it in the resident cache.
+    /// Write-back — this does NOT touch disk. A block only reaches RocksDB if
+    /// it is later evicted while still un-emitted (see `cache_put`).
     pub async fn insert(
         &mut self,
         block: DataBlock<Tx>,
@@ -227,22 +280,19 @@ where
         self.meta
             .entry(h.clone())
             .or_insert_with(|| DataBlockMeta::of(&block, h.clone()));
-        let serialized = bincode::serialize(&block)?;
-        let size = serialized.len();
-        // Hand the payload to the background writer — non-blocking, no disk
-        // await on the consensus loop. (Send only fails if the writer task is
-        // gone, i.e. shutdown; safe to ignore.)
-        let _ = self.write_tx.send((h.to_vec(), serialized));
+        // Approximate resident size by the payload-bearing envelope; exact
+        // serialized bytes aren't needed for a memory budget.
+        let size = (block.envelope.payload.len() + 1) * 64;
         self.cache_put(h, block, size);
         Ok(())
     }
 
     /// Insert into the byte-bounded cache, evicting oldest blocks (FIFO) until
-    /// the cumulative serialized size is within `cap_bytes`. The just-inserted
-    /// block is never evicted in the same call (we keep at least one entry), so
-    /// an immediate read-back hits the cache. We keep insertion order rather
-    /// than true LRU — Zeus's access pattern is append-heavy, so the
-    /// most-recently-admitted window (what the hot walks touch) stays resident.
+    /// within `cap_bytes`. An evicted block is **dropped for free** if it has
+    /// already been emitted (`height <= emitted_high`), and **spilled to disk**
+    /// otherwise (the un-emitted backlog during a stall). So steady state —
+    /// where the oldest cached blocks are already emitted — never writes to
+    /// disk. The just-inserted block is kept (we never evict below one entry).
     fn cache_put(
         &mut self,
         h: DataBlockHash<Tx>,
@@ -251,7 +301,6 @@ where
     ) {
         match self.cache.insert(h.clone(), (block, size)) {
             Some((_, old_size)) => {
-                // Replaced an existing entry; adjust the byte total in place.
                 self.resident_bytes = self.resident_bytes + size - old_size;
             }
             None => {
@@ -260,13 +309,21 @@ where
             }
         }
         while self.resident_bytes > self.cap_bytes && self.cache.len() > 1 {
-            match self.order.pop_front() {
-                Some(old) => {
-                    if let Some((_, sz)) = self.cache.remove(&old) {
-                        self.resident_bytes = self.resident_bytes.saturating_sub(sz);
+            let old = match self.order.pop_front() {
+                Some(o) => o,
+                None => break,
+            };
+            if let Some((evicted, sz)) = self.cache.remove(&old) {
+                self.resident_bytes = self.resident_bytes.saturating_sub(sz);
+                let emitted = self.emitted_high.load(Ordering::Relaxed);
+                if evicted.envelope.height > emitted {
+                    // Not yet emitted — the committer will need it later. Spill
+                    // to disk (non-blocking) so it can read it back.
+                    if let Ok(bytes) = bincode::serialize(&evicted) {
+                        let _ = self.write_tx.send((old.to_vec(), bytes));
                     }
                 }
-                None => break,
+                // else: already emitted — drop it; nobody needs the payload.
             }
         }
     }
@@ -333,17 +390,12 @@ mod tests {
         assert!(gg.is_genesis());
     }
 
-    #[tokio::test]
-    async fn eviction_reloads_from_disk_and_contains_survives() {
-        // Measure one block's serialized size, then set a byte budget that
-        // holds only ~2 blocks so inserting 10 forces eviction. The evicted
-        // blocks must still be retrievable from RocksDB and remain members.
+    /// Fill past the budget with 10 blocks; `first` is evicted from the cache.
+    async fn fill_and_evict(emitted_high_val: u64) -> (DataBlockDB<u32>, Vec<DataBlockHash<u32>>) {
+        let emitted = Arc::new(AtomicU64::new(emitted_high_val));
+        // size per block = (payload.len()+1)*64 = (4+1)*64 = 320; budget ~2.
+        let mut db = DataBlockDB::<u32>::with_byte_budget(temp_store(), 650, emitted);
         let g = DataBlock::<u32>::genesis();
-        let probe = block(1, g.hash().clone());
-        let block_bytes = bincode::serialized_size(&probe).unwrap() as usize;
-        let budget = block_bytes * 2 + 1;
-
-        let mut db = DataBlockDB::<u32>::with_byte_budget(temp_store(), budget);
         let mut parent = g.hash().clone();
         let mut hashes = Vec::new();
         for height in 1..=10u64 {
@@ -353,16 +405,46 @@ mod tests {
             hashes.push(h.clone());
             parent = h;
         }
-        // The byte budget is respected and eviction happened (not all 10 fit).
-        assert!(db.resident_bytes() <= budget, "cache stays within byte budget");
+        assert!(db.resident_bytes() <= 650, "cache stays within byte budget");
         assert!(db.cached_blocks() < 10, "eviction occurred");
-        // The first block is long evicted from the resident cache...
+        (db, hashes)
+    }
+
+    #[tokio::test]
+    async fn unemitted_eviction_spills_and_reloads() {
+        // emitted_high = 0 → every evicted block is un-emitted → spilled to disk.
+        let (mut db, hashes) = fill_and_evict(0).await;
         let first = &hashes[0];
         assert!(db.contains(first), "metadata survives eviction");
-        // ...but get() reloads it from disk.
-        let reloaded = db.get(first).await.unwrap().expect("reload from disk");
+        // The spill write is async; let the writer task drain, then read back.
+        let mut reloaded = None;
+        for _ in 0..2000 {
+            if let Some(b) = db.get(first).await.unwrap() {
+                reloaded = Some(b);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let reloaded = reloaded.expect("spilled block reloads from disk");
         assert_eq!(reloaded.envelope.height, 1);
-        assert_eq!(reloaded.hash(), first, "contains ⇒ get == Some");
+        assert_eq!(reloaded.hash(), first);
+    }
+
+    #[tokio::test]
+    async fn emitted_eviction_is_dropped() {
+        // emitted_high above all heights → every evicted block is dropped (no
+        // disk write); a later get returns None (payload is gone).
+        let (mut db, hashes) = fill_and_evict(1000).await;
+        let first = &hashes[0];
+        assert!(db.contains(first), "metadata still tracks the block");
+        // Give any (erroneous) writer activity a chance, then confirm it's gone.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            db.get(first).await.unwrap().is_none(),
+            "emitted + evicted block is dropped, not on disk"
+        );
     }
 
     #[tokio::test]

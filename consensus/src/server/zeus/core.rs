@@ -29,8 +29,8 @@ use tokio::sync::{
 use tokio::time::{interval, sleep, Interval, Sleep};
 
 use super::chain_state::{
-    blame_signed_bytes, eleader_change_qc_valid, AdmittedChangeQCs, DataBlockDB, DataBlockHash,
-    DataChainState, PendingAttestations,
+    blame_signed_bytes, eleader_change_qc_valid, AdmittedChangeQCs, CommitItem, DataBlockDB,
+    DataBlockHash, DataChainState, PendingAttestations,
 };
 use super::phases::ZeusCommitContext;
 use crate::types::{BlamePayload, BlameReason, EleaderBlame, EleaderChangeQC};
@@ -227,10 +227,11 @@ pub struct Zeus<Tx> {
     /// Data-tx commit output (kept alive to prevent channel close).
     #[allow(dead_code)]
     pub(crate) tx_data_commit: UnboundedSender<Arc<Batch<Tx>>>,
-    /// Ordered data-block hashes to commit, handed to the background committer
-    /// task. The consensus loop only walks metadata (child_of) and advances the
-    /// watermark; the committer reads payloads off-loop and emits them.
-    pub(crate) commit_tx: UnboundedSender<Vec<DataBlockHash<Tx>>>,
+    /// Ordered committed items handed to the background committer. Resident
+    /// blocks travel by value (steady state, no disk); spilled ones by hash.
+    /// The consensus loop only walks metadata (child_of) + advances the
+    /// watermark; the committer emits off-loop.
+    pub(crate) commit_tx: UnboundedSender<Vec<CommitItem<Tx>>>,
 
     // ------------------------------------------------------------------
     // Sig-plane state
@@ -451,24 +452,29 @@ where
         };
         // Reader handle for the background committer (shares the data RocksDB).
         let committer_reader = crate::server::ChainDB::new(data_store.clone());
-        let data_block_db = DataBlockDB::<Tx>::new(data_store);
+        // Shared emitted-height watermark: the committer advances it; the store
+        // uses it to drop already-emitted blocks for free on eviction (and spill
+        // only the un-emitted backlog), so steady-state commit is disk-free.
+        let emitted_high = Arc::new(AtomicU64::new(0));
+        let data_block_db = DataBlockDB::<Tx>::with_emitted_high(data_store, emitted_high.clone());
 
         let num_nodes = settings.committee_config.num_nodes();
         let num_faults = settings.committee_config.num_faults();
 
         let emit_dp = my_id == settings.bench_config.bench_metrics_node;
 
-        // Background committer: the consensus loop hands it ordered block
-        // hashes (after advancing the committed watermark via metadata only);
-        // it reads each payload off-loop and emits to the app sink + batcher.
+        // Background committer: the consensus loop hands it ordered commit items
+        // (after advancing the committed watermark via metadata only); it emits
+        // resident blocks from memory and reads spilled ones off-loop.
         let committed_tx_count = Arc::new(AtomicU64::new(0));
-        let (commit_tx, commit_rx) = unbounded_channel::<Vec<DataBlockHash<Tx>>>();
+        let (commit_tx, commit_rx) = unbounded_channel::<Vec<CommitItem<Tx>>>();
         Self::spawn_committer(
             commit_rx,
             committer_reader,
             tx_data_commit.clone(),
             tx_consensus_to_batcher.clone(),
             committed_tx_count.clone(),
+            emitted_high.clone(),
             emit_dp,
         );
         let bench_emit_window_secs = settings.bench_config.bench_emit_window_secs.max(1) as f64;
