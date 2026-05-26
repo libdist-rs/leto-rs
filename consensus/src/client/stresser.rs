@@ -14,6 +14,16 @@ use tokio::sync::{mpsc::unbounded_channel, oneshot};
 
 use crate::types::{ClientMsg, ZeusClientMsg};
 
+/// Closed-loop cap on outstanding (sent-but-unconfirmed) transactions. Above
+/// this the client trickles instead of offering full bursts, so it self-limits
+/// to the system's commit capacity rather than over-saturating it. At capacity
+/// C tx/s this bounds tail latency to roughly `MAX_OUTSTANDING_TXS / C`.
+const MAX_OUTSTANDING_TXS: usize = 500_000;
+
+/// Outstanding entries older than this are assumed lost (e.g. orphaned on a
+/// view change) and pruned, so a leak can't pin the client at the cap.
+const STALE_OUTSTANDING_SECS: u64 = 60;
+
 /// This is a client implementation that stresses the BFT-system
 pub struct Stressor<Tx> {
     id: Id,
@@ -210,9 +220,36 @@ where
                     break;
                 }
                 _ = burst_timer.tick() => {
-                    // Build one batch of `burst_tx` transactions.
-                    let mut batch: Vec<Tx> = Vec::with_capacity(burst_tx);
-                    for i in 0..burst_tx {
+                    // Closed-loop admission control. `send_ts.len()` is the
+                    // number of outstanding (sent-but-unconfirmed) txs. When the
+                    // system saturates and confirmations lag, outstanding rises;
+                    // once it crosses the cap we throttle the client to a
+                    // *trickle* (one tx per burst) rather than stopping. A
+                    // non-empty block keeps the eleader fresh so it is never
+                    // silence-blamed — stopping to zero would starve it and
+                    // trigger eleader-change churn. The client backs off; the
+                    // eleader is never throttled. This makes over-capacity load
+                    // plateau (offered ≈ commit rate) instead of collapsing.
+                    let this_burst = if send_ts.len() >= MAX_OUTSTANDING_TXS {
+                        // Drop likely-lost txs (e.g. orphaned on a view change)
+                        // so a leak can't pin the client at the cap forever.
+                        if let Some(cutoff) = Instant::now()
+                            .checked_sub(Duration::from_secs(STALE_OUTSTANDING_SECS))
+                        {
+                            send_ts.retain(|_, t| *t > cutoff);
+                        }
+                        if send_ts.len() >= MAX_OUTSTANDING_TXS {
+                            1
+                        } else {
+                            burst_tx
+                        }
+                    } else {
+                        burst_tx
+                    };
+
+                    // Build one batch of `this_burst` transactions.
+                    let mut batch: Vec<Tx> = Vec::with_capacity(this_burst);
+                    for i in 0..this_burst {
                         let tx = Tx::mock_transaction(
                             tx_id,
                             self.id,
