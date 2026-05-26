@@ -70,6 +70,22 @@ impl ChainDB {
         }
     }
 
+    /// Like `read_as`, but blocks until the key is written if it is not yet
+    /// present (delegates to `Storage::notify_read`). Used when a value is
+    /// known to have been admitted and handed to an async writer, but may not
+    /// have hit disk yet — the caller must only invoke this for keys that will
+    /// be written, otherwise it parks forever.
+    pub async fn notify_read_as<K, V>(
+        &mut self,
+        hash: &Hash<K>,
+    ) -> Result<V>
+    where
+        V: DeserializeOwned,
+    {
+        let serialized = self.store.notify_read(hash.to_vec()).await?;
+        bincode::deserialize::<V>(&serialized).context("Failed to deserialize value")
+    }
+
     pub async fn write<T>(
         &mut self,
         val: T,

@@ -30,6 +30,7 @@ use anyhow::Result;
 use fnv::FnvHashMap;
 use serde::{de::DeserializeOwned, Serialize};
 use storage::rocksdb::Storage;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 use super::DataBlockHash;
 use crate::server::ChainDB;
@@ -72,8 +73,14 @@ impl<Tx> DataBlockMeta<Tx> {
 }
 
 pub struct DataBlockDB<Tx> {
-    /// RocksDB-backed payload store (content-addressed by envelope hash).
+    /// RocksDB-backed payload store (content-addressed by envelope hash). Used
+    /// only for READS on the consensus task; writes go through `write_tx`.
     db: ChainDB,
+    /// Hands (key, serialized-payload) to a background writer task so the
+    /// consensus task never awaits a disk write. The writer drains this and
+    /// persists to the same RocksDB; `get` uses `notify_read` to wait for a
+    /// not-yet-flushed block, so correctness holds despite the async write.
+    write_tx: UnboundedSender<(Vec<u8>, Vec<u8>)>,
     /// Resident metadata for every admitted block (including genesis).
     meta: FnvHashMap<DataBlockHash<Tx>, DataBlockMeta<Tx>>,
     /// Bounded resident cache of full blocks, keyed by hash. Each entry stores
@@ -149,8 +156,22 @@ where
             genesis_hash.clone(),
             DataBlockMeta::of(&genesis, genesis_hash.clone()),
         );
+
+        // Background writer: persists payloads off the consensus task. `insert`
+        // hands (key, value) here without awaiting; this task absorbs the
+        // RocksDB write latency (and any libstorage actor backpressure) so the
+        // consensus loop is never blocked on disk.
+        let (write_tx, mut write_rx) = unbounded_channel::<(Vec<u8>, Vec<u8>)>();
+        let mut writer_store = store.clone();
+        tokio::spawn(async move {
+            while let Some((key, value)) = write_rx.recv().await {
+                writer_store.write(key, value).await;
+            }
+        });
+
         Self {
             db: ChainDB::new(store),
+            write_tx,
             meta,
             cache: FnvHashMap::default(),
             order: VecDeque::new(),
@@ -175,21 +196,24 @@ where
         if *h == self.genesis_hash {
             return Ok(Some(self.genesis.clone()));
         }
+        // Not admitted locally → genuinely absent. (Must short-circuit before
+        // notify_read, which would park forever for a key never written.)
+        if !self.meta.contains_key(h) {
+            return Ok(None);
+        }
         if let Some((b, _)) = self.cache.get(h) {
             return Ok(Some(b.clone()));
         }
-        match self
+        // Admitted but evicted from the cache. It has been, or will shortly be,
+        // persisted by the background writer; `notify_read` returns immediately
+        // if already on disk, otherwise waits for the pending write to land.
+        let block: DataBlock<Tx> = self
             .db
-            .read_as::<DataBlockEnvelope<Tx>, DataBlock<Tx>>(h)
-            .await?
-        {
-            Some(block) => {
-                let size = bincode::serialized_size(&block).unwrap_or(0) as usize;
-                self.cache_put(h.clone(), block.clone(), size);
-                Ok(Some(block))
-            }
-            None => Ok(None),
-        }
+            .notify_read_as::<DataBlockEnvelope<Tx>, DataBlock<Tx>>(h)
+            .await?;
+        let size = bincode::serialized_size(&block).unwrap_or(0) as usize;
+        self.cache_put(h.clone(), block.clone(), size);
+        Ok(Some(block))
     }
 
     /// Admit a block: record metadata (always), write the payload through to
@@ -205,9 +229,10 @@ where
             .or_insert_with(|| DataBlockMeta::of(&block, h.clone()));
         let serialized = bincode::serialize(&block)?;
         let size = serialized.len();
-        self.db
-            .write_serialized::<DataBlockEnvelope<Tx>>(h.clone(), serialized)
-            .await?;
+        // Hand the payload to the background writer — non-blocking, no disk
+        // await on the consensus loop. (Send only fails if the writer task is
+        // gone, i.e. shutdown; safe to ignore.)
+        let _ = self.write_tx.send((h.to_vec(), serialized));
         self.cache_put(h, block, size);
         Ok(())
     }
