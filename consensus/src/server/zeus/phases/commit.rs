@@ -280,10 +280,11 @@ where
     /// If a block in the walk is missing from the store (catch-up race), the
     /// contiguous tail that is present is emitted and a warning is logged.
     /// The gap will be picked up on the next commit cycle.
-    pub(crate) fn on_committed_attestation(
+    pub(crate) async fn on_committed_attestation(
         &mut self,
         committed: ZeusCommittedAttestation<Tx>,
-    ) where
+    ) -> Result<()>
+    where
         Tx: Clone + Serialize,
     {
         let new_height = committed.attestation.envelope.data_block_height;
@@ -291,13 +292,13 @@ where
 
         // Look up the pinned block in the store.  If it is absent (catch-up
         // gap), update commit_lock but defer prefix emission until next cycle.
-        let pinned_block = match self.data_block_store.get(pinned_hash).cloned() {
+        let pinned_block = match self.data_block_db.get(pinned_hash).await? {
             Some(b) => b,
             None => {
                 // Genesis special case: height 0 is always "committed" with
                 // empty payload; skip prefix emission.
                 if new_height == 0 {
-                    return;
+                    return Ok(());
                 }
                 warn!(
                     "Zeus: on_committed_attestation: pinned block hash={:?} \
@@ -315,7 +316,7 @@ where
                     self.commit_lock
                         .push((committed.sig_round, committed.attestation));
                 }
-                return;
+                return Ok(());
             }
         };
 
@@ -338,7 +339,7 @@ where
         // Prefix projection: emit all data blocks from zeus_committed_high+1 .. H.
         if new_height <= self.zeus_committed_high {
             // Already emitted; skip.
-            return;
+            return Ok(());
         }
 
         // Walk backward from pinned_block via parent hashes, collecting blocks
@@ -355,8 +356,8 @@ where
                 break;
             }
             let parent_hash = current.envelope.parent_hash.clone();
-            match self.data_block_store.get(&parent_hash) {
-                Some(p) => current = p.clone(),
+            match self.data_block_db.get(&parent_hash).await? {
+                Some(p) => current = p,
                 None => {
                     warn!(
                         "Zeus: prefix walk missing block at height {} (parent of h={}); \
@@ -408,7 +409,7 @@ where
                     .is_err()
                 {
                     error!("Zeus: tx_data_commit closed");
-                    return;
+                    return Ok(());
                 }
             } else {
                 // Should not happen post-fix: on_eleader_propose drops empty
@@ -418,5 +419,6 @@ where
             }
             self.zeus_committed_high = h;
         }
+        Ok(())
     }
 }

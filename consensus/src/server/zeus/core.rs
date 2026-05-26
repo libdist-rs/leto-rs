@@ -28,7 +28,7 @@ use tokio::sync::{
 use tokio::time::{interval, sleep, Interval, Sleep};
 
 use super::chain_state::{
-    blame_signed_bytes, eleader_change_qc_valid, AdmittedChangeQCs, DataBlockStore, DataChainState,
+    blame_signed_bytes, eleader_change_qc_valid, AdmittedChangeQCs, DataBlockDB, DataChainState,
     PendingAttestations,
 };
 use super::phases::ZeusCommitContext;
@@ -248,8 +248,9 @@ pub struct Zeus<Tx> {
     pub(crate) current_epoch: u64,
     /// Lightweight data-chain head (hash + height; no Vec<DataBlock>).
     pub(crate) data_chain: DataChainState<Tx>,
-    /// Block store: `H(envelope)` → `DataBlock`.
-    pub(crate) data_block_store: DataBlockStore<Tx>,
+    /// DB-backed block store: resident metadata index + bounded full-block
+    /// cache + RocksDB payload spill. Replaces the old unbounded in-memory map.
+    pub(crate) data_block_db: DataBlockDB<Tx>,
     /// Park map for attestations awaiting a missing data block.
     pub(crate) pending_attestations: PendingAttestations<Tx>,
     /// Admitted eleader-change QCs (epoch → QC).
@@ -422,11 +423,22 @@ where
 
         let (tx_msg_loopback, rx_msg_loopback) = unbounded_channel();
 
-        // Bootstrap genesis DataBlock store
+        // Bootstrap the DB-backed DataBlock store. The data plane gets its own
+        // RocksDB instance (separate path) so its write-heavy traffic does not
+        // contend with the sig-chain store's single-actor mpsc. Genesis is
+        // seeded (and pinned) inside `DataBlockDB::new`.
         let genesis_data_block = DataBlock::<Tx>::genesis();
-        let genesis_data_hash = genesis_data_block.hash().clone();
-        let mut data_block_store: DataBlockStore<Tx> = FnvHashMap::default();
-        data_block_store.insert(genesis_data_hash, genesis_data_block.clone());
+        let data_store = {
+            let mut path = std::path::PathBuf::new();
+            path.push(&settings.storage.base);
+            path.set_file_name(format!("{}-data-{}", settings.storage.prefix, my_id));
+            path.set_extension("db");
+            Storage::new(
+                path.to_str()
+                    .ok_or_else(|| anyhow!("Invalid path for data-block storage"))?,
+            )?
+        };
+        let data_block_db = DataBlockDB::<Tx>::new(data_store);
 
         let num_nodes = settings.committee_config.num_nodes();
         let num_faults = settings.committee_config.num_faults();
@@ -464,7 +476,7 @@ where
             signature_epoch: Zeus::<Tx>::STEADY_STATE_SIG_EPOCH,
             current_epoch: Zeus::<Tx>::INITIAL_DATA_EPOCH,
             data_chain: DataChainState::genesis(),
-            data_block_store,
+            data_block_db,
             pending_attestations: FnvHashMap::default(),
             admitted_change_qcs: {
                 // Pre-admit the epoch 0 → epoch 1 transition via a sentinel QC
@@ -600,7 +612,9 @@ where
                 // Committed attestation feedback from ZeusCommitContext
                 committed = self.zeus_commit_ctx.rx_committed.recv() => {
                     if let Some(c) = committed {
-                        self.on_committed_attestation(c);
+                        if let Err(e) = self.on_committed_attestation(c).await {
+                            error!("Zeus: on_committed_attestation: {}", e);
+                        }
                     } else {
                         warn!("Zeus main: rx_committed closed");
                     }
@@ -953,9 +967,9 @@ where
             .filter_map(|(parent_hash, children)| {
                 let keep = !children.is_empty()
                     && self
-                        .data_block_store
-                        .get(parent_hash)
-                        .is_some_and(|b| b.envelope.height <= d_star_height);
+                        .data_block_db
+                        .meta(parent_hash)
+                        .is_some_and(|m| m.height <= d_star_height);
                 if keep {
                     None
                 } else {
@@ -973,9 +987,9 @@ where
             .pending_attestations
             .keys()
             .filter(|h| {
-                self.data_block_store
-                    .get(*h)
-                    .is_none_or(|b| b.envelope.height > d_star_height)
+                self.data_block_db
+                    .meta(*h)
+                    .is_none_or(|m| m.height > d_star_height)
             })
             .cloned()
             .collect();

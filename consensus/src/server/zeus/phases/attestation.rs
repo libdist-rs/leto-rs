@@ -76,11 +76,7 @@ where
         let data_block_height = self.data_chain.head_height;
         // Epoch of the head block: look it up in the store.  Fallback to 0 for
         // genesis (always in store).
-        let data_block_epoch = self
-            .data_block_store
-            .get(&data_block_hash)
-            .map(|b| b.envelope.epoch)
-            .unwrap_or(0);
+        let data_block_epoch = self.data_block_db.epoch_of(&data_block_hash).unwrap_or(0);
 
         // h_p^(s) = H(head(lockChain)) — we use the sig-chain highest hash
         // h_p^(s) = H(head(lockChain)) — derive from sig-chain highest hash.
@@ -170,7 +166,7 @@ where
         let is_genesis = att.envelope.data_block_height == 0 && att.envelope.data_block_epoch == 0;
         let d_hash = &att.envelope.data_block_hash;
 
-        if !is_genesis && !self.data_block_store.contains_key(d_hash) {
+        if !is_genesis && !self.data_block_db.contains(d_hash) {
             // Park the message under the missing hash.
             debug!(
                 "attestation_valid: parking under missing data block {:?}",
@@ -189,7 +185,7 @@ where
         //    data_block_store has a valid parent link. Step 3 above already confirmed
         //    d_h is in the store (or is genesis). This O(1) call re-confirms membership
         //    as the invariant check.
-        if !data_chain_valid(d_hash, &self.data_block_store) {
+        if !data_chain_valid(d_hash, &self.data_block_db) {
             // Unreachable in steady-state: step 3 parks on store-miss.
             // Guard defensively.
             debug!("attestation_valid: data_chain_valid false (defensive guard)");
@@ -200,10 +196,17 @@ where
             return AttestationValidity::Parked(d_hash.clone());
         }
 
-        // 5. Committed-prefix conflict check. Look up the pinned block for the conflict
-        //    walk.  If the block is genesis, use it directly.
-        if let Some(d_block) = self.data_block_store.get(d_hash).cloned() {
-            if conflicts_data_prefix(&d_block, &self.commit_lock, &self.data_block_store) {
+        // 5. Committed-prefix conflict check. Drive the walk from the pinned
+        //    block's resident metadata (no payload load needed).
+        if let Some(m) = self.data_block_db.meta(d_hash) {
+            let (d_height, d_parent) = (m.height, m.parent_hash.clone());
+            if conflicts_data_prefix(
+                d_hash,
+                d_height,
+                &d_parent,
+                &self.commit_lock,
+                &self.data_block_db,
+            ) {
                 warn!("attestation_valid: conflicts with committed prefix");
                 return AttestationValidity::Invalid;
             }

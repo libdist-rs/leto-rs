@@ -18,6 +18,7 @@ use crate::types::{
 // EleaderBlameSigned is referenced only as a phantom type for Hash in
 // blame_signed_bytes. The actual Hash type used internally is Hash<BlameSigned>
 // (local struct).
+use super::DataBlockDB;
 use crypto::hash::Hash;
 use fnv::FnvHashMap;
 use serde::Serialize;
@@ -53,8 +54,6 @@ pub struct DataChainState<Tx> {
     pub pending_data_blocks: FnvHashMap<DataBlockHash<Tx>, Vec<DataBlock<Tx>>>,
 }
 
-/// The actual block store keyed by `H(envelope)`.
-pub type DataBlockStore<Tx> = FnvHashMap<DataBlockHash<Tx>, DataBlock<Tx>>;
 
 /// Park map: missing-data-hash → parked (attestation-containing) ZeusMsg
 /// entries. On `OnDataResponse` drain, each entry is re-dispatched to the
@@ -134,12 +133,9 @@ where
 /// confirm.  For genesis (always in the store) this trivially returns `true`.
 pub fn data_chain_valid<Tx>(
     hash: &DataBlockHash<Tx>,
-    store: &DataBlockStore<Tx>,
-) -> bool
-where
-    Tx: Serialize + Clone,
-{
-    store.contains_key(hash)
+    db: &DataBlockDB<Tx>,
+) -> bool {
+    db.contains(hash)
 }
 
 // ---------------------------------------------------------------------------
@@ -152,33 +148,44 @@ where
 /// `commit_lock` is the set of committed attestations (highest-height wins).
 ///
 /// Change C: attestations now carry `data_block_hash` + `data_block_height`
-/// rather than an embedded `DataBlock`.  The conflict check looks up the
-/// pinned block in `store` by hash; if the block is absent (catch-up gap)
-/// the check conservatively returns `true`.
+/// rather than an embedded `DataBlock`.  The ancestor walk uses only the
+/// resident metadata index (`parent_hash`/`height`/cached `hash`), so it stays
+/// synchronous and never touches RocksDB.  If a pinned block's ancestor is
+/// absent from the index (catch-up gap) the check conservatively returns
+/// `true`.
+/// The candidate head is identified by `(d_hash, d_height, d_parent)` — its
+/// own hash, height, and parent hash — rather than a full `DataBlock`, so
+/// callers can drive the walk from the resident metadata index without loading
+/// any payload.
 pub fn conflicts_data_prefix<Tx>(
-    d: &DataBlock<Tx>,
+    d_hash: &DataBlockHash<Tx>,
+    d_height: u64,
+    d_parent: &DataBlockHash<Tx>,
     commit_lock: &[(u64, Attestation<Tx>)],
-    store: &DataBlockStore<Tx>,
-) -> bool
-where
-    Tx: Serialize + Clone + PartialEq,
-{
+    db: &DataBlockDB<Tx>,
+) -> bool {
     for (_r_s, att) in commit_lock {
         let pinned_height = att.envelope.data_block_height;
         let pinned_hash = &att.envelope.data_block_hash;
 
-        if pinned_height <= d.envelope.height {
-            // pinned block should be an ancestor of d: walk d's parent chain.
-            let mut d_prime = d.clone();
-            while d_prime.envelope.height > pinned_height {
-                let parent_hash = d_prime.envelope.parent_hash.clone();
-                match store.get(&parent_hash) {
-                    Some(p) => d_prime = p.clone(),
+        if pinned_height <= d_height {
+            // pinned block should be an ancestor of d: walk d's parent chain
+            // via the metadata index down to `pinned_height`.
+            let mut cur_hash = d_hash.clone();
+            let mut cur_height = d_height;
+            let mut cur_parent = d_parent.clone();
+            while cur_height > pinned_height {
+                match db.meta(&cur_parent) {
+                    Some(m) => {
+                        cur_hash = m.hash.clone();
+                        cur_height = m.height;
+                        cur_parent = m.parent_hash.clone();
+                    }
                     None => return true, // Missing ancestor — conservative reject
                 }
             }
-            // Now d_prime.height == pinned_height; check its hash matches.
-            if d_prime.hash() != pinned_hash {
+            // Now cur_height == pinned_height; check the ancestor hash matches.
+            if cur_hash != *pinned_hash {
                 return true;
             }
         } else {
@@ -482,45 +489,56 @@ mod tests {
         assert!(std::ptr::eq(h1, h2));
     }
 
-    #[test]
-    fn chain_valid_o1_absent() {
-        // data_chain_valid (O(1)) returns false for a block not in the store.
-        let genesis = DataBlock::<Tx>::genesis();
-        let g_hash = genesis.hash().clone();
-        let block1 = make_block(1, 1, g_hash.clone(), vec![]);
-        let block1_hash = block1.hash().clone();
+    fn temp_store() -> storage::rocksdb::Storage {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("zeus-datachain-test-{nanos}-{n}.db"));
+        storage::rocksdb::Storage::new(path.to_str().unwrap()).expect("open rocksdb")
+    }
 
-        let mut store: DataBlockStore<Tx> = FnvHashMap::default();
-        store.insert(g_hash, genesis);
+    #[tokio::test]
+    async fn chain_valid_o1_absent() {
+        // data_chain_valid (O(1)) returns false for a block not admitted.
+        let db = DataBlockDB::<Tx>::new(temp_store());
+        let genesis = DataBlock::<Tx>::genesis();
+        let block1 = make_block(1, 1, genesis.hash().clone(), vec![]);
+        let block1_hash = block1.hash().clone();
         // block1 not inserted — should return false.
-        assert!(!data_chain_valid(&block1_hash, &store));
+        assert!(!data_chain_valid(&block1_hash, &db));
     }
 
-    #[test]
-    fn chain_valid_o1_present() {
-        // data_chain_valid (O(1)) returns true once block is in the store.
+    #[tokio::test]
+    async fn chain_valid_o1_present() {
+        // data_chain_valid (O(1)) returns true once block is admitted.
+        let mut db = DataBlockDB::<Tx>::new(temp_store());
         let genesis = DataBlock::<Tx>::genesis();
-        let g_hash = genesis.hash().clone();
-        let block1 = make_block(1, 1, g_hash.clone(), vec![]);
+        let block1 = make_block(1, 1, genesis.hash().clone(), vec![]);
         let block1_hash = block1.hash().clone();
-
-        let mut store: DataBlockStore<Tx> = FnvHashMap::default();
-        store.insert(g_hash, genesis);
-        store.insert(block1_hash.clone(), block1);
-        assert!(data_chain_valid(&block1_hash, &store));
+        db.insert(block1).await.unwrap();
+        assert!(data_chain_valid(&block1_hash, &db));
     }
 
-    #[test]
-    fn no_conflict_for_genesis_commit() {
+    #[tokio::test]
+    async fn no_conflict_for_genesis_commit() {
+        let db = DataBlockDB::<Tx>::new(temp_store());
         let genesis = DataBlock::<Tx>::genesis();
         let genesis_hash = genesis.hash().clone();
-        let att = make_attestation(1, 1, genesis_hash, 0, 0);
-
+        let att = make_attestation(1, 1, genesis_hash.clone(), 0, 0);
         let commit_lock = vec![(1u64, att)];
-        let store: DataBlockStore<Tx> = FnvHashMap::default();
 
-        // d == genesis should not conflict (equal height, same block hash)
-        assert!(!conflicts_data_prefix(&genesis, &commit_lock, &store));
+        // d == genesis should not conflict (equal height, same block hash).
+        assert!(!conflicts_data_prefix(
+            &genesis_hash,
+            genesis.envelope.height,
+            &genesis.envelope.parent_hash,
+            &commit_lock,
+            &db,
+        ));
     }
 
     #[test]

@@ -118,23 +118,28 @@ where
             // TODO(zeus-view-change): enforce strict extension here — RESOLVED.
             // The truncation in `advance_to_epoch` (core.rs) makes the head IS
             // H(D*), so the parent chain here is trivially correct.
-            let d_ext = {
+            // Only the pinned block's hash + height are needed — read them from
+            // the resident metadata index (no payload load).
+            let (ext_hash, ext_height) = {
                 let d_star_opt = crate::server::zeus::chain_state::latest_committed_attestation(
                     &self.commit_lock,
                 );
+                let genesis_ref = || {
+                    let g = DataBlock::<Tx>::genesis();
+                    (g.hash().clone(), g.envelope.height)
+                };
                 match d_star_opt {
-                    None => DataBlock::<Tx>::genesis(),
+                    None => genesis_ref(),
                     Some(a) => {
-                        // Look up the pinned block by its hash.
                         let pinned_hash = &a.envelope.data_block_hash;
-                        self.data_block_store
-                            .get(pinned_hash)
-                            .cloned()
-                            .unwrap_or_else(DataBlock::<Tx>::genesis)
+                        match self.data_block_db.meta(pinned_hash) {
+                            Some(m) => (m.hash.clone(), m.height),
+                            None => genesis_ref(),
+                        }
                     }
                 }
             };
-            (d_ext.hash().clone(), d_ext.envelope.height + 1)
+            (ext_hash, ext_height + 1)
         };
 
         debug!(
@@ -284,7 +289,7 @@ where
         );
 
         // 4. Idempotent: skip if already in store.
-        if self.data_block_store.contains_key(&block_hash) {
+        if self.data_block_db.contains(&block_hash) {
             return Ok(());
         }
 
@@ -304,7 +309,7 @@ where
                 );
                 // Look up the existing block to build the blame payload.
                 if let Some(existing_block) =
-                    self.data_block_store.get(&existing_child_hash).cloned()
+                    self.data_block_db.get(&existing_child_hash).await?
                 {
                     let epoch = block.envelope.epoch;
                     let height = block.envelope.height;
@@ -338,8 +343,15 @@ where
             // Same child already recorded — duplicate arrival; idempotent.
         }
 
-        // 6. Committed-prefix conflict check.
-        if conflicts_data_prefix(&block, &self.commit_lock, &self.data_block_store) {
+        // 6. Committed-prefix conflict check (driven from the block's own
+        //    identity; the ancestor walk uses the resident metadata index).
+        if conflicts_data_prefix(
+            block.hash(),
+            block.envelope.height,
+            &block.envelope.parent_hash,
+            &self.commit_lock,
+            &self.data_block_db,
+        ) {
             warn!("Zeus: data block conflicts with committed prefix");
             return Ok(());
         }
@@ -383,26 +395,26 @@ where
             // ---------------------------------------------------------------
             // Case (a): fast path — block directly extends the current head.
             // ---------------------------------------------------------------
-            self.insert_and_advance(block, block_hash, parent_hash);
+            self.insert_and_advance(block, block_hash, parent_hash).await?;
 
             // Drain any pending blocks whose parent is now the new head.
             self.drain_pending_data_blocks().await?;
 
             // Drain pending attestations for the new head.
             self.drain_pending_attestations(self.data_chain.head_hash.clone());
-        } else if self.data_block_store.contains_key(&parent_hash) {
+        } else if self.data_block_db.contains(&parent_hash) {
             // ---------------------------------------------------------------
             // Case (b): bridge — parent is in store but is not the head.
             // Insert without advancing head; then walk child_of forward from
             // the current head until there is no next child.
             // ---------------------------------------------------------------
-            self.insert_non_head(block, block_hash, parent_hash);
+            self.insert_non_head(block, block_hash, parent_hash).await?;
 
             // Drain pending blocks whose parent is now admitted.
             self.drain_pending_data_blocks().await?;
 
             // Walk child_of forward from head to advance it as far as possible.
-            self.advance_head_via_child_of();
+            self.advance_head_via_child_of().await?;
 
             // After advancing, drain attestations for the new head.
             self.drain_pending_attestations(self.data_chain.head_hash.clone());
@@ -441,17 +453,17 @@ where
 
     /// Insert a block that extends the current head; advance head and populate
     /// `child_of`.  Does NOT drain — caller handles draining.
-    fn insert_and_advance(
+    async fn insert_and_advance(
         &mut self,
         block: DataBlock<Tx>,
         block_hash: crate::server::zeus::chain_state::DataBlockHash<Tx>,
         parent_hash: crate::server::zeus::chain_state::DataBlockHash<Tx>,
-    ) where
+    ) -> Result<()>
+    where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
     {
         let old_head_hash = self.data_chain.head_hash.clone();
-        self.data_block_store
-            .insert(block_hash.clone(), block.clone());
+        self.data_block_db.insert(block.clone()).await?;
         self.data_chain
             .child_of
             .insert(parent_hash, block_hash.clone());
@@ -476,26 +488,30 @@ where
         }
 
         self.post_admit_side_effects(admitted_height, old_head_hash);
+        Ok(())
     }
 
     /// Insert a block whose parent is in the store but is not the head.
     /// Does NOT advance head — caller calls `advance_head_via_child_of` after.
-    fn insert_non_head(
+    async fn insert_non_head(
         &mut self,
         block: DataBlock<Tx>,
         block_hash: crate::server::zeus::chain_state::DataBlockHash<Tx>,
         parent_hash: crate::server::zeus::chain_state::DataBlockHash<Tx>,
-    ) where
+    ) -> Result<()>
+    where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
     {
-        self.data_block_store
-            .insert(block_hash.clone(), block.clone());
+        let height = block.envelope.height;
+        let epoch = block.envelope.epoch;
+        self.data_block_db.insert(block).await?;
         self.data_chain.child_of.insert(parent_hash, block_hash);
 
         info!(
             "Zeus: bridge-admitted data block height={} epoch={} (non-head)",
-            block.envelope.height, block.envelope.epoch
+            height, epoch
         );
+        Ok(())
     }
 
     /// Walk `child_of` forward from the current head as far as possible,
@@ -504,7 +520,7 @@ where
     /// Updates `latest_eleader_block` and `last_seen_data_block` for each
     /// newly-advanced head.  Called after a bridge (case b) or pending-drain
     /// insert to finalize head advancement.
-    fn advance_head_via_child_of(&mut self)
+    async fn advance_head_via_child_of(&mut self) -> Result<()>
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
     {
@@ -513,8 +529,8 @@ where
                 Some(h) => h.clone(),
                 None => break,
             };
-            let next_block = match self.data_block_store.get(&next_hash) {
-                Some(b) => b.clone(),
+            let next_block = match self.data_block_db.get(&next_hash).await? {
+                Some(b) => b,
                 None => {
                     // child_of points to a hash not yet in the store — should
                     // not happen under the invariant, but guard defensively.
@@ -543,6 +559,7 @@ where
 
             self.post_admit_side_effects(admitted_height, old_head);
         }
+        Ok(())
     }
 
     /// Drain `pending_data_blocks` for the current head hash, re-admitting
@@ -673,7 +690,7 @@ where
     where
         Tx: Clone + Serialize,
     {
-        if let Some(block) = self.data_block_store.get(&target_hash).cloned() {
+        if let Some(block) = self.data_block_db.get(&target_hash).await? {
             let msg = ZeusMsg::<Tx>::DataResponse { block };
             let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
             if let Ok(h) = self.consensus_net.send(source, bytes).await {
@@ -706,7 +723,7 @@ where
         let h_target = block.hash().clone();
 
         // Idempotent: if we already have this block, ignore.
-        if self.data_block_store.contains_key(&h_target) {
+        if self.data_block_db.contains(&h_target) {
             return Ok(());
         }
 
