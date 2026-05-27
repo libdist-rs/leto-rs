@@ -104,12 +104,10 @@ where
             sender: self.my_id,
         };
         let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
-        let results = self
+        let _ = self
             .consensus_net
             .broadcast(&self.broadcast_peers, bytes)
             .await;
-        let handlers: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
-        self.round_state.add_handlers(handlers);
 
         // Locally admit via loopback so the select loop can interleave network
         // messages with the admission.
@@ -203,9 +201,7 @@ where
         if let Some(block) = self.multi_data_chain.block_store.get(&target_hash).cloned() {
             let msg = HeraMsg::<Tx>::DataResponse { block };
             let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
-            if let Ok(h) = self.consensus_net.send(source, bytes).await {
-                self.round_state.add_handler(h);
-            }
+            let _ = self.consensus_net.send(source, bytes).await;
         }
         Ok(())
     }

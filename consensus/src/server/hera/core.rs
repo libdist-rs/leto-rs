@@ -22,7 +22,13 @@ use mempool::Batch;
 use serde::Serialize;
 use std::{collections::VecDeque, sync::Arc};
 use storage::rocksdb::Storage;
-use tcp_reliable_sender::{CancelHandler, TcpReliableSender};
+// Hera broadcasts its data/sig messages all-to-all. The reliable sender's
+// per-message ACK pipeline + re-dial storm collapse that n*(n-1) mesh at large
+// n; the simple sender is fire-and-forget (no ACK, lazy reconnect, batched
+// writes) — same transport hera's mempool and zeus's data plane already use.
+// BFT consensus tolerates message loss (re-propose / sync), so reliability is
+// the wrong tool here.
+use tcp_sender::TcpSimpleSender;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
@@ -61,8 +67,6 @@ pub struct HeraRoundState<Tx> {
     future_msgs: FnvHashMap<Round, VecDeque<HeraMsg<Tx>>>,
     pub blame_map: FnvHashMap<Id, Signature<Id, Round>>,
     pub got_qc: bool,
-    /// Per-round cancel handlers (see ZeusRoundState for the contract).
-    pub cancel_handlers: FnvHashMap<Round, Vec<CancelHandler>>,
     #[allow(dead_code)]
     num_nodes: usize,
 }
@@ -75,7 +79,6 @@ impl<Tx> HeraRoundState<Tx> {
             future_msgs: FnvHashMap::default(),
             blame_map: FnvHashMap::default(),
             got_qc: false,
-            cancel_handlers: FnvHashMap::default(),
             num_nodes,
         }
     }
@@ -121,10 +124,6 @@ impl<Tx> HeraRoundState<Tx> {
         self.current_round += 1;
         self.blame_map.clear();
         self.got_qc = false;
-        // Round-age GC; see ZeusRoundState::advance_round for rationale.
-        let gc_depth = crate::server::gc_depth_rounds();
-        let threshold = self.current_round.saturating_sub(gc_depth as Round);
-        self.cancel_handlers.retain(|round, _| *round >= threshold);
         if let Some(msgs) = self.future_msgs.remove(&self.current_round) {
             for m in msgs {
                 self.msg_buf.push_back(m);
@@ -133,26 +132,6 @@ impl<Tx> HeraRoundState<Tx> {
         self.future_msgs.retain(|r, _| r >= &self.current_round);
         timer.reset();
         *timer_enabled = true;
-    }
-
-    pub fn add_handler(
-        &mut self,
-        h: CancelHandler,
-    ) {
-        self.cancel_handlers
-            .entry(self.current_round)
-            .or_default()
-            .push(h);
-    }
-
-    pub fn add_handlers(
-        &mut self,
-        hs: Vec<CancelHandler>,
-    ) {
-        self.cancel_handlers
-            .entry(self.current_round)
-            .or_default()
-            .extend(hs);
     }
 
     pub fn disable_timer(
@@ -175,7 +154,7 @@ pub struct Hera<Tx> {
     pub(crate) crypto_system: KeyConfig,
     pub(crate) broadcast_peers: Vec<Id>,
     pub(crate) settings: Settings,
-    pub(crate) consensus_net: TcpReliableSender<Id, HeraMsg<Tx>>,
+    pub(crate) consensus_net: TcpSimpleSender<Id, HeraMsg<Tx>>,
 
     // ------------------------------------------------------------------
     // Channels
@@ -303,7 +282,7 @@ where
 
         // Outgoing consensus connections.
         let consensus_peers = settings.get_consensus_peers(my_id)?;
-        let consensus_net = TcpReliableSender::<Id, HeraMsg<Tx>>::with_peers(consensus_peers);
+        let consensus_net = TcpSimpleSender::<Id, HeraMsg<Tx>>::with_peers(consensus_peers);
 
         // Batcher: every node is always the leader of its own sub-chain.
         let (tx_consensus_to_batcher, rx_consensus_to_batcher) = unbounded_channel();

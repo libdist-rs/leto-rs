@@ -74,12 +74,10 @@ where
         };
 
         let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
-        let results = self
+        let _ = self
             .consensus_net
             .broadcast(&self.broadcast_peers, bytes)
             .await;
-        let handlers: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
-        self.round_state.add_handlers(handlers);
 
         // Yield so other Tokio tasks can deliver pending network messages
         // before the loopback cascade continues.
@@ -215,9 +213,7 @@ where
             sender: self.my_id,
         };
         let bytes = bytes::Bytes::from(bincode::serialize(&relay).map_err(anyhow::Error::new)?);
-        if let Ok(h) = self.consensus_net.send(next_leader, bytes).await {
-            self.round_state.add_handler(h);
-        }
+        let _ = self.consensus_net.send(next_leader, bytes).await;
         Ok(())
     }
 
@@ -327,12 +323,10 @@ where
             qc: qc.clone(),
         };
         let bytes = bytes::Bytes::from(bincode::serialize(&pmsg).map_err(anyhow::Error::new)?);
-        let results = self
+        let _ = self
             .consensus_net
             .broadcast(&self.broadcast_peers, bytes)
             .await;
-        let handlers: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
-        self.round_state.add_handlers(handlers);
 
         self.sig_chain_state.add_qc(blame_round, qc);
         self.advance_sig_round().await
@@ -356,12 +350,10 @@ where
             auth,
         };
         let bytes = bytes::Bytes::from(bincode::serialize(&pmsg).map_err(anyhow::Error::new)?);
-        let results = self
+        let _ = self
             .consensus_net
             .broadcast(&self.broadcast_peers, bytes)
             .await;
-        let handlers: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
-        self.round_state.add_handlers(handlers);
 
         self.tx_msg_loopback
             .send(pmsg)

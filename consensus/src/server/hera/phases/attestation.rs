@@ -223,12 +223,10 @@ where
             source: self.my_id,
         };
         let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
-        let results = self
+        let _ = self
             .consensus_net
             .broadcast(&self.broadcast_peers, bytes)
             .await;
-        let handlers: Vec<_> = results.into_iter().filter_map(|r| r.ok()).collect();
-        self.round_state.add_handlers(handlers);
         Ok(())
     }
 }
