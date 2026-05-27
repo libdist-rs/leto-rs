@@ -1,6 +1,9 @@
 pub mod chain_state;
 pub use chain_state::*;
 
+mod net;
+pub use net::HeraNet;
+
 mod phases;
 pub use phases::*;
 

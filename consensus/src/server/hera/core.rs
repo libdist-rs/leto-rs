@@ -16,19 +16,18 @@ use crate::{
 use anyhow::{anyhow, Result};
 use crypto::hash::Hash;
 use fnv::{FnvHashMap, FnvHashSet};
-use futures_util::StreamExt;
 use log::*;
 use mempool::Batch;
 use serde::Serialize;
+use std::net::SocketAddr;
 use std::{collections::VecDeque, sync::Arc};
 use storage::rocksdb::Storage;
-// Hera broadcasts its data/sig messages all-to-all. The reliable sender's
-// per-message ACK pipeline + re-dial storm collapse that n*(n-1) mesh at large
-// n; the simple sender is fire-and-forget (no ACK, lazy reconnect, batched
-// writes) — same transport hera's mempool and zeus's data plane already use.
-// BFT consensus tolerates message loss (re-propose / sync), so reliability is
-// the wrong tool here.
-use tcp_sender::TcpSimpleSender;
+// Hera broadcasts its data/sig messages all-to-all, which melts libnet's
+// reconnect-storm-prone senders at large n and wedges the sig-chain. The
+// HeraNet transport (ported from mysticeti) keeps one persistent connection per
+// peer pair with jittered reconnect backoff and bounded drop-on-full channels,
+// so the flood is shed instead of melting the mesh. See hera::net.
+use super::net::HeraNet;
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
@@ -160,7 +159,7 @@ pub struct Hera<Tx> {
     pub(crate) crypto_system: KeyConfig,
     pub(crate) broadcast_peers: Vec<Id>,
     pub(crate) settings: Settings,
-    pub(crate) consensus_net: TcpSimpleSender<Id, HeraMsg<Tx>>,
+    pub(crate) consensus_net: HeraNet,
 
     // ------------------------------------------------------------------
     // Channels
@@ -281,20 +280,38 @@ where
             .ok_or_else(|| anyhow!("My Id {} not in config", my_id))?;
         let consensus_addr = crate::to_socket_address("0.0.0.0", me.consensus_port)?;
 
-        // Networking receiver.
+        // Mysticeti-style persistent-connection transport (replaces libnet's
+        // reconnect-storm-prone TcpSimpleSender/TcpReceiver). One connection
+        // per peer pair, jittered reconnect backoff, bounded drop-on-full
+        // channels -- so hera's all-to-all flood is shed instead of melting the
+        // mesh and wedging the sig-chain (see hera::net).
+        let num_nodes = settings.committee_config.num_nodes();
+        let mut net_addresses: Vec<SocketAddr> = Vec::with_capacity(num_nodes);
+        for id in 0..num_nodes {
+            let party = settings
+                .committee_config
+                .get(&id)
+                .ok_or_else(|| anyhow!("Id {} not in config", id))?;
+            net_addresses
+                .push(crate::to_socket_address(&party.consensus_address, party.consensus_port)?);
+        }
+        let (consensus_net, mut inbound_rx) =
+            HeraNet::spawn(net_addresses, my_id, consensus_addr);
+
+        // Deserialize inbound frames into HeraMsg and feed the consensus loop.
         let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
-        let mut receiver = tcp_receiver::TcpReceiver::<HeraMsg<Tx>>::spawn(consensus_addr);
         tokio::spawn(async move {
-            while let Some(Ok(msg)) = receiver.next().await {
-                if tx_net_to_consensus.send(msg).is_err() {
-                    break;
+            while let Some(frame) = inbound_rx.recv().await {
+                match bincode::deserialize::<HeraMsg<Tx>>(&frame) {
+                    Ok(msg) => {
+                        if tx_net_to_consensus.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => log::warn!("Hera: failed to deserialize inbound frame: {e}"),
                 }
             }
         });
-
-        // Outgoing consensus connections.
-        let consensus_peers = settings.get_consensus_peers(my_id)?;
-        let consensus_net = TcpSimpleSender::<Id, HeraMsg<Tx>>::with_peers(consensus_peers);
 
         // Batcher: every node is always the leader of its own sub-chain.
         let (tx_consensus_to_batcher, rx_consensus_to_batcher) = unbounded_channel();
