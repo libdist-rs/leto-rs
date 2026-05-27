@@ -568,6 +568,17 @@ where
 
                 // DP[Throughput] + DP[Latency] emission.
                 _ = self.bench_emit_interval.tick(), if self.emit_dp => {
+                    // Heartbeat: lets a normal (Info-level) run show whether the
+                    // sig-chain is advancing rounds (rate vs wedge) without the
+                    // huge debug logs. round climbs but committed stays 0 ⇒
+                    // commit-logic issue; round stuck ⇒ wedge.
+                    info!(
+                        "Hera HB: round={} highest_chained={} connected={} committed_window={}",
+                        self.round_state.round(),
+                        self.sig_chain_state.highest_chain().proposal.round(),
+                        self.consensus_net.connected_peers(),
+                        self.committed_tx_count,
+                    );
                     eprintln!(
                         "DP[Throughput]: {}",
                         self.committed_tx_count as f64 / self.bench_emit_window_secs
