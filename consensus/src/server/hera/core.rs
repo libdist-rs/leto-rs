@@ -15,7 +15,7 @@ use crate::{
 };
 use anyhow::{anyhow, Result};
 use crypto::hash::Hash;
-use fnv::FnvHashMap;
+use fnv::{FnvHashMap, FnvHashSet};
 use futures_util::StreamExt;
 use log::*;
 use mempool::Batch;
@@ -55,6 +55,12 @@ pub type SigLeaderContext = LeaderContext;
 // Park map for attestations awaiting a missing data block.
 // ---------------------------------------------------------------------------
 pub type PendingAttestations<Tx> = FnvHashMap<DataBlockHash<Tx>, Vec<HeraMsg<Tx>>>;
+
+// Park map for sig proposals awaiting a missing PARENT sig-element. A node
+// that advanced a round via blame-QC never stored that round's element; a
+// later proposal then references a parent it lacks. We fetch the parent
+// (SigElementRequest) before agreeing, so the committer never sees a gap.
+pub type PendingSigProposals<Tx> = FnvHashMap<SigElementHash<Tx>, Vec<HeraMsg<Tx>>>;
 
 // ---------------------------------------------------------------------------
 // ZeusRoundState equivalent for Hera (same structure, HeraMsg type)
@@ -188,6 +194,12 @@ pub struct Hera<Tx> {
     pub(crate) multi_data_chain: MultiAuthorDataChainState<Tx>,
     /// Park map: missing data hash → parked HeraMsg entries.
     pub(crate) pending_attestations: PendingAttestations<Tx>,
+    /// Park map: missing parent sig-element hash → parked SigPropose entries.
+    pub(crate) pending_sig_proposals: PendingSigProposals<Tx>,
+    /// Sig-element hashes we have an outstanding fetch for. Lets us accept a
+    /// recursively-fetched ancestor (which has no parked proposal of its own)
+    /// and dedupe in-flight requests.
+    pub(crate) pending_sig_element_requests: FnvHashSet<SigElementHash<Tx>>,
 
     // ------------------------------------------------------------------
     // This node's own sub-chain state
@@ -350,6 +362,8 @@ where
             current_epoch: Hera::<Tx>::INITIAL_DATA_EPOCH,
             multi_data_chain,
             pending_attestations: FnvHashMap::default(),
+            pending_sig_proposals: FnvHashMap::default(),
+            pending_sig_element_requests: FnvHashSet::default(),
             my_height: 0,
             my_last_hash: None,
             prev_attested_heights: FnvHashMap::default(),
@@ -511,7 +525,19 @@ where
                 Ok(())
             }
 
-            // Sync variants — no-op for now (synchronizer not wired for Hera v1).
+            // Sig-element catch-up — handled directly (not round-ordered), like
+            // the data-plane DataRequest/DataResponse. Lets a node fetch a parent
+            // sig-element it missed (e.g. advanced past a round via blame-QC)
+            // before agreeing on a proposal that extends it.
+            HeraMsg::SigElementRequest { source, request } => {
+                self.on_sig_element_request(request.request_hash().clone(), source)
+                    .await
+            }
+            HeraMsg::SigElementResponse { response } => {
+                self.on_sig_element_response(response.response()).await
+            }
+
+            // Remaining sync variants — no-op for now (not wired for Hera v1).
             _ => {
                 debug!("Hera: unhandled msg variant in dispatch");
                 Ok(())

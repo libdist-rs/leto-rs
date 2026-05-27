@@ -11,7 +11,8 @@
 use crate::{
     server::hera::Hera,
     types::{
-        hera::MultiAttestation, Block, Certificate, HeraMsg, Proposal, Signature, Transaction,
+        hera::MultiAttestation, Block, Certificate, HeraMsg, Proposal, Request, Response,
+        Signature, Transaction,
     },
     Id, Round,
 };
@@ -20,6 +21,7 @@ use crypto::hash::Hash;
 use log::*;
 use mempool::Batch;
 use serde::Serialize;
+use std::sync::Arc;
 
 impl<Tx> Hera<Tx>
 where
@@ -160,6 +162,39 @@ where
             }
         }
 
+        // Fetch a missing PARENT sig-element BEFORE agreeing, so the committer
+        // never walks into a gap. A node that advanced past round r via a
+        // blame-QC never stored round r's element; a round r+1 proposal then
+        // references it as parent. Park this proposal and fetch the parent;
+        // `on_sig_element_response` re-drives it once the parent arrives.
+        let parent_hash = proposal.block().parent_hash();
+        match self.sig_chain_state.get_element(parent_hash.clone()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                debug!(
+                    "Hera: sig proposal round={} parked for missing parent element {:?}",
+                    proposal.round(),
+                    parent_hash
+                );
+                let parked = HeraMsg::SigPropose {
+                    proposal: proposal.clone(),
+                    auth: auth.clone(),
+                    attestation: attestation.clone(),
+                    sender: _sender,
+                };
+                self.pending_sig_proposals
+                    .entry(parent_hash.clone())
+                    .or_default()
+                    .push(parked);
+                self.broadcast_sig_element_request(parent_hash).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                warn!("Hera: error reading parent sig-element: {}", e);
+                return Ok(());
+            }
+        }
+
         self.on_correct_sig_proposal(proposal, auth, attestation)
             .await
     }
@@ -215,6 +250,114 @@ where
         let bytes = bytes::Bytes::from(bincode::serialize(&relay).map_err(anyhow::Error::new)?);
         let _ = self.consensus_net.send(next_leader, bytes).await;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Sig-element catch-up (mirrors the data-plane DataRequest/DataResponse).
+    // -----------------------------------------------------------------------
+
+    /// Broadcast a request for a missing sig-chain element by hash.
+    pub(crate) async fn broadcast_sig_element_request(
+        &mut self,
+        target_hash: crate::server::hera::core::SigElementHash<Tx>,
+    ) -> Result<()>
+    where
+        Tx: Clone + Serialize,
+    {
+        // Dedupe: skip if a fetch for this element is already outstanding.
+        if !self.pending_sig_element_requests.insert(target_hash.clone()) {
+            return Ok(());
+        }
+        let msg = HeraMsg::<Tx>::SigElementRequest {
+            source: self.my_id,
+            request: Request::new(target_hash),
+        };
+        let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
+        let _ = self
+            .consensus_net
+            .broadcast(&self.broadcast_peers, bytes)
+            .await;
+        Ok(())
+    }
+
+    /// Serve a peer's request for a sig-chain element we hold.
+    pub async fn on_sig_element_request(
+        &mut self,
+        target_hash: crate::server::hera::core::SigElementHash<Tx>,
+        source: Id,
+    ) -> Result<()>
+    where
+        Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
+    {
+        if let Ok(Some(element)) = self.sig_chain_state.get_element(target_hash.clone()).await {
+            let msg = HeraMsg::<Tx>::SigElementResponse {
+                response: Response::new(target_hash, element),
+            };
+            let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
+            let _ = self.consensus_net.send(source, bytes).await;
+        }
+        Ok(())
+    }
+
+    /// Admit a fetched sig-chain element and re-drive any proposals parked on
+    /// it. The element is content-addressed: we store it under its true hash
+    /// (`ser_and_hash`) and only re-drive proposals that referenced THAT hash,
+    /// so a peer cannot substitute a different element. If the fetched element's
+    /// own parent is also missing, fetch it too (fills a chain of gaps).
+    pub async fn on_sig_element_response(
+        &mut self,
+        element: crate::server::hera::core::SigElement<Tx>,
+    ) -> Result<()>
+    where
+        Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
+    {
+        let element_hash: crate::server::hera::core::SigElementHash<Tx> =
+            Hash::ser_and_hash(&element);
+
+        // Accept only elements we actually want: one a proposal is parked on,
+        // or one we requested (incl. recursively-fetched ancestors). The hash
+        // is content-derived, so a peer cannot substitute a different element.
+        let wanted = self.pending_sig_proposals.contains_key(&element_hash)
+            || self.pending_sig_element_requests.contains(&element_hash);
+        if !wanted {
+            return Ok(());
+        }
+        self.pending_sig_element_requests.remove(&element_hash);
+
+        // Recurse if this element's own parent is missing (fills a gap chain).
+        let parent_hash = element.proposal.block().parent_hash();
+        let parent_present = matches!(
+            self.sig_chain_state.get_element(parent_hash.clone()).await,
+            Ok(Some(_))
+        );
+
+        self.sig_chain_state
+            .write_element(Arc::new(element))
+            .await?;
+
+        if !parent_present {
+            self.broadcast_sig_element_request(parent_hash).await?;
+        }
+
+        self.drain_pending_sig_proposals(element_hash);
+        Ok(())
+    }
+
+    /// Re-queue sig proposals parked on `element_hash` via the loopback channel.
+    pub(crate) fn drain_pending_sig_proposals(
+        &mut self,
+        element_hash: crate::server::hera::core::SigElementHash<Tx>,
+    ) {
+        let to_replay = self
+            .pending_sig_proposals
+            .remove(&element_hash)
+            .unwrap_or_default();
+        for parked_msg in to_replay {
+            debug!("Hera: re-queuing parked sig proposal via loopback");
+            if self.tx_msg_loopback.send(parked_msg).is_err() {
+                warn!("Hera: loopback channel closed; dropping parked sig proposal");
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
