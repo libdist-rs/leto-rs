@@ -238,6 +238,14 @@ pub struct Hera<Tx> {
     // Test hook: max heads len across all committed attestations
     // ------------------------------------------------------------------
     pub(crate) max_committed_heads_len: Arc<std::sync::atomic::AtomicUsize>,
+
+    // ------------------------------------------------------------------
+    // Self-pacing: cumulative count of THIS node's own txs that have
+    // committed (bumped in on_committed_attestation for author == my_id).
+    // The load generator pauses when (generated - this) exceeds a cap, so
+    // load creation tracks commit progress instead of flooding the network.
+    // ------------------------------------------------------------------
+    pub(crate) my_committed_txs: Arc<std::sync::atomic::AtomicU64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -270,6 +278,7 @@ where
         rx_mem_to_batcher: UnboundedReceiver<(Tx, usize)>,
         tx_data_commit: UnboundedSender<Arc<Batch<Tx>>>,
         max_committed_heads_len: Arc<std::sync::atomic::AtomicUsize>,
+        my_committed_txs: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<()>
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug + 'static,
@@ -371,6 +380,7 @@ where
             emit_dp,
             bench_emit_window_secs,
             max_committed_heads_len,
+            my_committed_txs,
             settings,
         };
 

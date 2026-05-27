@@ -13,7 +13,11 @@ crypto = { package = "libcrypto", git = "https://github.com/libdist-rs/libcrypto
 storage = { package = "libstorage-rs", git = "https://github.com/libdist-rs/libstorage-rs.git" }
 mempool = { package = "libmempool-rs", git = "https://github.com/libdist-rs/libmempool-rs.git" }
 tcp-sender = { git = "https://github.com/libdist-rs/libnet-rs.git" }
-tcp-reliable-sender = { git = "https://github.com/libdist-rs/libnet-rs.git", features = ["unbounded"] }
+# NOTE: `unbounded` deliberately dropped — the bounded reliable sender applies
+# backpressure (try_send then send().await on Full) to the consensus loop,
+# instead of growing an unbounded queue + reconnect storm under broadcast load.
+# Affects consensus_net for leto/zeus/hera alike. tcp-broadcast (below) keeps it.
+tcp-reliable-sender = { git = "https://github.com/libdist-rs/libnet-rs.git" }
 tcp-broadcast = { git = "https://github.com/libdist-rs/libnet-rs.git", features = ["unbounded"] }
 tcp-receiver = { git = "https://github.com/libdist-rs/libnet-rs.git" }
 net-common = { package = "common", git = "https://github.com/libdist-rs/libnet-rs.git" }

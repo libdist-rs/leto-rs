@@ -343,6 +343,15 @@ where
             for block in &blocks {
                 let payload = std::sync::Arc::clone(&block.envelope.payload);
                 if !payload.is_empty() {
+                    // Self-pacing: count this node's OWN committed txs (every
+                    // node, not just the metrics node) so its load generator
+                    // can bound outstanding = generated - committed.
+                    if author == self.my_id {
+                        self.my_committed_txs.fetch_add(
+                            payload.len() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                     if self.emit_dp {
                         self.committed_tx_count += payload.len() as u64;
                         // Latency tracking: decode the per-tx send-timestamp

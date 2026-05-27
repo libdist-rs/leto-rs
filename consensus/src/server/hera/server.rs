@@ -85,6 +85,10 @@ where
         // Test hook: shared counter for max heads length across committed attestations.
         let max_committed_heads_len = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
+        // Self-pacing: shared cumulative count of this node's committed txs.
+        // The load generator reads it to bound outstanding (generated - committed).
+        let my_committed_txs = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
         mempool::Mempool::spawn(
             my_id,
             all_ids.clone(),
@@ -107,7 +111,13 @@ where
             .unwrap_or(0);
         if tps > 0 {
             if let Some(factory) = tx_factory {
-                super::load_gen::spawn(my_id, tps, tx_mem_to_batcher.clone(), factory);
+                super::load_gen::spawn(
+                    my_id,
+                    tps,
+                    tx_mem_to_batcher.clone(),
+                    factory,
+                    Arc::clone(&my_committed_txs),
+                );
                 info!("HeraServer: self-load generator spawned at TPS={}", tps);
             } else {
                 info!(
@@ -128,6 +138,7 @@ where
             rx_mem_to_batcher,
             tx_commit,
             Arc::clone(&max_committed_heads_len),
+            Arc::clone(&my_committed_txs),
         )?;
 
         Ok((exit_tx, max_committed_heads_len))
