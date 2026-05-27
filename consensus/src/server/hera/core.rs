@@ -37,6 +37,16 @@ use tokio::time::{interval, Interval};
 use super::chain_state::{DataBlockHash, MultiAuthorDataChainState};
 use super::phases::HeraCommitContext;
 
+/// Data-plane messages (the high-volume all-to-all flood). Everything else
+/// (sig proposals, blames, blame-QCs, sig-element catch-up) is treated as
+/// priority sig-plane traffic.
+fn is_data_plane<Tx>(msg: &HeraMsg<Tx>) -> bool {
+    matches!(
+        msg,
+        HeraMsg::DataPropose { .. } | HeraMsg::DataRequest { .. } | HeraMsg::DataResponse { .. }
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Type aliases
 // ---------------------------------------------------------------------------
@@ -165,7 +175,14 @@ pub struct Hera<Tx> {
     // Channels
     // ------------------------------------------------------------------
     pub(crate) exit_rx: oneshot::Receiver<()>,
-    pub(crate) rx_net_to_consensus: UnboundedReceiver<HeraMsg<Tx>>,
+    /// Sig-plane (consensus) inbound — drained with priority over the data
+    /// plane so the leader's low-volume but critical SigPropose/blame/blame-QC
+    /// messages are never buried behind the all-to-all data flood (which
+    /// desynchronizes the round state machine and wedges the sig-chain at large
+    /// n -- see hera-n61-stall-diagnosis).
+    pub(crate) rx_sig_net: UnboundedReceiver<HeraMsg<Tx>>,
+    /// Data-plane inbound — lowest priority.
+    pub(crate) rx_data_net: UnboundedReceiver<HeraMsg<Tx>>,
     pub(crate) rx_msg_loopback: UnboundedReceiver<HeraMsg<Tx>>,
     pub(crate) tx_msg_loopback: UnboundedSender<HeraMsg<Tx>>,
     pub(crate) tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Tx>>,
@@ -298,13 +315,22 @@ where
         let (consensus_net, mut inbound_rx) =
             HeraNet::spawn(net_addresses, my_id, consensus_addr);
 
-        // Deserialize inbound frames into HeraMsg and feed the consensus loop.
-        let (tx_net_to_consensus, rx_net_to_consensus) = unbounded_channel();
+        // Deserialize inbound frames into HeraMsg and split into two priority
+        // classes: sig-plane (consensus) and data-plane. The run loop drains the
+        // sig channel before the data channel so a data flood can't bury the
+        // critical sig messages.
+        let (tx_sig_net, rx_sig_net) = unbounded_channel();
+        let (tx_data_net, rx_data_net) = unbounded_channel();
         tokio::spawn(async move {
             while let Some(frame) = inbound_rx.recv().await {
                 match bincode::deserialize::<HeraMsg<Tx>>(&frame) {
                     Ok(msg) => {
-                        if tx_net_to_consensus.send(msg).is_err() {
+                        let tx = if is_data_plane(&msg) {
+                            &tx_data_net
+                        } else {
+                            &tx_sig_net
+                        };
+                        if tx.send(msg).is_err() {
                             break;
                         }
                     }
@@ -357,7 +383,8 @@ where
             crypto_system,
             broadcast_peers: all_peers_except_me,
             exit_rx,
-            rx_net_to_consensus,
+            rx_sig_net,
+            rx_data_net,
             consensus_net,
             tx_consensus_to_batcher,
             rx_data_batch,
@@ -371,8 +398,13 @@ where
             ),
             hera_commit_ctx,
             round_state: HeraRoundState::new(num_nodes),
+            // Round (blame) timer. Defaults to 4*delay_in_ms; override with
+            // HERA_ROUND_TIMER_MS to tune the blame timeout during experiments.
             timer: interval(std::time::Duration::from_millis(
-                4 * settings.bench_config.delay_in_ms,
+                std::env::var("HERA_ROUND_TIMER_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(4 * settings.bench_config.delay_in_ms),
             )),
             timer_enabled: true,
             signature_epoch: Hera::<Tx>::STEADY_STATE_SIG_EPOCH,
@@ -410,6 +442,39 @@ where
     {
         info!("Hera: starting (node {})", self.my_id);
         self.sig_chain_state.genesis_setup().await?;
+
+        // Startup gate: HeraNet establishes connections lazily (active/passive
+        // handshake + jittered 1-5s backoff). The bootstrap sig proposal is
+        // broadcast immediately, so without a gate it is dropped to peers whose
+        // connection is not yet up -- and the leader never re-proposes, which
+        // wedges the cluster at large n (the blame path cannot reconverge once
+        // nodes desynchronize). Wait until a quorum of peers has connected
+        // before proposing, capped so f crashed peers cannot block liveness.
+        {
+            let num_nodes = self.settings.committee_config.num_nodes();
+            let num_faults = self.settings.committee_config.num_faults();
+            // Quorum of *peers* (excluding self): n - f - 1.
+            let want = (num_nodes - num_faults).saturating_sub(1);
+            // Cap so f crashed peers cannot block startup forever. Override with
+            // HERA_STARTUP_GATE_CAP_MS during experiments (default 30s).
+            let cap_ms = std::env::var("HERA_STARTUP_GATE_CAP_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30_000);
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(cap_ms);
+            while self.consensus_net.connected_peers() < want
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            info!(
+                "Hera: startup gate cleared ({} of {} peers connected)",
+                self.consensus_net.connected_peers(),
+                want
+            );
+        }
+
         self.timer.reset();
         self.bench_emit_interval.tick().await;
 
@@ -430,6 +495,13 @@ where
 
         loop {
             tokio::select! {
+                // Biased: branches are tried top-to-bottom, so all control and
+                // sig-plane traffic is drained before the data plane. This keeps
+                // the leader's SigPropose/blame/blame-QC out from behind the
+                // all-to-all data flood, which otherwise desynchronizes the
+                // round state machine and wedges the sig-chain at large n.
+                biased;
+
                 // Exit
                 exit_val = &mut self.exit_rx => {
                     exit_val.map_err(anyhow::Error::new)?;
@@ -437,43 +509,10 @@ where
                     break;
                 }
 
-                // Data batches from this node's own batcher — always consuming.
-                batch = self.rx_data_batch.recv() => {
-                    let batch = batch.ok_or_else(|| anyhow!("Hera: data batcher shut down"))?;
-                    if let Err(e) = self.on_self_propose(batch).await {
-                        error!("Hera: on_self_propose: {}", e);
-                    }
-                }
-
-                // Round-ordered sig-plane messages.
-                _ = async {}, if self.round_state.is_ready() => {
-                    if let Some(msg) = self.round_state.pop_msg() {
-                        if let Err(e) = self.handle_sig_ordered(msg).await {
-                            error!("Hera: handle_sig_ordered: {}", e);
-                        }
-                    }
-                }
-
-                // Round timer (blame).
+                // Round timer (blame) — must fire on time regardless of load.
                 _ = self.timer.tick(), if self.timer_enabled => {
                     if let Err(e) = self.on_round_timeout().await {
                         error!("Hera: on_round_timeout: {}", e);
-                    }
-                }
-
-                // Loopback.
-                msg = self.rx_msg_loopback.recv() => {
-                    let msg = msg.ok_or_else(|| anyhow!("Hera: loopback closed"))?;
-                    if let Err(e) = self.dispatch(msg).await {
-                        error!("Hera: loopback dispatch: {}", e);
-                    }
-                }
-
-                // Net.
-                msg = self.rx_net_to_consensus.recv() => {
-                    let msg = msg.ok_or_else(|| anyhow!("Hera: net closed"))?;
-                    if let Err(e) = self.dispatch(msg).await {
-                        error!("Hera: net dispatch: {}", e);
                     }
                 }
 
@@ -483,6 +522,47 @@ where
                         self.on_committed_attestation(c);
                     } else {
                         warn!("Hera main: rx_committed closed");
+                    }
+                }
+
+                // Loopback (this node's own blames/relays re-entering).
+                msg = self.rx_msg_loopback.recv() => {
+                    let msg = msg.ok_or_else(|| anyhow!("Hera: loopback closed"))?;
+                    if let Err(e) = self.dispatch(msg).await {
+                        error!("Hera: loopback dispatch: {}", e);
+                    }
+                }
+
+                // Priority sig-plane network intake.
+                msg = self.rx_sig_net.recv() => {
+                    let msg = msg.ok_or_else(|| anyhow!("Hera: sig net closed"))?;
+                    if let Err(e) = self.dispatch(msg).await {
+                        error!("Hera: sig net dispatch: {}", e);
+                    }
+                }
+
+                // Round-ordered sig-plane messages (already buffered).
+                _ = async {}, if self.round_state.is_ready() => {
+                    if let Some(msg) = self.round_state.pop_msg() {
+                        if let Err(e) = self.handle_sig_ordered(msg).await {
+                            error!("Hera: handle_sig_ordered: {}", e);
+                        }
+                    }
+                }
+
+                // Data batches from this node's own batcher (data plane).
+                batch = self.rx_data_batch.recv() => {
+                    let batch = batch.ok_or_else(|| anyhow!("Hera: data batcher shut down"))?;
+                    if let Err(e) = self.on_self_propose(batch).await {
+                        error!("Hera: on_self_propose: {}", e);
+                    }
+                }
+
+                // Data-plane network intake — lowest priority.
+                msg = self.rx_data_net.recv() => {
+                    let msg = msg.ok_or_else(|| anyhow!("Hera: data net closed"))?;
+                    if let Err(e) = self.dispatch(msg).await {
+                        error!("Hera: data net dispatch: {}", e);
                     }
                 }
 

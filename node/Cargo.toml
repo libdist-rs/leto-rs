@@ -55,3 +55,5 @@ git = "https://github.com/libdist-rs/libnet-rs.git"
 
 [features]
 benchmark = ["consensus/benchmark"]
+[dev-dependencies]
+env_logger = "0.11"

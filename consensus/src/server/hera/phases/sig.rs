@@ -374,7 +374,7 @@ where
         self.try_commit()?;
 
         let new_round = self.round_state.round();
-        debug!("Hera: sig-chain advancing to round {}", new_round);
+        debug!("Hera[n{}]: sig-chain advancing to round {}", self.my_id, new_round);
 
         if self.sig_leader_context.leader() == self.my_id {
             if let Err(e) = self.handle_new_sig_round().await {
@@ -397,8 +397,6 @@ where
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
     {
-        debug!("Hera: sig blame for round {}", blame_round);
-
         if self.sig_chain_state.highest_chain().proposal.round() == blame_round {
             return Ok(());
         }
@@ -422,10 +420,12 @@ where
         auth.verify_without_id_check(&blame_hash, pk)?;
 
         self.round_state.blame_map.insert(auth.get_id(), auth);
-        if self.round_state.blame_map.len() != qc_len {
+        debug!("Hera[n{}]: blame round {} map={}/{} (cur_round={})", self.my_id, blame_round, self.round_state.blame_map.len(), qc_len, self.round_state.round());
+        if self.round_state.blame_map.len() < qc_len {
             return Ok(());
         }
 
+        debug!("Hera[n{}]: BLAME-QC formed for round {} ({} blames)", self.my_id, blame_round, qc_len);
         self.round_state.got_qc = true;
         let blame_map = std::mem::take(&mut self.round_state.blame_map);
         let mut qc = Certificate::empty();

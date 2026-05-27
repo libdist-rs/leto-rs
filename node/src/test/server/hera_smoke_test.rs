@@ -26,9 +26,21 @@ use fnv::FnvHashMap;
 use mempool::Batch;
 use tokio::sync::{mpsc::unbounded_channel, oneshot};
 
-const NUM_NODES: usize = 4;
+// Committee size. Default 4; override with SMOKE_N=<n> to reproduce larger
+// committees locally (e.g. SMOKE_N=61 to mirror the AWS scalability point).
+fn smoke_n() -> usize {
+    std::env::var("SMOKE_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4)
+}
 const TPS_PER_NODE: usize = 1000;
-const RUN_SECS: u64 = 10;
+fn run_secs() -> u64 {
+    std::env::var("SMOKE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10)
+}
 
 const BASE_CONSENSUS_PORT: u16 = 14000;
 const BASE_MEMPOOL_PORT: u16 = 14500;
@@ -37,7 +49,7 @@ const BASE_CONSENSUS_CLIENT_PORT: u16 = 14700;
 
 fn build_settings(db_dir: &std::path::Path) -> Settings {
     let mut parties: FnvHashMap<Id, Party> = FnvHashMap::default();
-    for id in 0..NUM_NODES {
+    for id in 0..smoke_n() {
         parties.insert(
             id,
             Party {
@@ -61,7 +73,10 @@ fn build_settings(db_dir: &std::path::Path) -> Settings {
         bench_config: BenchConfig {
             batch_size: 5_000,
             batch_timeout: Duration::from_millis(50),
-            delay_in_ms: 200,
+            delay_in_ms: std::env::var("SMOKE_DELAY_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(200),
             eleader_pipeline_depth: 4,
             data_timer_duration_ms: 1000,
             bench_emit_window_secs: 1,
@@ -89,8 +104,11 @@ fn make_tx(
 
 #[tokio::test]
 async fn test_hera_smoke() -> Result<()> {
+    let _ = env_logger::builder().is_test(false).format_timestamp_millis().try_init();
+    let num_nodes = smoke_n();
+    println!("[hera-smoke] NUM_NODES={num_nodes}");
     // Accumulate committed batch count per node.
-    let commit_counts: Vec<Arc<AtomicU64>> = (0..NUM_NODES)
+    let commit_counts: Vec<Arc<AtomicU64>> = (0..num_nodes)
         .map(|_| Arc::new(AtomicU64::new(0)))
         .collect();
 
@@ -101,13 +119,13 @@ async fn test_hera_smoke() -> Result<()> {
         p
     };
     let settings = build_settings(&db_dir);
-    let all_ids: Vec<Id> = (0..NUM_NODES).collect();
-    let crypto_keys = KeyConfig::generate(Algorithm::ED25519, NUM_NODES)?;
+    let all_ids: Vec<Id> = (0..num_nodes).collect();
+    let crypto_keys = KeyConfig::generate(Algorithm::ED25519, num_nodes)?;
 
     let mut exit_senders: Vec<oneshot::Sender<()>> = Vec::new();
     let mut max_heads_arcs: Vec<Arc<std::sync::atomic::AtomicUsize>> = Vec::new();
 
-    for id in 0..NUM_NODES {
+    for id in 0..num_nodes {
         let (tx_commit, rx_commit) = unbounded_channel::<Arc<Batch<TestTx>>>();
         let counter = commit_counts[id].clone();
 
@@ -137,7 +155,7 @@ async fn test_hera_smoke() -> Result<()> {
     }
 
     // Run for RUN_SECS.
-    tokio::time::sleep(Duration::from_secs(RUN_SECS)).await;
+    tokio::time::sleep(Duration::from_secs(run_secs())).await;
 
     // Shut down all nodes.
     for sender in exit_senders {
@@ -150,16 +168,21 @@ async fn test_hera_smoke() -> Result<()> {
 
     // --- Assertions ---
 
-    // (1) Every node committed at least one batch.
-    for (id, counter) in commit_counts.iter().enumerate() {
-        let count = counter.load(Ordering::Relaxed);
+    // (1) Every node committed at least one batch. Print all counts first so a
+    //     partial/zero stall is fully visible during diagnosis sweeps.
+    let counts: Vec<u64> = commit_counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let committed_nodes = counts.iter().filter(|&&c| c > 0).count();
+    println!(
+        "[hera-smoke] commits per node: {:?}  ({}/{} nodes committed)",
+        counts, committed_nodes, num_nodes
+    );
+    for (id, &count) in counts.iter().enumerate() {
         assert!(
             count > 0,
             "Node {} committed 0 batches in {}s — Hera protocol did not make progress",
             id,
-            RUN_SECS
+            run_secs()
         );
-        println!("[hera-smoke] Node {} committed {} batches", id, count);
     }
 
     // (2) DP[Throughput] counter: node 0's committed_tx_count was > 0
@@ -185,10 +208,10 @@ async fn test_hera_smoke() -> Result<()> {
     // conservative smoke check; the ideal is == 4 but network timing may
     // mean the rleader occasionally blames some authors in the first few rounds.
     assert!(
-        max_heads_on_node0 <= NUM_NODES,
+        max_heads_on_node0 <= num_nodes,
         "max_committed_heads_len ({}) exceeds NUM_NODES ({}) — invariant violated",
         max_heads_on_node0,
-        NUM_NODES
+        num_nodes
     );
 
     Ok(())

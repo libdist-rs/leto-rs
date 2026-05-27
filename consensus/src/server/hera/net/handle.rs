@@ -14,6 +14,7 @@
 //! because the transport never melts.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -30,6 +31,11 @@ type PeerSenders = Arc<Mutex<FnvHashMap<usize, mpsc::Sender<Bytes>>>>;
 #[derive(Clone)]
 pub struct HeraNet {
     peers: PeerSenders,
+    /// Count of distinct peers that have connected at least once. Lets the
+    /// protocol wait for the mesh to form before broadcasting its bootstrap
+    /// proposal (a proposal sent before the mesh is up is dropped to
+    /// not-yet-connected peers, with no retransmission -- wedging large n).
+    connected: Arc<AtomicUsize>,
 }
 
 impl HeraNet {
@@ -44,15 +50,25 @@ impl HeraNet {
     ) -> (Self, mpsc::Receiver<Bytes>) {
         let mut network = Network::from_socket_addresses(&addresses, our_id, local_addr);
         let peers: PeerSenders = Arc::new(Mutex::new(FnvHashMap::default()));
+        let connected = Arc::new(AtomicUsize::new(0));
         let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
 
         let peers_router = peers.clone();
+        let connected_router = connected.clone();
         tokio::spawn(async move {
             let conn_rx = network.connection_receiver();
             while let Some(conn) = conn_rx.recv().await {
                 let peer_id = conn.peer_id;
-                // Replace any prior sender for this peer with the new one.
-                peers_router.lock().unwrap().insert(peer_id, conn.sender);
+                // Replace any prior sender for this peer with the new one; count
+                // the first connection from each distinct peer.
+                let first_time = peers_router
+                    .lock()
+                    .unwrap()
+                    .insert(peer_id, conn.sender)
+                    .is_none();
+                if first_time {
+                    connected_router.fetch_add(1, Ordering::Relaxed);
+                }
                 // Pump this connection's inbound frames into the aggregate
                 // channel until the connection dies (receiver closes).
                 let inbound_tx = inbound_tx.clone();
@@ -67,7 +83,7 @@ impl HeraNet {
             }
         });
 
-        (Self { peers }, inbound_rx)
+        (Self { peers, connected }, inbound_rx)
     }
 
     /// Best-effort send to one peer. Drops on a full or stale channel.
@@ -80,8 +96,9 @@ impl HeraNet {
                 // Peer is behind; shed the frame rather than block consensus.
             }
             Err(TrySendError::Closed(_)) => {
-                // Stale connection; the router will install a fresh sender.
-                self.peers.lock().unwrap().remove(&id);
+                // Stale connection; leave the entry in place so the router
+                // overwrites it (rather than counting a fresh connection) when
+                // this peer reconnects. Sends drop until then.
             }
         }
     }
@@ -91,5 +108,10 @@ impl HeraNet {
         for peer in peers {
             self.send(*peer, bytes.clone()).await;
         }
+    }
+
+    /// Number of distinct peers that have connected at least once.
+    pub fn connected_peers(&self) -> usize {
+        self.connected.load(Ordering::Relaxed)
     }
 }
