@@ -1,19 +1,14 @@
 /// Hera commit projection.
 ///
-/// Parallel to `zeus/phases/commit.rs::ZeusCommitContext` but carries
-/// `MultiAttestation<Tx>` instead of `Attestation<Tx>` as the committed
-/// payload.
-///
 /// The commit rule is identical to Zeus: `(n+f+1)/2` unique proposers in the
-/// sliding window.  When a sig-chain element commits, the main task's
-/// `on_committed_attestation` receives the `MultiAttestation` and walks each
-/// author's sub-chain from the committed watermark to the attested head height,
-/// emitting txs in author-id-ascending order.
+/// sliding window. When a sig-chain element commits, the consensus actor's
+/// `on_committed_attestation` forwards the committed attestation to the data
+/// actor via the unbounded `tx_commit_emit` channel; the data actor walks
+/// ranges, emits txs, and GCs block_store below the committed watermark.
 ///
-/// `HeraCommitContext` wraps the same `ChainState<MultiAttestation<Tx>>` that
-/// the main `Hera<Tx>` task uses.  The commit background task is separate so
-/// the main event loop is not blocked by the chain-walk (which touches
-/// storage).
+/// `HeraCommitContext` wraps a second `ChainState<MultiAttestation<Tx>>`
+/// that runs in a background task so the sig actor event loop is not blocked
+/// by the chain-walk (which touches storage).
 use crate::{
     server::hera::{SigChainState, SigElement, SigElementHash},
     types::{hera::MultiAttestation, Transaction},
@@ -23,7 +18,6 @@ use anyhow::{anyhow, Result};
 use crypto::hash::Hash;
 use linked_hash_map::LinkedHashMap;
 use log::*;
-use mempool::Batch;
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -37,7 +31,7 @@ pub enum HeraCommitMsg<Tx> {
 }
 
 /// A committed multi-attestation notification sent from the commit task to the
-/// main Hera task.
+/// consensus actor.
 pub struct HeraCommittedAttestation<Tx> {
     /// The sig-chain round at which this element committed.
     pub sig_round: u64,
@@ -121,6 +115,8 @@ where
                 .recv()
                 .await
                 .ok_or_else(|| anyhow!("Hera commit context: inner channel closed"))?;
+            crate::server::hera::core::INFLIGHT_COMMIT_TX_INNER
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 
             match msg {
                 HeraCommitMsg::EndRound {
@@ -208,7 +204,6 @@ where
                         let sig_round = element.proposal.round();
                         let atts: &[MultiAttestation<Tx>] = &element.batch.payload;
 
-                        // Pick the attestation with the highest max-head-height.
                         let best_att: Option<MultiAttestation<Tx>> =
                             atts.iter().max_by_key(|a| a.max_head_height()).cloned();
 
@@ -219,10 +214,16 @@ where
                                 attestation.envelope.heads.len(),
                                 attestation.envelope.blames.len(),
                             );
-                            let _ = tx_committed.send(HeraCommittedAttestation {
-                                sig_round,
-                                attestation,
-                            });
+                            if tx_committed
+                                .send(HeraCommittedAttestation {
+                                    sig_round,
+                                    attestation,
+                                })
+                                .is_ok()
+                            {
+                                crate::server::hera::core::INFLIGHT_COMMITTED
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
 
                         highest_committed_hash = hash;
@@ -234,11 +235,13 @@ where
     }
 }
 
+use crate::server::hera::Hera;
+
 impl<Tx> Hera<Tx>
 where
     Tx: Transaction,
 {
-    /// Hera: try_commit — sends the current sig-chain head to the commit task.
+    /// Send the current sig-chain head to the commit task.
     pub fn try_commit(&mut self) -> Result<()>
     where
         Tx: Clone + Serialize,
@@ -247,165 +250,15 @@ where
             round_element_hash: self.sig_chain_state.highest_hash(),
             round_element: self.sig_chain_state.highest_chain(),
         };
-        self.hera_commit_ctx
+        let result = self
+            .hera_commit_ctx
             .tx_inner
             .send(msg)
-            .map_err(anyhow::Error::new)
-    }
-
-    /// Hera: `on_committed_attestation` — called from the main select loop
-    /// when `HeraCommittedAttestation` arrives.
-    ///
-    /// For each `DataHead` in `att.envelope.heads`, walk that author's
-    /// sub-chain from `committed_heights[author] + 1` to `head.height` and
-    /// emit all blocks' txs via `tx_data_commit`.  Authors are iterated in
-    /// ascending id order for determinism.
-    ///
-    /// Updates `multi_data_chain.committed_heights[author]` to `head.height`
-    /// after emission.
-    pub(crate) fn on_committed_attestation(
-        &mut self,
-        committed: HeraCommittedAttestation<Tx>,
-    ) where
-        Tx: Clone + Serialize,
-    {
-        let att = committed.attestation;
-
-        // Debug assertion: heads + blames must cover exactly n authors with no
-        // duplicates.
-        #[cfg(debug_assertions)]
-        {
-            let n = self.settings.committee_config.num_nodes();
-            let total = att.envelope.heads.len() + att.envelope.blames.len();
-            debug_assert_eq!(
-                total,
-                n,
-                "Hera invariant: heads.len() + blames.len() must equal n; \
-                 got heads={} blames={} n={}",
-                att.envelope.heads.len(),
-                att.envelope.blames.len(),
-                n
-            );
-            // No author should appear in both.
-            let head_authors: std::collections::HashSet<Id> =
-                att.envelope.heads.iter().map(|h| h.author).collect();
-            for blamed in &att.envelope.blames {
-                debug_assert!(
-                    !head_authors.contains(blamed),
-                    "Hera invariant: author {} appears in both heads and blames",
-                    blamed
-                );
-            }
+            .map_err(anyhow::Error::new);
+        if result.is_ok() {
+            crate::server::hera::core::INFLIGHT_COMMIT_TX_INNER
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-
-        // Track max heads size for test hook.
-        let heads_len = att.envelope.heads.len();
-        let prev = self
-            .max_committed_heads_len
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if heads_len > prev {
-            self.max_committed_heads_len
-                .store(heads_len, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        // Sort heads by author id for determinism.
-        let mut sorted_heads = att.envelope.heads.clone();
-        sorted_heads.sort_by_key(|h| h.author);
-
-        for head in &sorted_heads {
-            let author = head.author;
-            let to_height = head.height;
-            let from_height = self.multi_data_chain.committed_height(author);
-
-            if to_height <= from_height {
-                continue;
-            }
-
-            // Walk the sub-chain from from_height+1 to to_height.
-            let blocks = self
-                .multi_data_chain
-                .walk_range(&head.hash, from_height, to_height);
-
-            // Debug: verify parent-hash chain continuity.
-            #[cfg(debug_assertions)]
-            {
-                for i in 1..blocks.len() {
-                    debug_assert_eq!(
-                        blocks[i].envelope.parent_hash,
-                        *blocks[i - 1].hash(),
-                        "Hera commit: chain broken at author={} height={}",
-                        author,
-                        blocks[i].envelope.height
-                    );
-                }
-            }
-
-            for block in &blocks {
-                let payload = std::sync::Arc::clone(&block.envelope.payload);
-                if !payload.is_empty() {
-                    // Self-pacing: count this node's OWN committed txs (every
-                    // node, not just the metrics node) so its load generator
-                    // can bound outstanding = generated - committed.
-                    if author == self.my_id {
-                        self.my_committed_txs.fetch_add(
-                            payload.len() as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                    }
-                    if self.emit_dp {
-                        self.committed_tx_count += payload.len() as u64;
-                        // Latency tracking: decode the per-tx send-timestamp
-                        // (load_gen embeds it via Transaction::hera_timestamp_ns).
-                        // Cap samples per window at 8192 so very-high-throughput
-                        // runs don't blow memory; down-sample by skipping after
-                        // the cap (statistically OK for median).
-                        if self.latency_samples_ms.len() < 8192 {
-                            let now_ns = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_nanos())
-                                .unwrap_or(0);
-                            for tx in payload.iter() {
-                                if let Some(send_ns) = tx.hera_timestamp_ns() {
-                                    if send_ns > 0 && now_ns >= send_ns {
-                                        let lat_ms = ((now_ns - send_ns) / 1_000_000) as u64;
-                                        self.latency_samples_ms.push(lat_ms);
-                                        if self.latency_samples_ms.len() >= 8192 {
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    let payload_owned: Vec<Tx> = (*payload).clone();
-                    // Notify batcher of committed round.
-                    let _ = self.tx_consensus_to_batcher.send(
-                        crate::server::BatcherConsensusMsg::Committed {
-                            batch: Batch {
-                                payload: payload_owned.clone(),
-                            },
-                            round: block.envelope.height,
-                        },
-                    );
-                    if self
-                        .tx_data_commit
-                        .send(Arc::new(Batch {
-                            payload: payload_owned,
-                        }))
-                        .is_err()
-                    {
-                        log::error!("Hera: tx_data_commit closed");
-                        return;
-                    }
-                }
-            }
-
-            // Update committed watermark.
-            self.multi_data_chain
-                .committed_heights
-                .insert(author, to_height);
-        }
+        result
     }
 }
-
-use crate::server::hera::Hera;

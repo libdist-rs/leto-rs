@@ -54,6 +54,37 @@ fn default_logger(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // PROFILE INSTRUMENTATION: tokio-console init.
+    // Gate behind HERA_CONSOLE=1 so only one node in a 61-node run listens.
+    // Port = TOKIO_CONSOLE_BASE_PORT (default 6669) + node_id, resolved later
+    // from argv. We initialise the subscriber before log4rs so the tokio
+    // tracing layer is active from the start. Requires building with
+    // RUSTFLAGS="--cfg tokio_unstable" and the `console` feature.
+    #[cfg(feature = "console")]
+    {
+        if std::env::var("HERA_CONSOLE").as_deref() == Ok("1") {
+            // Determine node id from argv to pick a unique port.
+            let console_port: u16 = {
+                let args: Vec<String> = std::env::args().collect();
+                let id_pos = args.iter().position(|a| a == "--id");
+                let id: u64 = id_pos
+                    .and_then(|p| args.get(p + 1))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let base: u16 = std::env::var("TOKIO_CONSOLE_BASE_PORT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(6669);
+                base.saturating_add(id as u16)
+            };
+            let addr = format!("127.0.0.1:{}", console_port);
+            console_subscriber::ConsoleLayer::builder()
+                .server_addr(addr.parse::<std::net::SocketAddr>().unwrap())
+                .init();
+            eprintln!("tokio-console listening on {}", addr);
+        }
+    }
+
     // Raise the per-process FD soft limit.
     match fdlimit::raise_fd_limit() {
         Ok(fdlimit::Outcome::LimitRaised { from, to }) => {

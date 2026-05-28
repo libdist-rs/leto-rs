@@ -212,10 +212,7 @@ where
         // and no round-keyed CancelHandler is retained.  Nodes that miss this
         // block recover it via the DataRequest/DataResponse backfill once the
         // sig-chain references it (see on_data_request / on_data_response).
-        let _ = self
-            .data_net
-            .broadcast(&self.broadcast_peers, bytes)
-            .await;
+        let _ = self.data_net.broadcast(&self.broadcast_peers, bytes).await;
 
         // ----------------------------------------------------------------
         // Defer own admission via loopback.
@@ -308,9 +305,7 @@ where
                     block.envelope.parent_hash, existing_child_hash, block_hash
                 );
                 // Look up the existing block to build the blame payload.
-                if let Some(existing_block) =
-                    self.data_block_db.get(&existing_child_hash).await?
-                {
+                if let Some(existing_block) = self.data_block_db.get(&existing_child_hash).await? {
                     let epoch = block.envelope.epoch;
                     let height = block.envelope.height;
                     match self.make_equivocation_blame(epoch, height, existing_block, block) {
@@ -343,8 +338,8 @@ where
             // Same child already recorded — duplicate arrival; idempotent.
         }
 
-        // 6. Committed-prefix conflict check (driven from the block's own
-        //    identity; the ancestor walk uses the resident metadata index).
+        // 6. Committed-prefix conflict check (driven from the block's own identity; the
+        //    ancestor walk uses the resident metadata index).
         if conflicts_data_prefix(
             block.hash(),
             block.envelope.height,
@@ -395,7 +390,8 @@ where
             // ---------------------------------------------------------------
             // Case (a): fast path — block directly extends the current head.
             // ---------------------------------------------------------------
-            self.insert_and_advance(block, block_hash, parent_hash).await?;
+            self.insert_and_advance(block, block_hash, parent_hash)
+                .await?;
 
             // Drain any pending blocks whose parent is now the new head.
             self.drain_pending_data_blocks().await?;

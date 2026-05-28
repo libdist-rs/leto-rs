@@ -7,3 +7,8 @@ members = [
     "stress-test",
 ]
 resolver = "2"
+
+# PROFILE INSTRUMENTATION: keep debug symbols in release for samply/flamegraph.
+# Remove when profiling is done.
+[profile.release]
+debug = 1

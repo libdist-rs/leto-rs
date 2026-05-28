@@ -116,7 +116,7 @@ ARTEMIS = Protocol(
 LETO = Protocol(
     name="leto",
     git_url="https://github.com/libdist-rs/leto-rs.git",
-    git_sha="e521d4df778511aa5f0280c90c94baaa03065d7b",
+    git_sha="bb6751046a8bab1df43b2f267c888918eab78568",
     build_cmd="cargo build --release --bin node",
     # `node` + `node server --id N --config <cfg> --key-file <key>` —
     # client mode reuses the same binary's `client` subcommand which
@@ -134,7 +134,7 @@ LETO = Protocol(
 ZEUS = Protocol(
     name="zeus",
     git_url="https://github.com/libdist-rs/leto-rs.git",
-    git_sha="e521d4df778511aa5f0280c90c94baaa03065d7b",
+    git_sha="bb6751046a8bab1df43b2f267c888918eab78568",
     build_cmd="cargo build --release --bin node-zeus --bin node",
     node_run_cmd=(
         "{bin_dir}/node-zeus server --id {id} --config {config} "
@@ -184,8 +184,10 @@ MYSTICETI = Protocol(
 HERA = Protocol(
     name="hera",
     git_url="https://github.com/libdist-rs/leto-rs.git",
-    git_sha="e521d4df778511aa5f0280c90c94baaa03065d7b",
-    build_cmd="cargo build --release --bin node-hera",
+    git_sha="d72c3eb15c48e59bc3291b88612b32f4d5912c04",
+    # `node` (built alongside node-hera) is required for the remote keygen
+    # step (`{bin_dir}/node keys ...` in deploy.py); mirrors zeus's build_cmd.
+    build_cmd="cargo build --release --bin node-hera --bin node",
     # Self-load: every Hera node generates its own txs at TPS rate.  Mirrors
     # Mysticeti's pattern — orchestrator divides the offered system rate by
     # n so total = n * TPS = `rate`.  No separate client process.

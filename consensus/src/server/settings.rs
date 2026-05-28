@@ -47,8 +47,13 @@ pub struct Party {
     /// Port for mempool communication
     pub mempool_port: u16,
     pub consensus_address: String,
-    /// Port for consensus communication
+    /// Port for consensus (sig-plane) communication.
     pub consensus_port: u16,
+    /// Port for data-plane communication
+    /// (DataPropose/DataRequest/DataResponse). Separate from consensus_port
+    /// so the data actor binds its own listener and the O(n²) data flood
+    /// never enters the sig-plane's event loop.
+    pub data_port: u16,
     /// Port for raw-Tx client communication (owned by libmempool-rs).
     pub client_port: u16,
     /// Port for `ClientMsg<Tx>` client communication (owned by consensus).
@@ -210,6 +215,27 @@ impl Settings {
                     .ok_or_else(|| anyhow!("Id {} not found", id))?;
                 let ip_str = &party.consensus_address;
                 let addr = to_socket_address(ip_str, party.consensus_port)?;
+                map.insert(id, addr);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Data-plane peer addresses (reliable sender). Mirrors
+    /// `get_consensus_peers` but uses each party's `data_port`.
+    pub fn get_data_peers(
+        &self,
+        my_id: Id,
+    ) -> Result<HashMap<Id, SocketAddr>> {
+        let mut map = HashMap::default();
+        for id in 0..self.committee_config.num_nodes() {
+            if id != my_id {
+                let party = self
+                    .committee_config
+                    .get(&id)
+                    .ok_or_else(|| anyhow!("Id {} not found", id))?;
+                let ip_str = &party.consensus_address;
+                let addr = to_socket_address(ip_str, party.data_port)?;
                 map.insert(id, addr);
             }
         }

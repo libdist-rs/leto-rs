@@ -43,10 +43,9 @@ where
     {
         let r = self.round_state.round();
 
-        debug!(
-            "Hera: sig-chain leader proposing multi-attestation for round {}",
-            r
-        );
+        // STALL DIAGNOSTIC: log every proposal so a stalled round can be
+        // correlated to whether its leader actually proposed (and when).
+        info!("Hera[n{}]: PROPOSE round={}", self.my_id, r);
 
         let attestation = self.make_multi_attestation(r)?;
 
@@ -76,10 +75,13 @@ where
         };
 
         let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
-        let _ = self
-            .consensus_net
-            .broadcast(&self.broadcast_peers, bytes)
-            .await;
+        let peers = self.broadcast_peers.clone();
+        let results = self.consensus_net.broadcast(&peers, bytes).await;
+        for (peer, result) in peers.iter().zip(results.into_iter()) {
+            if let Ok(h) = result {
+                self.push_cancel_handler(*peer, h);
+            }
+        }
 
         // Yield so other Tokio tasks can deliver pending network messages
         // before the loopback cascade continues.
@@ -94,13 +96,19 @@ where
                 sender: self.my_id,
             })
             .map_err(anyhow::Error::new)?;
+        crate::server::hera::core::INFLIGHT_LOOPBACK
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         // Update prev_attested_heights after the proposal is sent.
-        // Committed heights are tracked separately; here we record what we just
-        // attested so the NEXT proposal's freshness check is correct.
+        // Read from the lock-free ArcSwap head_snapshots (published by data actor).
+        // Stale reads are safe: attesting a slightly-old head costs one round.
         let all_ids = self.settings.committee_config.get_all_ids();
         for id in all_ids {
-            let h = self.multi_data_chain.head_height(id);
+            let h = self
+                .head_snapshots
+                .get(&id)
+                .map(|slot| (**slot.load()).height)
+                .unwrap_or(0);
             *self.prev_attested_heights.entry(id).or_insert(0) = h;
         }
 
@@ -142,37 +150,46 @@ where
             auth.verify(&prop_hash, &leader, pk)?;
         }
 
-        // FuncMultiAttestationValid.
-        let parked_msg = HeraMsg::SigPropose {
-            proposal: proposal.clone(),
-            auth: auth.clone(),
-            attestation: attestation.clone(),
-            sender: _sender,
-        };
-        match self.multi_attestation_valid(&attestation, parked_msg) {
-            super::attestation::MultiAttestationValidity::Valid => {}
-            super::attestation::MultiAttestationValidity::Invalid => {
-                warn!("Hera: multi-attestation invalid in sig proposal");
-                return Ok(());
-            }
-            super::attestation::MultiAttestationValidity::Parked(h) => {
-                debug!("Hera: attestation parked waiting for {:?}", h);
-                self.broadcast_data_request(h).await?;
+        // FuncMultiAttestationValid — split into two steps:
+        // 1. Sig verify (stays in consensus actor, synchronous).
+        // 2. Head-existence check via Storage notify_read (FuturesUnordered): push a
+        //    GateFut and return immediately. The gating future resolves once all
+        //    referenced blocks are present in the shared store; the consensus loop's
+        //    `gating.next()` branch then calls handle_sig_proposal_post_gate. The blame
+        //    timer is the liveness backstop if a block never arrives.
+        match self.multi_attestation_sig_valid(&attestation) {
+            super::attestation::SigAttestationValidity::Valid => {}
+            super::attestation::SigAttestationValidity::Invalid => {
+                warn!("Hera: multi-attestation sig invalid in sig proposal");
                 return Ok(());
             }
         }
+        // Push gating future (fire-and-forget from this call site).
+        self.push_gating_future(proposal, auth, attestation);
+        Ok(())
+    }
 
-        // Fetch a missing PARENT sig-element BEFORE agreeing, so the committer
-        // never walks into a gap. A node that advanced past round r via a
-        // blame-QC never stored round r's element; a round r+1 proposal then
-        // references it as parent. Park this proposal and fetch the parent;
-        // `on_sig_element_response` re-drives it once the parent arrives.
+    /// Called from the `gating` FuturesUnordered branch (in core.rs `run`) once
+    /// `notify_read` has confirmed all referenced data blocks are present in
+    /// the shared store. Runs the parent-element check and, if satisfied,
+    /// calls `on_correct_sig_proposal`.
+    pub async fn handle_sig_proposal_post_gate(
+        &mut self,
+        proposal: Proposal<Id, MultiAttestation<Tx>, Round>,
+        auth: Signature<Id, Proposal<Id, MultiAttestation<Tx>, Round>>,
+        attestation: MultiAttestation<Tx>,
+    ) -> Result<()>
+    where
+        Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
+    {
+        // Fetch a missing PARENT sig-element BEFORE agreeing so the committer
+        // never walks into a gap.
         let parent_hash = proposal.block().parent_hash();
         match self.sig_chain_state.get_element(parent_hash.clone()).await {
             Ok(Some(_)) => {}
             Ok(None) => {
                 debug!(
-                    "Hera: sig proposal round={} parked for missing parent element {:?}",
+                    "Hera: sig proposal round={} parked for missing parent {:?}",
                     proposal.round(),
                     parent_hash
                 );
@@ -180,7 +197,7 @@ where
                     proposal: proposal.clone(),
                     auth: auth.clone(),
                     attestation: attestation.clone(),
-                    sender: _sender,
+                    sender: 0, // sender not needed for park/drain replay
                 };
                 self.pending_sig_proposals
                     .entry(parent_hash.clone())
@@ -248,7 +265,9 @@ where
             sender: self.my_id,
         };
         let bytes = bytes::Bytes::from(bincode::serialize(&relay).map_err(anyhow::Error::new)?);
-        let _ = self.consensus_net.send(next_leader, bytes).await;
+        if let Ok(h) = self.consensus_net.send(next_leader, bytes).await {
+            self.push_cancel_handler(next_leader, h);
+        }
         Ok(())
     }
 
@@ -265,7 +284,10 @@ where
         Tx: Clone + Serialize,
     {
         // Dedupe: skip if a fetch for this element is already outstanding.
-        if !self.pending_sig_element_requests.insert(target_hash.clone()) {
+        if !self
+            .pending_sig_element_requests
+            .insert(target_hash.clone())
+        {
             return Ok(());
         }
         let msg = HeraMsg::<Tx>::SigElementRequest {
@@ -273,10 +295,13 @@ where
             request: Request::new(target_hash),
         };
         let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
-        let _ = self
-            .consensus_net
-            .broadcast(&self.broadcast_peers, bytes)
-            .await;
+        let peers = self.broadcast_peers.clone();
+        let results = self.consensus_net.broadcast(&peers, bytes).await;
+        for (peer, result) in peers.iter().zip(results.into_iter()) {
+            if let Ok(h) = result {
+                self.push_cancel_handler(*peer, h);
+            }
+        }
         Ok(())
     }
 
@@ -294,7 +319,9 @@ where
                 response: Response::new(target_hash, element),
             };
             let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
-            let _ = self.consensus_net.send(source, bytes).await;
+            if let Ok(h) = self.consensus_net.send(source, bytes).await {
+                self.push_cancel_handler(source, h);
+            }
         }
         Ok(())
     }
@@ -302,8 +329,9 @@ where
     /// Admit a fetched sig-chain element and re-drive any proposals parked on
     /// it. The element is content-addressed: we store it under its true hash
     /// (`ser_and_hash`) and only re-drive proposals that referenced THAT hash,
-    /// so a peer cannot substitute a different element. If the fetched element's
-    /// own parent is also missing, fetch it too (fills a chain of gaps).
+    /// so a peer cannot substitute a different element. If the fetched
+    /// element's own parent is also missing, fetch it too (fills a chain of
+    /// gaps).
     pub async fn on_sig_element_response(
         &mut self,
         element: crate::server::hera::core::SigElement<Tx>,
@@ -343,7 +371,8 @@ where
         Ok(())
     }
 
-    /// Re-queue sig proposals parked on `element_hash` via the loopback channel.
+    /// Re-queue sig proposals parked on `element_hash` via the loopback
+    /// channel.
     pub(crate) fn drain_pending_sig_proposals(
         &mut self,
         element_hash: crate::server::hera::core::SigElementHash<Tx>,
@@ -354,7 +383,10 @@ where
             .unwrap_or_default();
         for parked_msg in to_replay {
             debug!("Hera: re-queuing parked sig proposal via loopback");
-            if self.tx_msg_loopback.send(parked_msg).is_err() {
+            if self.tx_msg_loopback.send(parked_msg).is_ok() {
+                crate::server::hera::core::INFLIGHT_LOOPBACK
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
                 warn!("Hera: loopback channel closed; dropping parked sig proposal");
             }
         }
@@ -374,7 +406,10 @@ where
         self.try_commit()?;
 
         let new_round = self.round_state.round();
-        debug!("Hera[n{}]: sig-chain advancing to round {}", self.my_id, new_round);
+        debug!(
+            "Hera[n{}]: sig-chain advancing to round {}",
+            self.my_id, new_round
+        );
 
         if self.sig_leader_context.leader() == self.my_id {
             if let Err(e) = self.handle_new_sig_round().await {
@@ -420,12 +455,22 @@ where
         auth.verify_without_id_check(&blame_hash, pk)?;
 
         self.round_state.blame_map.insert(auth.get_id(), auth);
-        debug!("Hera[n{}]: blame round {} map={}/{} (cur_round={})", self.my_id, blame_round, self.round_state.blame_map.len(), qc_len, self.round_state.round());
+        debug!(
+            "Hera[n{}]: blame round {} map={}/{} (cur_round={})",
+            self.my_id,
+            blame_round,
+            self.round_state.blame_map.len(),
+            qc_len,
+            self.round_state.round()
+        );
         if self.round_state.blame_map.len() < qc_len {
             return Ok(());
         }
 
-        debug!("Hera[n{}]: BLAME-QC formed for round {} ({} blames)", self.my_id, blame_round, qc_len);
+        debug!(
+            "Hera[n{}]: BLAME-QC formed for round {} ({} blames)",
+            self.my_id, blame_round, qc_len
+        );
         self.round_state.got_qc = true;
         let blame_map = std::mem::take(&mut self.round_state.blame_map);
         let mut qc = Certificate::empty();
@@ -466,12 +511,19 @@ where
             qc: qc.clone(),
         };
         let bytes = bytes::Bytes::from(bincode::serialize(&pmsg).map_err(anyhow::Error::new)?);
-        let _ = self
-            .consensus_net
-            .broadcast(&self.broadcast_peers, bytes)
-            .await;
+        let peers = self.broadcast_peers.clone();
+        let results = self.consensus_net.broadcast(&peers, bytes).await;
+        for (peer, result) in peers.iter().zip(results.into_iter()) {
+            if let Ok(h) = result {
+                self.push_cancel_handler(*peer, h);
+            }
+        }
 
         self.sig_chain_state.add_qc(blame_round, qc);
+        info!(
+            "Hera[n{}]: BLAMEQC-ADVANCE past round={}",
+            self.my_id, blame_round
+        );
         self.advance_sig_round().await
     }
 
@@ -486,6 +538,17 @@ where
         self.round_state.disable_timer(&mut self.timer_enabled);
 
         let blame_msg = self.round_state.round();
+        // STALL DIAGNOSTIC: which round timed out, who its leader was, and how far
+        // the chain got. Correlate across nodes: did `leader` ever log PROPOSE for
+        // this round? If not, the leader fell behind (didn't reach this round in
+        // time); if yes, the proposal didn't propagate/agree.
+        info!(
+            "Hera[n{}]: STALL-TIMEOUT round={} leader={} highest_chained={}",
+            self.my_id,
+            blame_msg,
+            self.sig_leader_context.leader(),
+            self.sig_chain_state.highest_chain().proposal.round(),
+        );
         let blame_hash = Hash::ser_and_hash(&blame_msg);
         let auth = Signature::<Id, Round>::new(blame_hash, self.my_id, &self.crypto_system.secret)?;
         let pmsg = HeraMsg::<Tx>::SigBlame {
@@ -493,14 +556,19 @@ where
             auth,
         };
         let bytes = bytes::Bytes::from(bincode::serialize(&pmsg).map_err(anyhow::Error::new)?);
-        let _ = self
-            .consensus_net
-            .broadcast(&self.broadcast_peers, bytes)
-            .await;
+        let peers = self.broadcast_peers.clone();
+        let results = self.consensus_net.broadcast(&peers, bytes).await;
+        for (peer, result) in peers.iter().zip(results.into_iter()) {
+            if let Ok(h) = result {
+                self.push_cancel_handler(*peer, h);
+            }
+        }
 
         self.tx_msg_loopback
             .send(pmsg)
             .map_err(anyhow::Error::new)?;
+        crate::server::hera::core::INFLIGHT_LOOPBACK
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 }

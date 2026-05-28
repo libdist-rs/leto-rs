@@ -8,9 +8,10 @@
 //!
 //! `DataBlockDB` is a **write-back** store, so steady-state commit incurs no
 //! disk I/O at all (which is what kept peak throughput high):
-//!   - a **resident metadata index** (`DataBlockMeta`: epoch/height/parent/hash),
-//!     one small entry per admitted block, answers the synchronous membership /
-//!     chain-validity / conflict-walk / epoch queries without a DB hit;
+//!   - a **resident metadata index** (`DataBlockMeta`:
+//!     epoch/height/parent/hash), one small entry per admitted block, answers
+//!     the synchronous membership / chain-validity / conflict-walk / epoch
+//!     queries without a DB hit;
 //!   - a **bounded in-memory cache** of full blocks is the primary payload
 //!     store. `insert` only touches RAM — it does NOT write through to disk.
 //!   - on eviction (cache over budget), a block is **dropped for free if it has
@@ -77,7 +78,10 @@ pub struct DataBlockMeta<Tx> {
 }
 
 impl<Tx> DataBlockMeta<Tx> {
-    fn of(block: &DataBlock<Tx>, hash: DataBlockHash<Tx>) -> Self {
+    fn of(
+        block: &DataBlock<Tx>,
+        hash: DataBlockHash<Tx>,
+    ) -> Self {
         Self {
             epoch: block.envelope.epoch,
             height: block.envelope.height,
@@ -108,7 +112,8 @@ pub struct DataBlockDB<Tx> {
     order: VecDeque<DataBlockHash<Tx>>,
     /// Cumulative serialized bytes of the blocks currently resident in `cache`.
     resident_bytes: usize,
-    /// Eviction budget in bytes; evict oldest until `resident_bytes <= cap_bytes`.
+    /// Eviction budget in bytes; evict oldest until `resident_bytes <=
+    /// cap_bytes`.
     cap_bytes: usize,
     /// Pinned genesis block — always resident, never evicted, never on disk.
     genesis: DataBlock<Tx>,
@@ -345,7 +350,10 @@ mod tests {
         Storage::new(path.to_str().unwrap()).expect("open rocksdb")
     }
 
-    fn block(height: u64, parent: DataBlockHash<u32>) -> DataBlock<u32> {
+    fn block(
+        height: u64,
+        parent: DataBlockHash<u32>,
+    ) -> DataBlock<u32> {
         use crate::types::DataBlockSig;
         use std::marker::PhantomData;
         use std::sync::Arc;

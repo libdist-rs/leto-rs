@@ -143,12 +143,21 @@ fn create_settings(config: &CreateConfig) -> Result<(server::Settings, client::S
         } else {
             config.client_port + 1000
         };
+        // data_port: immediately above the consensus_port range.
+        // For local mode: consensus_port_base + servers + i.
+        // For non-local: consensus_port + 500.
+        let data_port = if config.local {
+            config.consensus_port + config.servers as u16 + i as u16
+        } else {
+            config.consensus_port + 500
+        };
         server_parties.insert(
             ids[i],
             server::Party {
                 id: ids[i],
                 consensus_address: ips[i].clone(),
                 consensus_port,
+                data_port,
                 mempool_address: ips[i].clone(),
                 mempool_port,
                 client_port,

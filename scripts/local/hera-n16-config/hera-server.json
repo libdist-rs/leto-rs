@@ -1,0 +1,190 @@
+{
+  "committee_config": {
+    "parties": {
+      "0": {
+        "id": 0,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18001,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18000,
+        "data_port": 18004,
+        "client_port": 18002,
+        "consensus_client_port": 18006
+      },
+      "1": {
+        "id": 1,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18101,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18100,
+        "data_port": 18104,
+        "client_port": 18102,
+        "consensus_client_port": 18106
+      },
+      "2": {
+        "id": 2,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18201,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18200,
+        "data_port": 18204,
+        "client_port": 18202,
+        "consensus_client_port": 18206
+      },
+      "3": {
+        "id": 3,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18301,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18300,
+        "data_port": 18304,
+        "client_port": 18302,
+        "consensus_client_port": 18306
+      },
+      "4": {
+        "id": 4,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18401,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18400,
+        "data_port": 18404,
+        "client_port": 18402,
+        "consensus_client_port": 18406
+      },
+      "5": {
+        "id": 5,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18501,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18500,
+        "data_port": 18504,
+        "client_port": 18502,
+        "consensus_client_port": 18506
+      },
+      "6": {
+        "id": 6,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18601,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18600,
+        "data_port": 18604,
+        "client_port": 18602,
+        "consensus_client_port": 18606
+      },
+      "7": {
+        "id": 7,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18701,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18700,
+        "data_port": 18704,
+        "client_port": 18702,
+        "consensus_client_port": 18706
+      },
+      "8": {
+        "id": 8,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18801,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18800,
+        "data_port": 18804,
+        "client_port": 18802,
+        "consensus_client_port": 18806
+      },
+      "9": {
+        "id": 9,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18901,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18900,
+        "data_port": 18904,
+        "client_port": 18902,
+        "consensus_client_port": 18906
+      },
+      "10": {
+        "id": 10,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 19001,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 19000,
+        "data_port": 19004,
+        "client_port": 19002,
+        "consensus_client_port": 19006
+      },
+      "11": {
+        "id": 11,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 19101,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 19100,
+        "data_port": 19104,
+        "client_port": 19102,
+        "consensus_client_port": 19106
+      },
+      "12": {
+        "id": 12,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 19201,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 19200,
+        "data_port": 19204,
+        "client_port": 19202,
+        "consensus_client_port": 19206
+      },
+      "13": {
+        "id": 13,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 19301,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 19300,
+        "data_port": 19304,
+        "client_port": 19302,
+        "consensus_client_port": 19306
+      },
+      "14": {
+        "id": 14,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 19401,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 19400,
+        "data_port": 19404,
+        "client_port": 19402,
+        "consensus_client_port": 19406
+      },
+      "15": {
+        "id": 15,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 19501,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 19500,
+        "data_port": 19504,
+        "client_port": 19502,
+        "consensus_client_port": 19506
+      }
+    }
+  },
+  "mempool_config": {
+    "gc_depth": 5,
+    "sync_retry_delay": {
+      "secs": 1,
+      "nanos": 0
+    },
+    "sync_retry_nodes": 16
+  },
+  "storage": {
+    "base": ".",
+    "prefix": "db"
+  },
+  "bench_config": {
+    "batch_size": 500000,
+    "batch_timeout": {
+      "secs": 0,
+      "nanos": 100000000
+    },
+    "delay_in_ms": 2000,
+    "eleader_pipeline_depth": 16,
+    "data_timer_duration_ms": 1000,
+    "bench_emit_window_secs": 5,
+    "bench_metrics_node": 0
+  }
+}

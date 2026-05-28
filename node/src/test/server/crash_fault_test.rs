@@ -72,6 +72,7 @@ fn build_server_settings(db_dir: &std::path::Path) -> Settings {
                 id,
                 consensus_address: "127.0.0.1".to_string(),
                 consensus_port: BASE_CONSENSUS_PORT + id as u16,
+                data_port: BASE_CONSENSUS_PORT + 800 + id as u16,
                 mempool_address: "127.0.0.1".to_string(),
                 mempool_port: BASE_MEMPOOL_PORT + id as u16,
                 client_port: BASE_CLIENT_PORT + id as u16,
@@ -163,7 +164,9 @@ async fn test_crash_fault_view_change() -> Result<()> {
         use log4rs::config::{Appender, Config as L4Config, Logger, Root};
         use log4rs::encode::pattern::PatternEncoder;
         let stdout = ConsoleAppender::builder()
-            .encoder(Box::new(PatternEncoder::new("{d(%H:%M:%S%.3f)} [VC] {m}{n}")))
+            .encoder(Box::new(PatternEncoder::new(
+                "{d(%H:%M:%S%.3f)} [VC] {m}{n}",
+            )))
             .build();
         if let Ok(config) = L4Config::builder()
             .appender(Appender::builder().build("stdout", Box::new(stdout)))

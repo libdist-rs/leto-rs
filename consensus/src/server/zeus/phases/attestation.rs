@@ -196,8 +196,8 @@ where
             return AttestationValidity::Parked(d_hash.clone());
         }
 
-        // 5. Committed-prefix conflict check. Drive the walk from the pinned
-        //    block's resident metadata (no payload load needed).
+        // 5. Committed-prefix conflict check. Drive the walk from the pinned block's
+        //    resident metadata (no payload load needed).
         if let Some(m) = self.data_block_db.meta(d_hash) {
             let (d_height, d_parent) = (m.height, m.parent_hash.clone());
             if conflicts_data_prefix(

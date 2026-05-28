@@ -423,6 +423,35 @@ def destroy(c, config=None, target="aws", tag=None):
     aws.destroy(tag=tag_v)
 
 
+@task
+def suspend(c, config=None, tag=None):
+    """Stop (not terminate) the AWS cluster to pause compute billing.
+
+    Preserves instance IDs + EBS volumes so `fab resume` brings the same
+    hosts back without reinstalling. You still pay for the root volumes
+    while stopped. Public IPs change on resume — regenerate any config
+    that baked them in.
+    """
+    cfg = _load_cfg(config)
+    from orchestrator import aws
+    tag_v = cfg_lib.cli_or(tag, cfg, "aws", "tag", default=aws.DEFAULT_TAG)
+    aws.suspend(tag=tag_v)
+
+
+@task
+def resume(c, config=None, tag=None):
+    """Restart a suspended AWS cluster and refresh aws.json public IPs.
+
+    Counterpart to `fab suspend`. Binaries on disk survive the stop/start
+    so install/build can be skipped, but public IPs almost certainly
+    changed — regenerate committee configs before benching.
+    """
+    cfg = _load_cfg(config)
+    from orchestrator import aws
+    tag_v = cfg_lib.cli_or(tag, cfg, "aws", "tag", default=aws.DEFAULT_TAG)
+    aws.resume(tag=tag_v)
+
+
 # ---------------------------------------------------------------------------
 # fab run — execute meta.steps in declared order
 # ---------------------------------------------------------------------------

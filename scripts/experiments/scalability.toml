@@ -1,4 +1,4 @@
-# Scalability sweep: 5 protocols × t ∈ {1,2,5,10,20} × 1 saturating load × 3 trials.
+# Scalability sweep: 3 protocols (leto, hera, mysticeti) × t ∈ {1,2,5,10,20} × 1 saturating load × 3 trials.
 #
 # n = 3t+1 ∈ {4, 7, 16, 31, 61}; clients ⌈n/3⌉ ∈ {2, 3, 6, 11, 21}.
 # Largest cluster (t=20): 61 nodes + 21 clients = 82 hosts × 2 vCPU = 164 vCPU.
@@ -31,7 +31,7 @@
 
 [meta]
 tag = "scaling-v1"
-steps = ["provision", "install", "build", "smoke", "scaling", "plot", "destroy"]
+steps = ["provision", "install", "build", "scaling", "plot", "destroy"]
 
 [aws]
 key_name           = "leto-bench"
@@ -47,10 +47,10 @@ num_clients        = 21
 root_volume_gb     = 30
 
 [install]
-protocols = ["apollo", "artemis", "leto", "zeus", "mysticeti"]
+protocols = ["leto", "hera", "mysticeti"]
 
 [build]
-protocols = ["apollo", "artemis", "leto", "zeus", "mysticeti"]
+protocols = ["leto", "hera", "mysticeti"]
 
 [smoke]
 # Validate the cluster end-to-end at the smallest scale (n=4) before
@@ -60,7 +60,7 @@ rate     = 2000
 duration = 30
 
 [bench]
-protocols    = ["apollo", "artemis", "leto", "zeus", "mysticeti"]
+protocols    = ["leto", "hera", "mysticeti"]
 t_values     = [1, 2, 5, 10, 20]
 # Single saturating load per row; each protocol is expected to absorb
 # 50 k tx/s offered and report whatever its actual sustained throughput is.

@@ -54,7 +54,6 @@ pub struct DataChainState<Tx> {
     pub pending_data_blocks: FnvHashMap<DataBlockHash<Tx>, Vec<DataBlock<Tx>>>,
 }
 
-
 /// Park map: missing-data-hash → parked (attestation-containing) ZeusMsg
 /// entries. On `OnDataResponse` drain, each entry is re-dispatched to the
 /// appropriate handler.

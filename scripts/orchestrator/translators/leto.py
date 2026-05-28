@@ -44,6 +44,7 @@ def translate(committee: Committee, out_dir: Path, protocol: str = "leto") -> di
             "mempool_port": m.endpoint.mempool_port,
             "consensus_address": m.endpoint.host,
             "consensus_port": m.endpoint.consensus_port,
+            "data_port": m.endpoint.data_port,
             "client_port": m.endpoint.client_port,
             "consensus_client_port": m.endpoint.client_port + 4,
         }

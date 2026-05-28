@@ -1,51 +1,79 @@
-/// Hera core struct and main event loop.
+/// Hera consensus (sig-plane) actor.
 ///
-/// Mirrors `zeus/core.rs` with these key differences:
-///   - Every node runs its own data sub-chain (no single eleader).
-///   - The sig-plane carries `MultiAttestation<Tx>` payloads.
-///   - No eleader blame / eleader change logic.
-///   - No `rleader_waiting_fresh` state.
-///   - `my_height` / `my_last_hash` track this node's own proposed tip.
-///   - `prev_attested_heights` tracks, per-author, the height last attested in
-///     a sig-block proposal from this node.
+/// Owns the sig chain and drives sig-chain rounds. The data plane lives in a
+/// separate `HeraDataActor` (see `data_actor.rs`) so the O(n²) data flood
+/// never enters this event loop.
+///
+/// ## Cross-plane edges (unbounded — sig-plane discipline, never drop)
+/// - `tx_fetch_hint` → data actor: (hash, author) hint for a missing block.
+/// - `tx_commit_emit` → data actor: committed `{author→height}` set.
+///
+/// ## Gating via Storage::notify_read (FuturesUnordered)
+/// After sig verify, for each incoming `SigPropose`, we push a `GateFut` into
+/// `self.gating`. The future calls
+/// `store.notify_read(data_block_key(hash)).await` for each non-genesis head
+/// in the attestation, then yields the proposal. `notify_read` resolves
+/// immediately if the data actor has already written the block (common case);
+/// otherwise it parks in the store's in-memory obligation map until the data
+/// actor's `store.write(data_block_key(hash), bytes)` lands (no disk flush
+/// needed — the store task resolves obligations synchronously on Write).
+///
+/// ## Head reads (lock-free, stale-OK)
+/// When building a SigPropose, reads per-author
+/// `ArcSwap<Arc<DataHeadSnapshot>>` from `multi_data_chain.head_snapshots` (the
+/// data actor publishes after each admission). Stale reads cost one round of
+/// throughput, never safety.
 use crate::{
-    server::{BatcherConsensusMsg, ChainState, LeaderContext, Parameters, RRBatcher, Settings},
-    types::{hera::MultiAttestation, Element, HeraMsg, Signature, Transaction},
+    server::{
+        hera::{
+            chain_state::{data_block_key, MultiAuthorDataChainState},
+            data_actor::{CommitEmit, HeraDataActor},
+            phases::HeraCommitContext,
+        },
+        ChainState, LeaderContext, Parameters, RRBatcher, Settings,
+    },
+    types::{hera::MultiAttestation, Element, HeraMsg, Proposal, Signature, Transaction},
     Id, KeyConfig, Round, START_ID,
 };
 use anyhow::{anyhow, Result};
 use crypto::hash::Hash;
 use fnv::{FnvHashMap, FnvHashSet};
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use log::*;
 use mempool::Batch;
 use serde::Serialize;
+use std::collections::VecDeque;
+use std::future::Future;
 use std::net::SocketAddr;
-use std::{collections::VecDeque, sync::Arc};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicI64, Ordering as AOrdering};
+use std::sync::Arc;
 use storage::rocksdb::Storage;
-// Hera broadcasts its data/sig messages all-to-all, which melts libnet's
-// reconnect-storm-prone senders at large n and wedges the sig-chain. The
-// HeraNet transport (ported from mysticeti) keeps one persistent connection per
-// peer pair with jittered reconnect backoff and bounded drop-on-full channels,
-// so the flood is shed instead of melting the mesh. See hera::net.
-use super::net::HeraNet;
+use tcp_reliable_sender::{CancelHandler, TcpReliableSender};
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     oneshot,
 };
 use tokio::time::{interval, Interval};
 
-use super::chain_state::{DataBlockHash, MultiAuthorDataChainState};
-use super::phases::HeraCommitContext;
-
-/// Data-plane messages (the high-volume all-to-all flood). Everything else
-/// (sig proposals, blames, blame-QCs, sig-element catch-up) is treated as
-/// priority sig-plane traffic.
-fn is_data_plane<Tx>(msg: &HeraMsg<Tx>) -> bool {
-    matches!(
-        msg,
-        HeraMsg::DataPropose { .. } | HeraMsg::DataRequest { .. } | HeraMsg::DataResponse { .. }
-    )
-}
+// ---------------------------------------------------------------------------
+// PROFILE INSTRUMENTATION: in-flight depth counters for unbounded channels.
+// ---------------------------------------------------------------------------
+/// Depth of rx_sig_net (net → consensus actor, sig-plane).
+pub(crate) static INFLIGHT_SIG_NET: AtomicI64 = AtomicI64::new(0);
+/// Depth of rx_msg_loopback (sig-plane self-deliver).
+pub(crate) static INFLIGHT_LOOPBACK: AtomicI64 = AtomicI64::new(0);
+/// Depth of HeraCommitContext tx_inner (consensus → commit task).
+pub(crate) static INFLIGHT_COMMIT_TX_INNER: AtomicI64 = AtomicI64::new(0);
+/// Depth of rx_committed (commit task → consensus actor).
+pub(crate) static INFLIGHT_COMMITTED: AtomicI64 = AtomicI64::new(0);
+/// PROFILE: max gating `notify_read` latency (ms) seen in the current HB
+/// window. High values ⇒ the shared store command channel is congested by the
+/// per-block write flood, delaying gating (the suspected intermittent-stall
+/// cause).
+pub(crate) static NOTIFY_READ_MAX_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -61,18 +89,30 @@ pub type SigChainState<Tx> = ChainState<MultiAttestation<Tx>>;
 pub type SigLeaderContext = LeaderContext;
 
 // ---------------------------------------------------------------------------
-// Park map for attestations awaiting a missing data block.
+// Park map for sig proposals awaiting a missing PARENT sig-element.
 // ---------------------------------------------------------------------------
-pub type PendingAttestations<Tx> = FnvHashMap<DataBlockHash<Tx>, Vec<HeraMsg<Tx>>>;
-
-// Park map for sig proposals awaiting a missing PARENT sig-element. A node
-// that advanced a round via blame-QC never stored that round's element; a
-// later proposal then references a parent it lacks. We fetch the parent
-// (SigElementRequest) before agreeing, so the committer never sees a gap.
 pub type PendingSigProposals<Tx> = FnvHashMap<SigElementHash<Tx>, Vec<HeraMsg<Tx>>>;
 
 // ---------------------------------------------------------------------------
-// ZeusRoundState equivalent for Hera (same structure, HeraMsg type)
+// Gating future type alias
+// ---------------------------------------------------------------------------
+
+/// A gating future: waits for all referenced data blocks to be present in the
+/// shared store (via `notify_read`), then yields the proposal triple.
+pub type GateFut<Tx> = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    Proposal<Id, MultiAttestation<Tx>, Round>,
+                    Signature<Id, Proposal<Id, MultiAttestation<Tx>, Round>>,
+                    MultiAttestation<Tx>,
+                ),
+            > + Send,
+    >,
+>;
+
+// ---------------------------------------------------------------------------
+// HeraRoundState
 // ---------------------------------------------------------------------------
 
 /// Minimal round-ordering buffer for Hera sig-plane messages.
@@ -149,6 +189,35 @@ impl<Tx> HeraRoundState<Tx> {
         *timer_enabled = true;
     }
 
+    /// Forward catch-up: jump `current_round` directly to `target` (> current).
+    /// Used when a *verified* SigPropose / SigBlameQC proves the cluster is
+    /// already at a higher round, so this node should rejoin the frontier rather
+    /// than strand in `future_msgs`. Stale current-round messages are dropped;
+    /// any messages already buffered for `target` are released for processing.
+    pub fn fast_forward(
+        &mut self,
+        target: Round,
+        timer: &mut Interval,
+        timer_enabled: &mut bool,
+    ) {
+        if target <= self.current_round {
+            return;
+        }
+        self.current_round = target;
+        self.blame_map.clear();
+        self.got_qc = false;
+        // Old current-round messages are now stale (round < target); drop them.
+        self.msg_buf.clear();
+        if let Some(msgs) = self.future_msgs.remove(&self.current_round) {
+            for m in msgs {
+                self.msg_buf.push_back(m);
+            }
+        }
+        self.future_msgs.retain(|r, _| r >= &self.current_round);
+        timer.reset();
+        *timer_enabled = true;
+    }
+
     pub fn disable_timer(
         &self,
         timer_enabled: &mut bool,
@@ -158,8 +227,26 @@ impl<Tx> HeraRoundState<Tx> {
 }
 
 // ---------------------------------------------------------------------------
-// Hera struct
+// Hera consensus actor struct
 // ---------------------------------------------------------------------------
+
+/// Maximum number of pending cancel handlers retained per peer.
+/// When the queue exceeds this limit the oldest handler is popped (dropped),
+/// cancelling that stale in-flight message.  1024 >> a few rounds of sig
+/// messages, so the backlog to a late-connecting peer drains before the cap.
+pub const MAX_CANCEL_HANDLERS_PER_PEER: usize = 1024;
+
+/// Grace window before the gate falls back to an explicit data fetch. In steady
+/// state the referenced DataPropose is already buffered, so the gate resolves
+/// immediately and this never elapses. Must be ≪ the round/blame timeout so a
+/// genuinely-late block can be refetched (and the fetch retried) before blame.
+const GATE_FETCH_GRACE: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// Maximum round gap this node will fast-forward in a single forward-catch-up
+/// step. Bounds the deterministic leader-rotation replay (and the gap to fill
+/// via sig-element fetch), preventing a Byzantine-inflated round number from
+/// forcing an unbounded replay. Normal lag is a few rounds; this is generous.
+const MAX_SIG_CATCHUP: Round = 4096;
 
 pub struct Hera<Tx> {
     // ------------------------------------------------------------------
@@ -169,26 +256,28 @@ pub struct Hera<Tx> {
     pub(crate) crypto_system: KeyConfig,
     pub(crate) broadcast_peers: Vec<Id>,
     pub(crate) settings: Settings,
-    pub(crate) consensus_net: HeraNet,
+    /// Sig-plane reliable sender (retransmits, reconnects; queued per peer).
+    pub(crate) consensus_net: TcpReliableSender<Id, HeraMsg<Tx>>,
+    /// Per-peer bounded cancel-handler queue.
+    /// Retains up to MAX_CANCEL_HANDLERS_PER_PEER handlers per peer;
+    /// drops oldest on overflow (cancels the stale in-flight message).
+    pub(crate) cancel_handlers: FnvHashMap<Id, VecDeque<CancelHandler>>,
 
     // ------------------------------------------------------------------
     // Channels
     // ------------------------------------------------------------------
     pub(crate) exit_rx: oneshot::Receiver<()>,
-    /// Sig-plane (consensus) inbound — drained with priority over the data
-    /// plane so the leader's low-volume but critical SigPropose/blame/blame-QC
-    /// messages are never buried behind the all-to-all data flood (which
-    /// desynchronizes the round state machine and wedges the sig-chain at large
-    /// n -- see hera-n61-stall-diagnosis).
+    /// Sig-plane inbound (unbounded, never drop).
     pub(crate) rx_sig_net: UnboundedReceiver<HeraMsg<Tx>>,
-    /// Data-plane inbound — lowest priority.
-    pub(crate) rx_data_net: UnboundedReceiver<HeraMsg<Tx>>,
+    /// Sig-plane self-deliver loopback (unbounded).
     pub(crate) rx_msg_loopback: UnboundedReceiver<HeraMsg<Tx>>,
     pub(crate) tx_msg_loopback: UnboundedSender<HeraMsg<Tx>>,
-    pub(crate) tx_consensus_to_batcher: UnboundedSender<BatcherConsensusMsg<Id, Tx>>,
-    pub(crate) rx_data_batch: UnboundedReceiver<Batch<Tx>>,
-    #[allow(dead_code)]
-    pub(crate) tx_data_commit: UnboundedSender<Arc<Batch<Tx>>>,
+
+    /// Cross-plane: send (hash, author) fetch hint to data actor
+    /// (fire-and-forget).
+    pub(crate) tx_fetch_hint: UnboundedSender<(super::chain_state::DataBlockHash<Tx>, Id)>,
+    /// Cross-plane: send committed {author→height} to data actor (unbounded).
+    pub(crate) tx_commit_emit: UnboundedSender<CommitEmit<Tx>>,
 
     // ------------------------------------------------------------------
     // Sig-plane state
@@ -202,61 +291,41 @@ pub struct Hera<Tx> {
     pub(crate) signature_epoch: u64,
 
     // ------------------------------------------------------------------
-    // Data-plane state
+    // Data heads (read-only, from shared ArcSwap map in multi_data_chain)
     // ------------------------------------------------------------------
-    /// Current data-plane epoch.
-    pub(crate) current_epoch: u64,
-    /// Per-author data-chain state (all n sub-chains).
-    pub(crate) multi_data_chain: MultiAuthorDataChainState<Tx>,
-    /// Park map: missing data hash → parked HeraMsg entries.
-    pub(crate) pending_attestations: PendingAttestations<Tx>,
-    /// Park map: missing parent sig-element hash → parked SigPropose entries.
-    pub(crate) pending_sig_proposals: PendingSigProposals<Tx>,
-    /// Sig-element hashes we have an outstanding fetch for. Lets us accept a
-    /// recursively-fetched ancestor (which has no parked proposal of its own)
-    /// and dedupe in-flight requests.
-    pub(crate) pending_sig_element_requests: FnvHashSet<SigElementHash<Tx>>,
-
-    // ------------------------------------------------------------------
-    // This node's own sub-chain state
-    // ------------------------------------------------------------------
-    /// Height of the most recently proposed block by this node.
-    pub(crate) my_height: u64,
-    /// Hash of the most recently proposed block by this node.
-    pub(crate) my_last_hash: Option<DataBlockHash<Tx>>,
+    pub(crate) head_snapshots:
+        Arc<fnv::FnvHashMap<Id, arc_swap::ArcSwap<Arc<super::chain_state::DataHeadSnapshot<Tx>>>>>,
     /// Per-author highest height attested in the last SigPropose from this
     /// node.
     pub(crate) prev_attested_heights: FnvHashMap<Id, u64>,
 
     // ------------------------------------------------------------------
-    // DP[Throughput] emission
+    // Pending sig proposals park map
     // ------------------------------------------------------------------
-    pub(crate) committed_tx_count: u64,
+    pub(crate) pending_sig_proposals: PendingSigProposals<Tx>,
+    pub(crate) pending_sig_element_requests: FnvHashSet<SigElementHash<Tx>>,
+
+    // ------------------------------------------------------------------
+    // Gating (Storage::notify_read path)
+    // ------------------------------------------------------------------
+    /// Clone of the shared `Storage` handle.  GateFuts clone this and call
+    /// `store.notify_read(data_block_key(hash)).await` for each non-genesis
+    /// head in the attestation.  The data actor writes the same key on block
+    /// admission, which wakes the obligation synchronously (no disk flush).
+    pub(crate) store: Storage,
+    /// FuturesUnordered of gating futures: each resolves when all referenced
+    /// data blocks for that proposal have been written to the shared store.
+    pub(crate) gating: FuturesUnordered<GateFut<Tx>>,
+
+    // ------------------------------------------------------------------
+    // Heartbeat (info-level round/commit progress)
+    // ------------------------------------------------------------------
     pub(crate) bench_emit_interval: tokio::time::Interval,
     pub(crate) emit_dp: bool,
-    pub(crate) bench_emit_window_secs: f64,
-    /// Per-window latency samples (ms).  Populated in `on_committed_attestation`
-    /// for txs that carry a `hera_timestamp_ns()`; consumed by the emission
-    /// tick and cleared.  Capacity-bounded to avoid memory blow-up at very high
-    /// commit rates (we down-sample after the cap).
-    pub(crate) latency_samples_ms: Vec<u64>,
-
-    // ------------------------------------------------------------------
-    // Test hook: max heads len across all committed attestations
-    // ------------------------------------------------------------------
-    pub(crate) max_committed_heads_len: Arc<std::sync::atomic::AtomicUsize>,
-
-    // ------------------------------------------------------------------
-    // Self-pacing: cumulative count of THIS node's own txs that have
-    // committed (bumped in on_committed_attestation for author == my_id).
-    // The load generator pauses when (generated - this) exceeds a cap, so
-    // load creation tracks commit progress instead of flooding the network.
-    // ------------------------------------------------------------------
-    pub(crate) my_committed_txs: Arc<std::sync::atomic::AtomicU64>,
 }
 
 // ---------------------------------------------------------------------------
-// Constants
+// Constants + cancel-handler bookkeeping
 // ---------------------------------------------------------------------------
 
 impl<Tx> Hera<Tx> {
@@ -264,6 +333,24 @@ impl<Tx> Hera<Tx> {
     pub const INITIAL_ROUND: Round = 0;
     pub const STEADY_STATE_SIG_EPOCH: u64 = 1;
     pub const INITIAL_DATA_EPOCH: u64 = 1;
+
+    /// Push a cancel handler onto the per-peer bounded queue.
+    ///
+    /// If the queue length now exceeds `MAX_CANCEL_HANDLERS_PER_PEER`,
+    /// pop_front (drop) the oldest handler — cancelling that stale message.
+    /// Recent (liveness-relevant) handlers are retained; memory is bounded
+    /// per peer even for a permanently-dead peer.
+    pub(crate) fn push_cancel_handler(
+        &mut self,
+        peer: Id,
+        h: CancelHandler,
+    ) {
+        let q = self.cancel_handlers.entry(peer).or_default();
+        q.push_back(h);
+        if q.len() > MAX_CANCEL_HANDLERS_PER_PEER {
+            q.pop_front();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -285,65 +372,108 @@ where
         rx_mem_to_batcher: UnboundedReceiver<(Tx, usize)>,
         tx_data_commit: UnboundedSender<Arc<Batch<Tx>>>,
         max_committed_heads_len: Arc<std::sync::atomic::AtomicUsize>,
-        my_committed_txs: Arc<std::sync::atomic::AtomicU64>,
+        my_height_atomic: Arc<std::sync::atomic::AtomicU64>,
+        my_committed_height_atomic: Arc<std::sync::atomic::AtomicU64>,
+        max_chain_lead: u64,
     ) -> Result<()>
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug + 'static,
     {
         crate::server::init_gc_depth_rounds(settings.committee_config.num_nodes());
+
         let me = settings
             .committee_config
             .get(&my_id)
             .ok_or_else(|| anyhow!("My Id {} not in config", my_id))?;
-        let consensus_addr = crate::to_socket_address("0.0.0.0", me.consensus_port)?;
 
-        // Mysticeti-style persistent-connection transport (replaces libnet's
-        // reconnect-storm-prone TcpSimpleSender/TcpReceiver). One connection
-        // per peer pair, jittered reconnect backoff, bounded drop-on-full
-        // channels -- so hera's all-to-all flood is shed instead of melting the
-        // mesh and wedging the sig-chain (see hera::net).
+        // ---------------------------------------------------------------
+        // Two physical planes: sig uses tcp-reliable-sender/tcp-receiver;
+        // data uses HeraNet (bounded per-peer outbox, try_send-drop).
+        // ---------------------------------------------------------------
+        let consensus_addr = crate::to_socket_address("0.0.0.0", me.consensus_port)?;
+        let data_addr = crate::to_socket_address("0.0.0.0", me.data_port)?;
+
         let num_nodes = settings.committee_config.num_nodes();
-        let mut net_addresses: Vec<SocketAddr> = Vec::with_capacity(num_nodes);
+        let mut data_addresses: Vec<SocketAddr> = Vec::with_capacity(num_nodes);
         for id in 0..num_nodes {
             let party = settings
                 .committee_config
                 .get(&id)
                 .ok_or_else(|| anyhow!("Id {} not in config", id))?;
-            net_addresses
-                .push(crate::to_socket_address(&party.consensus_address, party.consensus_port)?);
+            data_addresses.push(crate::to_socket_address(
+                &party.consensus_address,
+                party.data_port,
+            )?);
         }
-        let (consensus_net, mut inbound_rx) =
-            HeraNet::spawn(net_addresses, my_id, consensus_addr);
 
-        // Deserialize inbound frames into HeraMsg and split into two priority
-        // classes: sig-plane (consensus) and data-plane. The run loop drains the
-        // sig channel before the data channel so a data flood can't bury the
-        // critical sig messages.
-        let (tx_sig_net, rx_sig_net) = unbounded_channel();
-        let (tx_data_net, rx_data_net) = unbounded_channel();
+        // Sig plane: TcpReliableSender (retransmits, reconnects) outbound.
+        let sig_peers = settings.get_consensus_peers(my_id)?;
+        let consensus_net = TcpReliableSender::<Id, HeraMsg<Tx>>::with_peers(sig_peers);
+
+        // Sig plane: TcpReceiver inbound — forward deserialized msgs to rx_sig_net.
+        let (tx_sig_net, rx_sig_net) = unbounded_channel::<HeraMsg<Tx>>();
+        let mut sig_receiver = tcp_receiver::TcpReceiver::<HeraMsg<Tx>>::spawn(consensus_addr);
         tokio::spawn(async move {
-            while let Some(frame) = inbound_rx.recv().await {
-                match bincode::deserialize::<HeraMsg<Tx>>(&frame) {
+            while let Some(result) = sig_receiver.next().await {
+                match result {
                     Ok(msg) => {
-                        let tx = if is_data_plane(&msg) {
-                            &tx_data_net
-                        } else {
-                            &tx_sig_net
-                        };
-                        if tx.send(msg).is_err() {
+                        INFLIGHT_SIG_NET.fetch_add(1, AOrdering::Relaxed);
+                        if tx_sig_net.send(msg).is_err() {
                             break;
                         }
                     }
-                    Err(e) => log::warn!("Hera: failed to deserialize inbound frame: {e}"),
+                    Err(e) => log::warn!("Hera sig: receive error: {e}"),
                 }
             }
         });
 
-        // Batcher: every node is always the leader of its own sub-chain.
+        // ---------------------------------------------------------------
+        // Data plane: reliable sender + receiver (same transport as the sig
+        // plane). DataPropose is paced by an n-f ack gate in the data actor
+        // (propose height h+1 only once >= n-f nodes received h), so the data
+        // volume is low and reliable delivery is affordable. Reliable delivery
+        // means every block reaches >= n-f nodes, so a referenced head is
+        // always available and the consensus gate (notify_read) never stalls on
+        // a lost block. DataRequest/DataResponse remain as a reconnect backstop.
+        // ---------------------------------------------------------------
+        let _ = data_addresses; // (data peer map built from settings below)
+        let data_peers = settings.get_data_peers(my_id)?;
+        let data_net = TcpReliableSender::<Id, HeraMsg<Tx>>::with_peers(data_peers);
+
+        // Data-plane inbound: TcpReceiver → verify (ed25519) in the forwarding
+        // task (off the actor loop) → rx_verified. The n-f ack gate keeps the
+        // inbound rate O(n)/round so a single verify task is not a bottleneck.
+        let crypto_for_verify = crypto_system.clone();
+        let (tx_verified, rx_verified) = unbounded_channel::<HeraMsg<Tx>>();
+        let mut data_receiver = tcp_receiver::TcpReceiver::<HeraMsg<Tx>>::spawn(data_addr);
+        tokio::spawn(async move {
+            while let Some(result) = data_receiver.next().await {
+                match result {
+                    Ok(msg) => {
+                        let ok = match &msg {
+                            HeraMsg::DataPropose { block, .. }
+                            | HeraMsg::DataResponse { block } => {
+                                verify_data_block_sig(&crypto_for_verify, block)
+                            }
+                            HeraMsg::DataRequest { .. } => true,
+                            _ => false,
+                        };
+                        if ok && tx_verified.send(msg).is_err() {
+                            break; // data actor gone
+                        }
+                    }
+                    Err(e) => log::warn!("Hera data: receive error: {e}"),
+                }
+            }
+        });
+
+        // ---------------------------------------------------------------
+        // Batcher
+        // ---------------------------------------------------------------
         let (tx_consensus_to_batcher, rx_consensus_to_batcher) = unbounded_channel();
         let batching_params = Parameters::new(
             my_id,
-            my_id, // initial_leader = self (always)
+            my_id,
             settings.bench_config.batch_size,
             settings.bench_config.batch_timeout,
         );
@@ -355,9 +485,11 @@ where
             tx_data_batch,
         )?;
 
-        let num_nodes = settings.committee_config.num_nodes();
         let num_faults = settings.committee_config.num_faults();
 
+        // ---------------------------------------------------------------
+        // HeraCommitContext (sig-chain commit task)
+        // ---------------------------------------------------------------
         let hera_commit_ctx = HeraCommitContext::<Tx>::spawn(
             SigChainState::new(store.clone()),
             num_nodes,
@@ -367,10 +499,28 @@ where
         let all_peers_except_me: Vec<Id> =
             all_peers.iter().filter(|x| *x != &my_id).cloned().collect();
 
+        // Sig-plane loopback (unbounded, sig-plane discipline).
         let (tx_msg_loopback, rx_msg_loopback) = unbounded_channel();
 
         let all_ids = settings.committee_config.get_all_ids();
+        // MultiAuthorDataChainState is owned by the data actor; we only
+        // need the shared head_snapshots for the consensus actor.
         let multi_data_chain = MultiAuthorDataChainState::<Tx>::new(&all_ids);
+        let head_snapshots = Arc::clone(&multi_data_chain.head_snapshots);
+
+        // ---------------------------------------------------------------
+        // Shared store for gating: the data actor writes
+        // data_block_key(hash) on admission; the consensus actor calls
+        // store.notify_read(data_block_key(hash)) in each GateFut.
+        // Both actors hold a clone of the same Storage handle (same channel).
+        // ---------------------------------------------------------------
+
+        // ---------------------------------------------------------------
+        // Cross-plane channels (unbounded — sig-plane discipline).
+        // ---------------------------------------------------------------
+        let (tx_fetch_hint, rx_fetch_hint) =
+            unbounded_channel::<(super::chain_state::DataBlockHash<Tx>, Id)>();
+        let (tx_commit_emit, rx_commit_emit) = unbounded_channel::<CommitEmit<Tx>>();
 
         let emit_dp = my_id == settings.bench_config.bench_metrics_node;
         let bench_emit_window_secs = settings.bench_config.bench_emit_window_secs.max(1) as f64;
@@ -378,19 +528,68 @@ where
             settings.bench_config.bench_emit_window_secs.max(1),
         ));
 
-        let protocol = Hera::<Tx> {
+        // ---------------------------------------------------------------
+        // Data actor
+        // ---------------------------------------------------------------
+        let data_actor = HeraDataActor::<Tx> {
+            my_id,
+            crypto_system: crypto_system.clone(),
+            broadcast_peers: all_peers_except_me.clone(),
+            current_epoch: Hera::<Tx>::INITIAL_DATA_EPOCH,
+            data_net,
+            n_minus_t: num_nodes.saturating_sub(num_faults),
+            can_propose: true,
+            acks_for_current: 0,
+            awaiting_acks: FuturesUnordered::new(),
+            _exit_placeholder: None,
+            rx_verified_blocks: rx_verified,
+            rx_data_batch,
+            rx_fetch_hint,
+            rx_commit_emit,
+            tx_data_commit: tx_data_commit.clone(),
+            tx_consensus_to_batcher: tx_consensus_to_batcher.clone(),
+            block_store: fnv::FnvHashMap::default(),
+            store: store.clone(),
+            multi_data_chain,
+            pending_data_requests: fnv::FnvHashSet::default(),
+            my_height: 0,
+            my_last_hash: None,
+            commit_event_count: 0,
+            committed_tx_count: 0,
+            bench_emit_interval: interval(std::time::Duration::from_secs(
+                settings.bench_config.bench_emit_window_secs.max(1),
+            )),
+            emit_dp,
+            bench_emit_window_secs,
+            latency_samples_ms: Vec::with_capacity(8192),
+            max_committed_heads_len: Arc::clone(&max_committed_heads_len),
+            max_chain_lead,
+            my_height_atomic: Arc::clone(&my_height_atomic),
+            my_committed_height_atomic: Arc::clone(&my_committed_height_atomic),
+        };
+
+        tokio::spawn(async move {
+            let mut da = data_actor;
+            if let Err(e) = da.run().await {
+                error!("HeraDataActor error: {}", e);
+            }
+        });
+
+        // ---------------------------------------------------------------
+        // Consensus (sig) actor
+        // ---------------------------------------------------------------
+        let consensus_actor = Hera::<Tx> {
             my_id,
             crypto_system,
             broadcast_peers: all_peers_except_me,
             exit_rx,
             rx_sig_net,
-            rx_data_net,
             consensus_net,
-            tx_consensus_to_batcher,
-            rx_data_batch,
+            cancel_handlers: FnvHashMap::default(),
             tx_msg_loopback,
             rx_msg_loopback,
-            tx_data_commit,
+            tx_fetch_hint,
+            tx_commit_emit,
             sig_chain_state: SigChainState::new(store.clone()),
             sig_leader_context: SigLeaderContext::new(
                 settings.committee_config.get_all_ids(),
@@ -398,8 +597,6 @@ where
             ),
             hera_commit_ctx,
             round_state: HeraRoundState::new(num_nodes),
-            // Round (blame) timer. Defaults to 4*delay_in_ms; override with
-            // HERA_ROUND_TIMER_MS to tune the blame timeout during experiments.
             timer: interval(std::time::Duration::from_millis(
                 std::env::var("HERA_ROUND_TIMER_MS")
                     .ok()
@@ -408,26 +605,19 @@ where
             )),
             timer_enabled: true,
             signature_epoch: Hera::<Tx>::STEADY_STATE_SIG_EPOCH,
-            current_epoch: Hera::<Tx>::INITIAL_DATA_EPOCH,
-            multi_data_chain,
-            pending_attestations: FnvHashMap::default(),
+            head_snapshots,
+            prev_attested_heights: FnvHashMap::default(),
             pending_sig_proposals: FnvHashMap::default(),
             pending_sig_element_requests: FnvHashSet::default(),
-            my_height: 0,
-            my_last_hash: None,
-            prev_attested_heights: FnvHashMap::default(),
-            committed_tx_count: 0,
-            latency_samples_ms: Vec::with_capacity(8192),
+            store: store.clone(),
+            gating: FuturesUnordered::new(),
             bench_emit_interval,
             emit_dp,
-            bench_emit_window_secs,
-            max_committed_heads_len,
-            my_committed_txs,
             settings,
         };
 
         tokio::spawn(async move {
-            let mut p = protocol;
+            let mut p = consensus_actor;
             if let Err(e) = p.run().await {
                 error!("Hera consensus error: {}", e);
             }
@@ -442,57 +632,46 @@ where
     {
         info!("Hera: starting (node {})", self.my_id);
         self.sig_chain_state.genesis_setup().await?;
+        // No startup gate needed: TcpReliableSender queues and retransmits
+        // until each peer connects, so the bootstrap proposal is reliably
+        // delivered even to late-connecting peers.
 
-        // Startup gate: HeraNet establishes connections lazily (active/passive
-        // handshake + jittered 1-5s backoff). The bootstrap sig proposal is
-        // broadcast immediately, so without a gate it is dropped to peers whose
-        // connection is not yet up -- and the leader never re-proposes, which
-        // wedges the cluster at large n (the blame path cannot reconverge once
-        // nodes desynchronize). Wait until a quorum of peers has connected
-        // before proposing, capped so f crashed peers cannot block liveness.
+        // PROFILE INSTRUMENTATION: independent monitor task.
         {
-            let num_nodes = self.settings.committee_config.num_nodes();
-            // Target peer count to wait for before starting consensus. On a
-            // CPU-constrained node the network tasks form connections quickly
-            // while idle but starve once the O(n)-crypto consensus loop + load
-            // generator run -- so proposing at the bare quorum (n-f-1) leaves a
-            // partial mesh and the sig-chain desynchronizes. Wait for nearly the
-            // full mesh (n-1) by default so it forms during the idle gate.
-            // Override with HERA_STARTUP_GATE_PEERS for experiments.
-            let want = std::env::var("HERA_STARTUP_GATE_PEERS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| num_nodes.saturating_sub(1));
-            // Cap so crashed/unreachable peers cannot block startup forever.
-            // Override with HERA_STARTUP_GATE_CAP_MS (default 45s).
-            let cap_ms = std::env::var("HERA_STARTUP_GATE_CAP_MS")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(45_000);
-            let deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_millis(cap_ms);
-            while self.consensus_net.connected_peers() < want
-                && tokio::time::Instant::now() < deadline
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            info!(
-                "Hera: startup gate cleared ({} of {} peers connected)",
-                self.consensus_net.connected_peers(),
-                want
-            );
+            let my_id = self.my_id;
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+                loop {
+                    ticker.tick().await;
+                    let sig_net = INFLIGHT_SIG_NET.load(AOrdering::Relaxed);
+                    let loopback = INFLIGHT_LOOPBACK.load(AOrdering::Relaxed);
+                    let tx_inner = INFLIGHT_COMMIT_TX_INNER.load(AOrdering::Relaxed);
+                    let committed = INFLIGHT_COMMITTED.load(AOrdering::Relaxed);
+                    #[cfg(target_os = "linux")]
+                    let rss_kb: i64 = {
+                        std::fs::read_to_string("/proc/self/status")
+                            .ok()
+                            .and_then(|s| {
+                                s.lines()
+                                    .find(|l| l.starts_with("VmRSS:"))
+                                    .and_then(|l| l.split_whitespace().nth(1))
+                                    .and_then(|v| v.parse().ok())
+                            })
+                            .unwrap_or(-1)
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let rss_kb: i64 = -1;
+                    eprintln!(
+                        "CHANDEPTH: node={} sig_net={} loopback={} \
+                         commit_tx_inner={} rx_committed={} rss_kb={}",
+                        my_id, sig_net, loopback, tx_inner, committed, rss_kb,
+                    );
+                }
+            });
         }
 
         self.timer.reset();
         self.bench_emit_interval.tick().await;
-
-        // Prime batcher: every node is always the leader of its own sub-chain.
-        let _ = self
-            .tx_consensus_to_batcher
-            .send(BatcherConsensusMsg::NewRound {
-                leader: self.my_id,
-                round: self.my_height + 1,
-            });
 
         // If this node is the first sig-chain leader, kick off the first proposal.
         if self.sig_leader_context.leader() == self.my_id {
@@ -503,14 +682,9 @@ where
 
         loop {
             tokio::select! {
-                // Biased: branches are tried top-to-bottom, so all control and
-                // sig-plane traffic is drained before the data plane. This keeps
-                // the leader's SigPropose/blame/blame-QC out from behind the
-                // all-to-all data flood, which otherwise desynchronizes the
-                // round state machine and wedges the sig-chain at large n.
                 biased;
 
-                // Exit
+                // Exit.
                 exit_val = &mut self.exit_rx => {
                     exit_val.map_err(anyhow::Error::new)?;
                     info!("Hera: exit signal.");
@@ -524,8 +698,9 @@ where
                     }
                 }
 
-                // Committed attestation feedback from HeraCommitContext.
+                // Committed attestation from HeraCommitContext.
                 committed = self.hera_commit_ctx.rx_committed.recv() => {
+                    INFLIGHT_COMMITTED.fetch_sub(1, AOrdering::Relaxed);
                     if let Some(c) = committed {
                         self.on_committed_attestation(c);
                     } else {
@@ -533,23 +708,37 @@ where
                     }
                 }
 
-                // Loopback (this node's own blames/relays re-entering).
+                // Gating future resolved: all referenced blocks now exist in store.
+                // This branch beats blame so a ready gate promotes before blame fires.
+                Some((proposal, auth, attestation)) = self.gating.next(), if !self.gating.is_empty() => {
+                    let cur = self.round_state.round();
+                    if proposal.round() == cur {
+                        if let Err(e) = self.handle_sig_proposal_post_gate(proposal, auth, attestation).await {
+                            error!("Hera: handle_sig_proposal_post_gate (from gating): {e}");
+                        }
+                    }
+                    // else: round advanced while block was missing — drop (blame fired first, legitimate).
+                }
+
+                // Sig-plane self-deliver loopback (unbounded).
                 msg = self.rx_msg_loopback.recv() => {
+                    INFLIGHT_LOOPBACK.fetch_sub(1, AOrdering::Relaxed);
                     let msg = msg.ok_or_else(|| anyhow!("Hera: loopback closed"))?;
                     if let Err(e) = self.dispatch(msg).await {
                         error!("Hera: loopback dispatch: {}", e);
                     }
                 }
 
-                // Priority sig-plane network intake.
+                // Sig-plane network intake (unbounded, never drop).
                 msg = self.rx_sig_net.recv() => {
+                    INFLIGHT_SIG_NET.fetch_sub(1, AOrdering::Relaxed);
                     let msg = msg.ok_or_else(|| anyhow!("Hera: sig net closed"))?;
                     if let Err(e) = self.dispatch(msg).await {
                         error!("Hera: sig net dispatch: {}", e);
                     }
                 }
 
-                // Round-ordered sig-plane messages (already buffered).
+                // Round-ordered sig-plane messages (buffered).
                 _ = async {}, if self.round_state.is_ready() => {
                     if let Some(msg) = self.round_state.pop_msg() {
                         if let Err(e) = self.handle_sig_ordered(msg).await {
@@ -558,50 +747,23 @@ where
                     }
                 }
 
-                // Data batches from this node's own batcher (data plane).
-                batch = self.rx_data_batch.recv() => {
-                    let batch = batch.ok_or_else(|| anyhow!("Hera: data batcher shut down"))?;
-                    if let Err(e) = self.on_self_propose(batch).await {
-                        error!("Hera: on_self_propose: {}", e);
-                    }
-                }
-
-                // Data-plane network intake — lowest priority.
-                msg = self.rx_data_net.recv() => {
-                    let msg = msg.ok_or_else(|| anyhow!("Hera: data net closed"))?;
-                    if let Err(e) = self.dispatch(msg).await {
-                        error!("Hera: data net dispatch: {}", e);
-                    }
-                }
-
-                // DP[Throughput] + DP[Latency] emission.
+                // Heartbeat (info-level round/commit progress).
                 _ = self.bench_emit_interval.tick(), if self.emit_dp => {
-                    // Heartbeat: lets a normal (Info-level) run show whether the
-                    // sig-chain is advancing rounds (rate vs wedge) without the
-                    // huge debug logs. round climbs but committed stays 0 ⇒
-                    // commit-logic issue; round stuck ⇒ wedge.
+                    let nr_max = NOTIFY_READ_MAX_MS.swap(0, AOrdering::Relaxed);
                     info!(
-                        "Hera HB: round={} highest_chained={} connected={} committed_window={}",
+                        "Hera HB: round={} highest_chained={} notify_read_max_ms={}",
                         self.round_state.round(),
                         self.sig_chain_state.highest_chain().proposal.round(),
-                        self.consensus_net.connected_peers(),
-                        self.committed_tx_count,
+                        nr_max,
                     );
-                    eprintln!(
-                        "DP[Throughput]: {}",
-                        self.committed_tx_count as f64 / self.bench_emit_window_secs
+                    let sig_net = INFLIGHT_SIG_NET.load(AOrdering::Relaxed);
+                    let loopback = INFLIGHT_LOOPBACK.load(AOrdering::Relaxed);
+                    let tx_inner = INFLIGHT_COMMIT_TX_INNER.load(AOrdering::Relaxed);
+                    let committed_depth = INFLIGHT_COMMITTED.load(AOrdering::Relaxed);
+                    info!(
+                        "CHAN_DEPTH: sig_net={} loopback={} commit_tx_inner={} rx_committed={}",
+                        sig_net, loopback, tx_inner, committed_depth,
                     );
-                    if !self.latency_samples_ms.is_empty() {
-                        // Median (50th percentile).  Cheap to compute, robust to
-                        // tail outliers from warmup / GC.  Parser at
-                        // scripts/orchestrator/parse.py averages across windows.
-                        self.latency_samples_ms.sort_unstable();
-                        let mid = self.latency_samples_ms.len() / 2;
-                        let median_ms = self.latency_samples_ms[mid];
-                        eprintln!("DP[Latency]: {}", median_ms);
-                        self.latency_samples_ms.clear();
-                    }
-                    self.committed_tx_count = 0;
                 }
             }
         }
@@ -610,7 +772,7 @@ where
     }
 
     // -----------------------------------------------------------------------
-    // Top-level dispatch
+    // Top-level dispatch (sig-plane only)
     // -----------------------------------------------------------------------
 
     pub(crate) async fn dispatch(
@@ -621,30 +783,49 @@ where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
     {
         match msg {
-            // Data-plane — direct.
-            HeraMsg::DataPropose { block, sender } => self.on_data_propose(block, sender).await,
-            HeraMsg::DataRequest {
-                target_hash,
-                source,
-            } => self.on_data_request(target_hash, source).await,
-            HeraMsg::DataResponse { block } => self.on_data_response(block).await,
-
             // Sig-plane — route through round ordering.
-            HeraMsg::SigPropose { ref proposal, .. } => {
+            HeraMsg::SigPropose {
+                ref proposal,
+                ref auth,
+                ..
+            } => {
                 let r = proposal.round();
+                // Forward catch-up: a SigPropose for a round ahead of us proves
+                // (once its leader signature checks out) that the cluster has
+                // moved on. Fast-forward to r instead of stranding it in
+                // future_msgs; the parent sig-element chain is filled by the
+                // existing fetch path when the proposal is processed.
+                if r > self.round_state.round() && self.verify_future_proposal(proposal, auth, r) {
+                    self.catch_up_to(r);
+                }
                 self.round_state.enqueue(msg, r);
                 Ok(())
             }
-            HeraMsg::SigBlame { round, .. } | HeraMsg::SigBlameQC { round, .. } => {
-                let r = round;
-                self.round_state.enqueue(msg, r);
+            HeraMsg::SigBlameQC { round, ref qc } => {
+                // A valid blame-QC for `round` is unforgeable proof the cluster
+                // blamed `round` and advanced. Catch up to `round` so the normal
+                // handler advances us to round+1.
+                if round > self.round_state.round() {
+                    let blame_hash = Hash::ser_and_hash(&round);
+                    if qc.verify(&blame_hash, &self.crypto_system.system).is_ok() {
+                        info!(
+                            "Hera[n{}]: CATCH-UP to round {} via valid SigBlameQC (was {})",
+                            self.my_id,
+                            round,
+                            self.round_state.round()
+                        );
+                        self.catch_up_to(round);
+                    }
+                }
+                self.round_state.enqueue(msg, round);
+                Ok(())
+            }
+            HeraMsg::SigBlame { round, .. } => {
+                self.round_state.enqueue(msg, round);
                 Ok(())
             }
 
-            // Sig-element catch-up — handled directly (not round-ordered), like
-            // the data-plane DataRequest/DataResponse. Lets a node fetch a parent
-            // sig-element it missed (e.g. advanced past a round via blame-QC)
-            // before agreeing on a proposal that extends it.
+            // Sig-element catch-up — handled directly (not round-ordered).
             HeraMsg::SigElementRequest { source, request } => {
                 self.on_sig_element_request(request.request_hash().clone(), source)
                     .await
@@ -653,12 +834,80 @@ where
                 self.on_sig_element_response(response.response()).await
             }
 
-            // Remaining sync variants — no-op for now (not wired for Hera v1).
+            // Data-plane messages must NOT arrive on the sig transport.
+            HeraMsg::DataPropose { .. }
+            | HeraMsg::DataRequest { .. }
+            | HeraMsg::DataResponse { .. } => {
+                debug!("Hera: data msg on sig transport — ignoring (bug in caller)");
+                Ok(())
+            }
+
             _ => {
                 debug!("Hera: unhandled msg variant in dispatch");
                 Ok(())
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Forward catch-up (rejoin the frontier instead of stranding)
+    // -----------------------------------------------------------------------
+
+    /// Verify that `proposal` (for round `r` > our current round) carries a
+    /// valid signature from round `r`'s legitimate leader. The leader rotation
+    /// is a deterministic stateful PRNG walk, so we replay it on a CLONE of the
+    /// live leader context (advancing `r - cur` steps) to learn round `r`'s
+    /// leader without mutating live state. Bounded by `MAX_SIG_CATCHUP` so a
+    /// Byzantine-inflated round number cannot force an unbounded replay.
+    fn verify_future_proposal(
+        &self,
+        proposal: &Proposal<Id, MultiAttestation<Tx>, Round>,
+        auth: &Signature<Id, Proposal<Id, MultiAttestation<Tx>, Round>>,
+        r: Round,
+    ) -> bool
+    where
+        Tx: Clone + Serialize,
+    {
+        let cur = self.round_state.round();
+        if r <= cur || r - cur > MAX_SIG_CATCHUP {
+            return false;
+        }
+        let mut ctx = self.sig_leader_context.clone();
+        for _ in 0..(r - cur) {
+            ctx.advance_round();
+        }
+        let leader = ctx.leader();
+        let Some(pk) = self.crypto_system.system.get(&leader) else {
+            return false;
+        };
+        let prop_hash = Hash::ser_and_hash(proposal);
+        if auth.verify(&prop_hash, &leader, pk).is_ok() {
+            info!(
+                "Hera[n{}]: CATCH-UP to round {} via valid SigPropose (was {})",
+                self.my_id, r, cur
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Fast-forward both the round buffer and the (lock-step) leader context to
+    /// `target`. Caller must have already validated that `target` is justified
+    /// (verified proposal or blame-QC) and within `MAX_SIG_CATCHUP`.
+    fn catch_up_to(
+        &mut self,
+        target: Round,
+    ) {
+        let cur = self.round_state.round();
+        if target <= cur || target - cur > MAX_SIG_CATCHUP {
+            return;
+        }
+        for _ in 0..(target - cur) {
+            self.sig_leader_context.advance_round();
+        }
+        self.round_state
+            .fast_forward(target, &mut self.timer, &mut self.timer_enabled);
     }
 
     async fn handle_sig_ordered(
@@ -691,6 +940,93 @@ where
     pub fn rleader(&self) -> Id {
         self.sig_leader_context.leader()
     }
+
+    /// Build and push a gating future for this proposal.
+    ///
+    /// For each non-genesis head in the attestation, sends a fetch hint to the
+    /// data actor (fire-and-forget) and calls
+    /// `store.notify_read(data_block_key(hash)).await` in the gating future.
+    /// `notify_read` resolves immediately if the data actor has already written
+    /// the key; otherwise it parks in the store's in-memory obligation map
+    /// until `store.write(data_block_key(hash), bytes)` lands (woken
+    /// synchronously by the store task, before any RocksDB flush).
+    pub(crate) fn push_gating_future(
+        &mut self,
+        proposal: Proposal<Id, MultiAttestation<Tx>, Round>,
+        auth: Signature<Id, Proposal<Id, MultiAttestation<Tx>, Round>>,
+        attestation: MultiAttestation<Tx>,
+    ) where
+        Tx: Clone + Serialize + PartialEq + 'static,
+    {
+        // (key, hash, author) for each non-genesis referenced head.
+        let heads: Vec<(Vec<u8>, super::chain_state::DataBlockHash<Tx>, Id)> = attestation
+            .envelope
+            .heads
+            .iter()
+            .filter(|h| h.height > 0 || h.epoch > 0)
+            .map(|h| (data_block_key(&h.hash), h.hash.clone(), h.author))
+            .collect();
+
+        // Clone the shared store handle + fetch-hint sender into the async closure.
+        let mut store = self.store.clone();
+        let tx_fetch_hint = self.tx_fetch_hint.clone();
+
+        let fut: GateFut<Tx> = Box::pin(async move {
+            for (key, hash, author) in heads {
+                // Gate on the BUFFERED block: in steady state the author's
+                // DataPropose has already arrived and been admitted, so
+                // notify_read resolves immediately with no request traffic. Only
+                // if the block hasn't landed within a grace window do we fall back
+                // to an explicit fetch hint — re-fired every grace tick until the
+                // block is present, so a shed DataRequest/DataResponse is retried.
+                // This makes request/response a reliable *backstop*, not a
+                // steady-state dependency. The single notify_read future is kept
+                // alive across ticks (no obligation churn in the store).
+                let t0 = std::time::Instant::now();
+                let notify = store.notify_read(key);
+                tokio::pin!(notify);
+                let mut ticker = tokio::time::interval(GATE_FETCH_GRACE);
+                ticker.tick().await; // consume the immediate first tick (no t=0 fetch)
+                loop {
+                    tokio::select! {
+                        _ = &mut notify => break,
+                        _ = ticker.tick() => {
+                            let _ = tx_fetch_hint.send((hash.clone(), author));
+                            debug!(
+                                "Hera: gate waited {} ms for data block author={} {:?}; (re)fired fetch hint",
+                                t0.elapsed().as_millis(), author, hash
+                            );
+                        }
+                    }
+                }
+                let ms = t0.elapsed().as_millis() as u64;
+                let prev = NOTIFY_READ_MAX_MS.load(AOrdering::Relaxed);
+                if ms > prev {
+                    NOTIFY_READ_MAX_MS.store(ms, AOrdering::Relaxed);
+                }
+            }
+            (proposal, auth, attestation)
+        });
+
+        self.gating.push(fut);
+    }
+
+    /// Emit committed {author→height} set to the data actor via unbounded
+    /// tx_commit_emit channel (sig-plane discipline, never drop).
+    pub(crate) fn on_committed_attestation(
+        &mut self,
+        committed: super::phases::HeraCommittedAttestation<Tx>,
+    ) where
+        Tx: Clone + Serialize,
+    {
+        let commit = CommitEmit {
+            heads: committed.attestation.envelope.heads.clone(),
+            sig_round: committed.sig_round,
+        };
+        if self.tx_commit_emit.send(commit).is_err() {
+            error!("Hera: tx_commit_emit closed — data actor gone");
+        }
+    }
 }
 
 impl<Tx> std::fmt::Debug for Hera<Tx> {
@@ -700,8 +1036,29 @@ impl<Tx> std::fmt::Debug for Hera<Tx> {
     ) -> std::fmt::Result {
         f.debug_struct("Hera")
             .field("my_id", &self.my_id)
-            .field("current_epoch", &self.current_epoch)
             .field("signature_epoch", &self.signature_epoch)
             .finish()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-peer verify helper (used in the inbound pump task)
+// ---------------------------------------------------------------------------
+
+/// Verify a DataBlock's author signature. Used in the data-plane inbound pump
+/// task (off the actor loop) so verification parallelizes across peers/cores.
+fn verify_data_block_sig<Tx>(
+    crypto_system: &KeyConfig,
+    block: &crate::types::DataBlock<Tx>,
+) -> bool
+where
+    Tx: serde::Serialize + Clone,
+{
+    let author = block.sig.signer;
+    let pk = match crypto_system.system.get(&author) {
+        Some(pk) => pk,
+        None => return false,
+    };
+    let env_hash = block.hash();
+    pk.verify(env_hash.as_ref(), &block.sig.raw)
 }

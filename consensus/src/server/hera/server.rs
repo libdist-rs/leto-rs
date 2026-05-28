@@ -10,6 +10,7 @@
 ///     clients connect.
 ///   - A shared `Arc<AtomicUsize>` is passed to `Hera::spawn` so the smoke test
 ///     can observe the maximum heads-per-committed-attestation.
+///   - Two oneshot exits: one for the consensus actor, one for the data actor.
 use crate::{server::Settings, types::Transaction, Id, KeyConfig};
 use anyhow::{anyhow, Result};
 use log::info;
@@ -35,10 +36,8 @@ where
 {
     /// Spawn the Hera server.
     ///
-    /// `tx_factory`: optional closure `(my_id, nonce, now_ns) -> Tx` for the
-    /// internal load generator.  If `None`, the load generator reads the `TPS`
-    /// env var but does nothing (no factory = no txs regardless of TPS).
-    /// Pass `Some(factory)` with `TPS` > 0 for self-load.
+    /// Returns `(exit_tx, max_committed_heads_len)`. Send `()` to `exit_tx`
+    /// to shut down both the consensus and data actors.
     pub fn spawn_with_factory<F>(
         my_id: Id,
         all_ids: Vec<Id>,
@@ -72,7 +71,6 @@ where
         let mempool_peers = settings.get_mempool_peers(my_id)?;
         let mempool_net = TcpSimpleSender::<Id, MempoolMsg<Id, Tx>>::with_peers(mempool_peers);
         let mempool_addr = crate::to_socket_address("0.0.0.0", me.mempool_port)?;
-        // Hera has no external clients; the client_port listener will sit idle.
         let client_addr = crate::to_socket_address("0.0.0.0", me.client_port)?;
 
         info!("HeraServer booted on {}", me.mempool_address);
@@ -82,12 +80,22 @@ where
         let (tx_mem_to_batcher, rx_mem_to_batcher) = unbounded_channel::<(Tx, usize)>();
         let (tx_processor, rx_processor) = unbounded_channel();
 
-        // Test hook: shared counter for max heads length across committed attestations.
         let max_committed_heads_len = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        // Self-pacing: shared cumulative count of this node's committed txs.
-        // The load generator reads it to bound outstanding (generated - committed).
-        let my_committed_txs = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Chain-lead rate-limit cap.  Must be >= 1 (see liveness invariant in
+        // data_actor.rs: a cap of 0 would freeze the node's own data sub-chain
+        // by preventing it from ever proposing a block above its committed head).
+        let max_chain_lead: u64 = std::env::var("HERA_MAX_CHAIN_LEAD")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(super::data_actor::DEFAULT_MAX_CHAIN_LEAD)
+            .max(1);
+
+        // Shared atomics: data actor writes, load generator reads.
+        // Initialized to 0 (genesis): my_height starts at 0 and
+        // committed_height starts at 0 before any commit lands.
+        let my_height_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let my_committed_height_atomic = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         mempool::Mempool::spawn(
             my_id,
@@ -104,7 +112,6 @@ where
             client_addr,
         );
 
-        // Self-load generator: read TPS env var and spawn if > 0.
         let tps: usize = std::env::var("TPS")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -116,7 +123,9 @@ where
                     tps,
                     tx_mem_to_batcher.clone(),
                     factory,
-                    Arc::clone(&my_committed_txs),
+                    Arc::clone(&my_height_atomic),
+                    Arc::clone(&my_committed_height_atomic),
+                    max_chain_lead,
                 );
                 info!("HeraServer: self-load generator spawned at TPS={}", tps);
             } else {
@@ -127,7 +136,11 @@ where
             }
         }
 
-        let (exit_tx, exit_rx) = oneshot::channel();
+        // One exit oneshot for the consensus actor. The data actor exits
+        // naturally when the consensus actor drops its cross-plane senders
+        // (tx_fetch_hint, tx_commit_emit), which closes the data actor's recv channels.
+        let (exit_tx, exit_rx) = oneshot::channel::<()>();
+
         Hera::<Tx>::spawn(
             my_id,
             crypto_system,
@@ -138,16 +151,15 @@ where
             rx_mem_to_batcher,
             tx_commit,
             Arc::clone(&max_committed_heads_len),
-            Arc::clone(&my_committed_txs),
+            Arc::clone(&my_height_atomic),
+            Arc::clone(&my_committed_height_atomic),
+            max_chain_lead,
         )?;
 
         Ok((exit_tx, max_committed_heads_len))
     }
 
     /// Convenience wrapper: spawn without a self-load factory.
-    ///
-    /// TPS env var is still read; if > 0 a warning is logged and no load is
-    /// generated (use `spawn_with_factory` to wire a factory).
     pub fn spawn(
         my_id: Id,
         all_ids: Vec<Id>,

@@ -404,10 +404,13 @@ where
                     let height = block.envelope.height;
                     let payload = block.envelope.payload;
                     if !payload.is_empty() {
-                        info!("Zeus-committed height {} with {} txs", height, payload.len());
+                        info!(
+                            "Zeus-committed height {} with {} txs",
+                            height,
+                            payload.len()
+                        );
                         if emit_dp {
-                            committed_tx_count
-                                .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            committed_tx_count.fetch_add(payload.len() as u64, Ordering::Relaxed);
                         }
                         let payload_owned: Vec<Tx> = (*payload).clone();
                         let _ = tx_consensus_to_batcher.send(BatcherConsensusMsg::Committed {

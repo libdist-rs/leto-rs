@@ -38,7 +38,7 @@ use rand::prelude::ThreadRng;
 use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::runtime::Handle;
 use tokio::select;
 use tokio::sync::mpsc;
@@ -48,8 +48,30 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 const PING_INTERVAL: Duration = Duration::from_secs(30);
-/// Per-peer outbound/inbound channel depth. Full ⇒ caller drops (shedding).
+/// Default per-peer outbound channel depth for the data plane (full ⇒ caller
+/// drops, shedding). The data transport now derives its outbox cap from the
+/// chain-lead window W (see `core.rs` / `spawn_data_processed`), so this is only
+/// a fallback for `spawn_data`/`spawn_sig`; the sig plane is unbounded anyway.
 pub(crate) const CHANNEL_CAPACITY: usize = 1_000;
+
+/// Raw per-connection inbound staging buffer (frames straight off the socket,
+/// before deserialize+verify). Uses a *blocking* send (`handle_read_stream`),
+/// so a full buffer backpressures the socket read rather than dropping —
+/// modest is fine.
+pub(crate) const INBOUND_CHANNEL_CAPACITY: usize = 512;
+
+/// Per-plane channel discipline for the per-peer outbox.
+///
+/// - `Bounded(cap)`: bounded mpsc; caller uses `try_send` and drops on full.
+///   Used for the data plane — high-volume, loss-tolerant (refetchable).
+/// - `Unbounded`: unbounded mpsc; caller uses blocking `send`. Used for the sig
+///   plane — low-volume, loss-intolerant (a dropped SigPropose wedges liveness
+///   with no per-message retransmit).
+#[derive(Clone, Copy, Debug)]
+pub enum ChannelMode {
+    Bounded(usize),
+    Unbounded,
+}
 /// Break a connection whose measured RTT exceeds this (a stuck peer frees its
 /// slot so a fresh connection can be established).
 const MAX_LATENCY: Duration = Duration::from_secs(5);
@@ -60,12 +82,34 @@ const PASSIVE_HANDSHAKE: u64 = 0x0000AEAE;
 /// or malicious dialer cannot pin the listener.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Outbound sender, either bounded (data plane, try_send+drop) or unbounded
+/// (sig plane, reliable send, never drop).
+pub enum OutboundSender {
+    Bounded(mpsc::Sender<Bytes>),
+    Unbounded(mpsc::UnboundedSender<Bytes>),
+}
+
+impl OutboundSender {
+    /// Try to send a frame. For bounded senders drops on full (data plane
+    /// shedding). For unbounded senders always succeeds (sig plane must not
+    /// drop).
+    pub fn try_send(
+        &self,
+        bytes: Bytes,
+    ) -> bool {
+        match self {
+            OutboundSender::Bounded(s) => s.try_send(bytes).is_ok(),
+            OutboundSender::Unbounded(s) => s.send(bytes).is_ok(),
+        }
+    }
+}
+
 /// Handed to the application each time a (re)connection to a peer succeeds.
 /// `sender` is the current outbound channel for `peer_id`; `receiver` yields
 /// inbound frames from that peer.
 pub struct Connection {
     pub peer_id: usize,
-    pub sender: mpsc::Sender<Bytes>,
+    pub sender: OutboundSender,
     pub receiver: mpsc::Receiver<Bytes>,
 }
 
@@ -77,13 +121,15 @@ pub struct Network {
 
 impl Network {
     /// `addresses` is indexed by authority id (0..n); `our_id` indexes into it;
-    /// `local_addr` is the bind address for the inbound listener. Synchronous:
-    /// must be called from within a tokio runtime (it spawns the server and
-    /// per-peer worker tasks); the listener is bound inside the server task.
+    /// `local_addr` is the bind address for the inbound listener. `mode`
+    /// controls per-peer outbox discipline (bounded+drop for data plane,
+    /// unbounded for sig plane). Synchronous: must be called from within a
+    /// tokio runtime (it spawns the server and per-peer worker tasks).
     pub fn from_socket_addresses(
         addresses: &[SocketAddr],
         our_id: usize,
         local_addr: SocketAddr,
+        mode: ChannelMode,
     ) -> Self {
         assert!(
             our_id < addresses.len(),
@@ -106,6 +152,7 @@ impl Network {
                     our_id,
                     connection_sender: connection_sender.clone(),
                     active_immediately: id < our_id,
+                    channel_mode: mode,
                 }
                 .run(receiver),
             );
@@ -147,10 +194,24 @@ struct Server {
 }
 
 impl Server {
-    async fn run(self, mut stop: Receiver<()>) {
-        let server = TcpListener::bind(self.local_addr)
-            .await
+    async fn run(
+        self,
+        mut stop: Receiver<()>,
+    ) {
+        // Build the listener with SO_REUSEADDR so a fast restart can rebind a
+        // port still in TIME_WAIT (otherwise local re-runs panic with AddrInUse).
+        let socket = match self.local_addr {
+            SocketAddr::V4(_) => TcpSocket::new_v4(),
+            SocketAddr::V6(_) => TcpSocket::new_v6(),
+        }
+        .expect("create TCP socket");
+        socket
+            .set_reuseaddr(true)
+            .expect("set SO_REUSEADDR on listener");
+        socket
+            .bind(self.local_addr)
             .expect("Failed to bind to local socket");
+        let server = socket.listen(1024).expect("listen on bound socket");
         loop {
             tokio::select! {
                 result = server.accept() => {
@@ -200,10 +261,14 @@ struct Worker {
     our_id: usize,
     connection_sender: mpsc::Sender<Connection>,
     active_immediately: bool,
+    channel_mode: ChannelMode,
 }
 
 impl Worker {
-    async fn run(self, mut receiver: mpsc::UnboundedReceiver<TcpStream>) -> Option<()> {
+    async fn run(
+        self,
+        mut receiver: mpsc::UnboundedReceiver<TcpStream>,
+    ) -> Option<()> {
         let initial_delay = if self.active_immediately {
             Duration::ZERO
         } else {
@@ -230,7 +295,10 @@ impl Worker {
         }
     }
 
-    async fn connect_and_handle(&self, delay: Duration) -> io::Result<()> {
+    async fn connect_and_handle(
+        &self,
+        delay: Duration,
+    ) -> io::Result<()> {
         // critical to avoid a race between active and passive connections
         tokio::time::sleep(delay).await;
         let mut stream = loop {
@@ -253,7 +321,10 @@ impl Worker {
         Self::handle_stream(stream, connection).await
     }
 
-    async fn handle_passive_stream(&self, mut stream: TcpStream) -> io::Result<()> {
+    async fn handle_passive_stream(
+        &self,
+        mut stream: TcpStream,
+    ) -> io::Result<()> {
         // The dialer's magic + id were already consumed by the server before it
         // routed the socket here; we only reply with the passive handshake.
         stream.set_nodelay(true)?;
@@ -264,7 +335,10 @@ impl Worker {
         Self::handle_stream(stream, connection).await
     }
 
-    async fn handle_stream(stream: TcpStream, connection: WorkerConnection) -> io::Result<()> {
+    async fn handle_stream(
+        stream: TcpStream,
+        connection: WorkerConnection,
+    ) -> io::Result<()> {
         let WorkerConnection {
             sender,
             receiver,
@@ -275,14 +349,14 @@ impl Worker {
         let (pong_sender, pong_receiver) = mpsc::channel(150);
         let write_fut = Self::handle_write_stream(writer, receiver, pong_receiver).boxed();
         let read_fut = Self::handle_read_stream(reader, sender, pong_sender).boxed();
-        let (r, _, _) = select_all([write_fut, read_fut]).await;
+        let (r, ..) = select_all([write_fut, read_fut]).await;
         log::debug!("Disconnected from {peer_id}");
         r
     }
 
     async fn handle_write_stream(
         mut writer: OwnedWriteHalf,
-        mut receiver: mpsc::Receiver<Bytes>,
+        mut receiver: mpsc::UnboundedReceiver<Bytes>,
         mut pong_receiver: mpsc::Receiver<i64>,
     ) -> io::Result<()> {
         let start = Instant::now();
@@ -377,25 +451,53 @@ impl Worker {
     }
 
     async fn make_connection(&self) -> Option<WorkerConnection> {
-        let (network_in_sender, network_in_receiver) = mpsc::channel(CHANNEL_CAPACITY);
-        let (network_out_sender, network_out_receiver) = mpsc::channel(CHANNEL_CAPACITY);
+        // Inbound: always a bounded channel (backpressure on the socket read).
+        let (network_in_sender, network_in_receiver) = mpsc::channel(INBOUND_CHANNEL_CAPACITY);
+        // Outbound: bounded for data plane (try_send+drop), unbounded for sig.
+        let (outbound_sender, write_receiver) = match self.channel_mode {
+            ChannelMode::Bounded(cap) => {
+                let (tx, rx_bounded) = mpsc::channel::<Bytes>(cap);
+                // Bridge: forward the bounded rx into an unbounded channel so
+                // handle_write_stream can use a single UnboundedReceiver type.
+                let (ub_tx, ub_rx) = mpsc::unbounded_channel::<Bytes>();
+                let ub_tx_fwd = ub_tx.clone();
+                tokio::spawn(async move {
+                    let mut rx = rx_bounded;
+                    while let Some(frame) = rx.recv().await {
+                        if ub_tx_fwd.send(frame).is_err() {
+                            break;
+                        }
+                    }
+                });
+                (OutboundSender::Bounded(tx), ub_rx)
+            }
+            ChannelMode::Unbounded => {
+                let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+                (OutboundSender::Unbounded(tx), rx)
+            }
+        };
         let connection = Connection {
             peer_id: self.peer_id,
-            sender: network_out_sender,
+            sender: outbound_sender,
             receiver: network_in_receiver,
         };
         self.connection_sender.send(connection).await.ok()?;
         Some(WorkerConnection {
             sender: network_in_sender,
-            receiver: network_out_receiver,
+            receiver: write_receiver,
             peer_id: self.peer_id,
         })
     }
 }
 
 struct WorkerConnection {
+    /// Inbound: frames from the TCP stream sent to the aggregate inbound
+    /// channel.
     sender: mpsc::Sender<Bytes>,
-    receiver: mpsc::Receiver<Bytes>,
+    /// Outbound: frames to write to the TCP stream. Always UnboundedReceiver;
+    /// the bounded/unbounded discipline is enforced at the OutboundSender
+    /// level.
+    receiver: mpsc::UnboundedReceiver<Bytes>,
     peer_id: usize,
 }
 

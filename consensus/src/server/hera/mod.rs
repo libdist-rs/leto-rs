@@ -10,6 +10,9 @@ pub use phases::*;
 mod core;
 pub use self::core::*;
 
+pub mod data_actor;
+pub use data_actor::{CommitEmit, HeraDataActor};
+
 pub mod load_gen;
 
 mod server;

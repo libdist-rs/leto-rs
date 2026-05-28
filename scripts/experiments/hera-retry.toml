@@ -1,0 +1,49 @@
+# Focused hera n=61 retry after the bounded-consensus_net + self-paced-load fix
+# (commit 4a90b81). Goal: does hera commit >0 at n=61, f=20, 50k tx/s on
+# c8g.large, where it previously flatlined to 0?
+#
+# Staged build to avoid idle hosts during compile:
+#   1. fab provision --config experiments/hera-retry.toml --num-nodes 1 --num-clients 0
+#      fab install   --config experiments/hera-retry.toml
+#      fab build     --config experiments/hera-retry.toml      # caches hera-4a90b81
+#      fab destroy   --config experiments/hera-retry.toml
+#   2. fab provision --config experiments/hera-retry.toml      # 61 nodes
+#      fab install   --config experiments/hera-retry.toml      # cache-hit fanout
+#      fab bench     --config experiments/hera-retry.toml
+#      fab destroy   --config experiments/hera-retry.toml
+# Drive with `ulimit -n 10240` (61-host orchestration exceeds the macOS 256 default).
+
+[meta]
+tag = "hera-retry"
+steps = ["provision", "install", "build", "bench", "destroy"]
+
+[aws]
+key_name           = "leto-bench"
+security_group_id  = "sg-00e60e97deb4c41cc"
+subnet_id          = "subnet-0e31e6c0b1430bdc2"
+ssh_key_path       = "~/.ssh/leto-bench.pem"
+instance_type      = "c8g.large"
+az                 = "us-west-2d"
+spot               = false
+# hera self-loads (no client driver), but the bench harness still requires
+# ceil(n/3) client HOSTS to exist for n=61 → 21. They sit idle for hera.
+num_nodes          = 61
+num_clients        = 21
+root_volume_gb     = 30
+
+[install]
+protocols = ["hera"]
+
+[build]
+protocols = ["hera"]
+
+[bench]
+protocols    = ["hera"]
+t_values     = [20]
+loads        = [50000]
+runs         = 1
+# Validation run for the sig-chain wedge fix (commit 140fe16: startup
+# connection gate + priority sig intake). The first commit needs ~commit_len
+# (=41 at n=61) sig rounds, so warm up generously before measuring steady state.
+warmup_secs  = 60
+measure_secs = 30

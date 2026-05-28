@@ -43,6 +43,7 @@ fn run_secs() -> u64 {
 }
 
 const BASE_CONSENSUS_PORT: u16 = 14000;
+const BASE_DATA_PORT: u16 = 14100;
 const BASE_MEMPOOL_PORT: u16 = 14500;
 const BASE_CLIENT_PORT: u16 = 14200;
 const BASE_CONSENSUS_CLIENT_PORT: u16 = 14700;
@@ -56,6 +57,7 @@ fn build_settings(db_dir: &std::path::Path) -> Settings {
                 id,
                 consensus_address: "127.0.0.1".to_string(),
                 consensus_port: BASE_CONSENSUS_PORT + id as u16,
+                data_port: BASE_DATA_PORT + id as u16,
                 mempool_address: "127.0.0.1".to_string(),
                 mempool_port: BASE_MEMPOOL_PORT + id as u16,
                 client_port: BASE_CLIENT_PORT + id as u16,
@@ -104,7 +106,10 @@ fn make_tx(
 
 #[tokio::test]
 async fn test_hera_smoke() -> Result<()> {
-    let _ = env_logger::builder().is_test(false).format_timestamp_millis().try_init();
+    let _ = env_logger::builder()
+        .is_test(false)
+        .format_timestamp_millis()
+        .try_init();
     let num_nodes = smoke_n();
     println!("[hera-smoke] NUM_NODES={num_nodes}");
     // Accumulate committed batch count per node.
@@ -170,7 +175,10 @@ async fn test_hera_smoke() -> Result<()> {
 
     // (1) Every node committed at least one batch. Print all counts first so a
     //     partial/zero stall is fully visible during diagnosis sweeps.
-    let counts: Vec<u64> = commit_counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let counts: Vec<u64> = commit_counts
+        .iter()
+        .map(|c| c.load(Ordering::Relaxed))
+        .collect();
     let committed_nodes = counts.iter().filter(|&&c| c > 0).count();
     println!(
         "[hera-smoke] commits per node: {:?}  ({}/{} nodes committed)",

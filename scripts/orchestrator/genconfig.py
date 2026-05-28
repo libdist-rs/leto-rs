@@ -24,7 +24,8 @@ class Endpoint:
     """One server's network endpoints. Ports are protocol-independent."""
 
     host: str                       # IP or hostname (private for AWS)
-    consensus_port: int             # server↔server consensus messages
+    consensus_port: int             # server↔server sig/consensus-plane messages
+    data_port: int                  # server↔server data-plane (Hera DataPropose/Request/Response)
     mempool_port: int               # client→server raw tx (libmempool-rs path)
     client_port: int                # server↔client wire (ClientMsg, NewBatch)
     metrics_port: int               # Prometheus or similar; protocol-specific
@@ -108,6 +109,7 @@ def generate_local(
                 endpoint=Endpoint(
                     host="127.0.0.1",
                     consensus_port=base_port + 0 + offset,
+                    data_port=base_port + 4 + offset,
                     mempool_port=base_port + 1 + offset,
                     client_port=base_port + 2 + offset,
                     metrics_port=base_port + 3 + offset,
@@ -126,6 +128,7 @@ def generate_local(
                 endpoint=Endpoint(
                     host="127.0.0.1",
                     consensus_port=0,    # unused for clients
+                    data_port=0,
                     mempool_port=0,
                     client_port=client_base + 0 + offset,
                     metrics_port=0,
@@ -153,6 +156,7 @@ def generate_aws(
             endpoint=Endpoint(
                 host=host,
                 consensus_port=base_port + 0,
+                data_port=base_port + 4,
                 mempool_port=base_port + 1,
                 client_port=base_port + 2,
                 metrics_port=base_port + 3,
@@ -168,6 +172,7 @@ def generate_aws(
             endpoint=Endpoint(
                 host=host,
                 consensus_port=0,
+                data_port=0,
                 mempool_port=0,
                 client_port=base_port + 100,
                 metrics_port=0,

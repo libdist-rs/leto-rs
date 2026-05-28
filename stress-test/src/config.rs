@@ -132,6 +132,7 @@ pub fn build_server_settings(
                 id,
                 consensus_address: "127.0.0.1".to_string(),
                 consensus_port: config.base_consensus_port + id as u16,
+                data_port: config.base_consensus_port + 500 + id as u16,
                 mempool_address: "127.0.0.1".to_string(),
                 mempool_port: config.base_mempool_port + id as u16,
                 client_port: config.base_client_port + id as u16,

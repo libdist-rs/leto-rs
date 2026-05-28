@@ -7,10 +7,10 @@ mod chain_db;
 pub use chain_db::*;
 
 /// Cancel-handler GC depth (in rounds).  When a protocol's sig-chain is at
-/// round `r`, cancel handlers for messages sent at rounds `< r - GC_DEPTH_ROUNDS`
-/// are dropped, which signals the per-peer `tcp-reliable-sender` connection
-/// task to skip those messages (via `cancel_handler.is_closed()` check in
-/// libnet's `connection.rs:200-207`).
+/// round `r`, cancel handlers for messages sent at rounds `< r -
+/// GC_DEPTH_ROUNDS` are dropped, which signals the per-peer
+/// `tcp-reliable-sender` connection task to skip those messages (via
+/// `cancel_handler.is_closed()` check in libnet's `connection.rs:200-207`).
 ///
 /// Initialized to `4 * n` at the first protocol `spawn`.  `4 * n` gives the
 /// protocol ample time for slow-but-alive peers to catch up while bounding

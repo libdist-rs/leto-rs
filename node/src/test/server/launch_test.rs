@@ -36,6 +36,7 @@ fn _dummy_settings(
                 id,
                 consensus_address: "127.0.0.1".to_string(),
                 consensus_port: 6000 + (id as u16),
+                data_port: 6800 + (id as u16),
                 mempool_address: "127.0.0.1".to_string(),
                 mempool_port: 7000 + (id as u16),
                 client_port: 8000 + (id as u16),

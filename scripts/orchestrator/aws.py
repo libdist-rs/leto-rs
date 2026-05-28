@@ -90,13 +90,18 @@ def _resolve_ami(region: str) -> str:
     return images[0]["ImageId"]
 
 
-def _list_live_by_tag(ec2, tag: str) -> list[dict]:
-    """Return raw EC2 Instance dicts (running + pending) matching tag:Project=<tag>."""
+def _list_by_tag(ec2, tag: str, states: list[str]) -> list[dict]:
+    """Return raw EC2 Instance dicts in `states` matching tag:Project=<tag>."""
     resp = ec2.describe_instances(Filters=[
         {"Name": "tag:Project", "Values": [tag]},
-        {"Name": "instance-state-name", "Values": ["running", "pending"]},
+        {"Name": "instance-state-name", "Values": states},
     ])
     return [i for r in resp.get("Reservations", []) for i in r.get("Instances", [])]
+
+
+def _list_live_by_tag(ec2, tag: str) -> list[dict]:
+    """Return raw EC2 Instance dicts (running + pending) matching tag:Project=<tag>."""
+    return _list_by_tag(ec2, tag, ["running", "pending"])
 
 
 def _role_from_tags(inst: dict) -> Optional[str]:
@@ -375,6 +380,97 @@ def destroy(tag: str = DEFAULT_TAG) -> None:
     ec2.terminate_instances(InstanceIds=ids)
     save_state({"instances": [], "region": region})
     print(f"destroy initiated for {len(ids)} instance(s)")
+
+
+def suspend(tag: str = DEFAULT_TAG) -> None:
+    """Stop (not terminate) every running instance tagged Project=<tag>.
+
+    Pauses compute billing while preserving the root EBS volumes and
+    instance IDs, so a later `resume` brings the same cluster back without
+    reinstalling/rebuilding. You still pay for the gp3 root volumes while
+    stopped (~$0.08/GB-month each — see DEFAULT_ROOT_VOLUME_GB), but not
+    for the c8g.xlarge compute.
+
+    aws.json is preserved as-is. Note the stored public IPs go stale the
+    moment the hosts stop and will differ after `resume` (EC2 reassigns
+    public IPv4 on each start unless the host has an Elastic IP), so
+    `resume` rewrites them — and any committee config baked from the old
+    IPs must be regenerated before the next bench.
+
+    Idempotent: re-running on an already-stopped cluster is a no-op.
+    """
+    s = load_state()
+    region = s.get("region", DEFAULT_REGION)
+    ec2 = _ec2_client(region)
+    live = _list_live_by_tag(ec2, tag)
+    ids = [i["InstanceId"] for i in live]
+    if not ids:
+        print(f"suspend: no running instances tagged Project={tag}")
+        return
+    ec2.stop_instances(InstanceIds=ids)
+    print(f"suspend: stopping {len(ids)} instance(s) tagged Project={tag} "
+          f"(compute billing pauses; EBS volumes retained)")
+
+
+def resume(tag: str = DEFAULT_TAG) -> list[Instance]:
+    """Start a cluster previously `suspend`-ed and refresh aws.json IPs.
+
+    Starts every stopped instance tagged Project=<tag>, waits for
+    running + status_ok, then rewrites aws.json with the freshly assigned
+    public IPs (these change on each stop/start cycle absent an Elastic
+    IP). Returns the refreshed Instance list, nodes first then clients.
+
+    Regenerate any committee config that bakes in public IPs after this
+    (the IPs almost certainly changed); the binaries on disk survive the
+    stop/start, so install/build can be skipped.
+
+    Idempotent: instances already running are picked up and refreshed too.
+    """
+    s = load_state()
+    region = s.get("region", DEFAULT_REGION)
+    ec2 = _ec2_client(region)
+    # Describe BEFORE starting. start_instances → describe is eventually
+    # consistent: a running/pending filter applied immediately after the start
+    # call can still read the instances back as "stopped" and return nothing.
+    # So capture the instance dicts here (they carry tags/type/az even while
+    # stopped) and feed them to `_wait_and_fill`, whose boto3 `instance_running`
+    # waiter polls with retries until they are actually up, then fills IPs.
+    stopped = _list_by_tag(ec2, tag, ["stopped", "stopping"])
+    running = _list_live_by_tag(ec2, tag)  # already-running (idempotent resume)
+    ids = [i["InstanceId"] for i in stopped]
+    if ids:
+        ec2.start_instances(InstanceIds=ids)
+        print(f"resume: starting {len(ids)} stopped instance(s) tagged Project={tag}")
+    else:
+        print(f"resume: no stopped instances tagged Project={tag}; "
+              f"refreshing IPs for any that are already running")
+
+    described = stopped + running
+    if not described:
+        print(f"resume: no instances tagged Project={tag} to resume")
+        return []
+
+    instances: list[Instance] = []
+    for inst in described:
+        role = _role_from_tags(inst) or "node"
+        instances.append(Instance(
+            instance_id=inst["InstanceId"],
+            public_ip=inst.get("PublicIpAddress"),
+            private_ip=inst.get("PrivateIpAddress", ""),
+            role=role,
+            instance_type=inst.get("InstanceType", s.get("instance_type", DEFAULT_INSTANCE_TYPE)),
+            az=inst.get("Placement", {}).get("AvailabilityZone", s.get("az", DEFAULT_AZ)),
+        ))
+    instances.sort(key=lambda i: (0 if i.role == "node" else 1, i.instance_id))
+    _wait_and_fill(ec2, instances)
+
+    s.update({
+        "region": region,
+        "instances": [asdict(i) for i in instances],
+    })
+    save_state(s)
+    print(f"resume: {len(instances)} instance(s) running; aws.json IPs refreshed")
+    return instances
 
 
 def scale_down(target_nodes: int, target_clients: int) -> int:

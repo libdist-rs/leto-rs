@@ -4,7 +4,7 @@ use fnv::FnvHashSet;
 use rand::{rngs::StdRng, seq::IteratorRandom, SeedableRng};
 use std::collections::VecDeque;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LeaderContext {
     rng: StdRng,
     current_round: Round,

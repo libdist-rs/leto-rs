@@ -301,9 +301,7 @@ where
                 Ok(ZeusClientMsg::NewTx { tx, reply_to: _ }) => {
                     let size = bincode::serialized_size(&tx).unwrap_or(0) as usize;
                     if tx_batcher.send((tx, size)).await.is_err() {
-                        log::warn!(
-                            "Zeus client listener: tx_batcher closed (NewTx path)"
-                        );
+                        log::warn!("Zeus client listener: tx_batcher closed (NewTx path)");
                         return;
                     }
                 }
