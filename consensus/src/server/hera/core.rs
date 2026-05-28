@@ -452,15 +452,23 @@ where
         // before proposing, capped so f crashed peers cannot block liveness.
         {
             let num_nodes = self.settings.committee_config.num_nodes();
-            let num_faults = self.settings.committee_config.num_faults();
-            // Quorum of *peers* (excluding self): n - f - 1.
-            let want = (num_nodes - num_faults).saturating_sub(1);
-            // Cap so f crashed peers cannot block startup forever. Override with
-            // HERA_STARTUP_GATE_CAP_MS during experiments (default 30s).
+            // Target peer count to wait for before starting consensus. On a
+            // CPU-constrained node the network tasks form connections quickly
+            // while idle but starve once the O(n)-crypto consensus loop + load
+            // generator run -- so proposing at the bare quorum (n-f-1) leaves a
+            // partial mesh and the sig-chain desynchronizes. Wait for nearly the
+            // full mesh (n-1) by default so it forms during the idle gate.
+            // Override with HERA_STARTUP_GATE_PEERS for experiments.
+            let want = std::env::var("HERA_STARTUP_GATE_PEERS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| num_nodes.saturating_sub(1));
+            // Cap so crashed/unreachable peers cannot block startup forever.
+            // Override with HERA_STARTUP_GATE_CAP_MS (default 45s).
             let cap_ms = std::env::var("HERA_STARTUP_GATE_CAP_MS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(30_000);
+                .unwrap_or(45_000);
             let deadline =
                 tokio::time::Instant::now() + std::time::Duration::from_millis(cap_ms);
             while self.consensus_net.connected_peers() < want
