@@ -124,7 +124,7 @@ where
         proposal: Proposal<Id, MultiAttestation<Tx>, Round>,
         auth: Signature<Id, Proposal<Id, MultiAttestation<Tx>, Round>>,
         attestation: MultiAttestation<Tx>,
-        _sender: Id,
+        sender: Id,
     ) -> Result<()>
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
@@ -150,13 +150,7 @@ where
             auth.verify(&prop_hash, &leader, pk)?;
         }
 
-        // FuncMultiAttestationValid — split into two steps:
-        // 1. Sig verify (stays in consensus actor, synchronous).
-        // 2. Head-existence check via Storage notify_read (FuturesUnordered): push a
-        //    GateFut and return immediately. The gating future resolves once all
-        //    referenced blocks are present in the shared store; the consensus loop's
-        //    `gating.next()` branch then calls handle_sig_proposal_post_gate. The blame
-        //    timer is the liveness backstop if a block never arrives.
+        // FuncMultiAttestationValid — sig verify only (synchronous).
         match self.multi_attestation_sig_valid(&attestation) {
             super::attestation::SigAttestationValidity::Valid => {}
             super::attestation::SigAttestationValidity::Invalid => {
@@ -164,46 +158,51 @@ where
                 return Ok(());
             }
         }
-        // Push gating future (fire-and-forget from this call site).
-        self.push_gating_future(proposal, auth, attestation);
-        Ok(())
-    }
 
-    /// Called from the `gating` FuturesUnordered branch (in core.rs `run`) once
-    /// `notify_read` has confirmed all referenced data blocks are present in
-    /// the shared store. Runs the parent-element check and, if satisfied,
-    /// calls `on_correct_sig_proposal`.
-    pub async fn handle_sig_proposal_post_gate(
-        &mut self,
-        proposal: Proposal<Id, MultiAttestation<Tx>, Round>,
-        auth: Signature<Id, Proposal<Id, MultiAttestation<Tx>, Round>>,
-        attestation: MultiAttestation<Tx>,
-    ) -> Result<()>
-    where
-        Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
-    {
-        // Fetch a missing PARENT sig-element BEFORE agreeing so the committer
-        // never walks into a gap.
+        // Agreement is DECOUPLED from data availability (spec invariant 1): the
+        // proposer only references data blocks it holds, so we agree on the
+        // leader signature + parent sig-element and fetch the data lazily for
+        // commit. This is what prevents a node momentarily missing one data
+        // block from stranding (it can neither agree nor, alone, blame it out).
+        //
+        // Fire non-blocking fetch-from-SENDER hints (invariant 2) for each
+        // referenced head, so the data is present by commit time. The data actor
+        // skips heads already in its block_store. `sender` is the proposer/
+        // relayer — a guaranteed holder of every referenced head by invariant 1.
+        for h in attestation
+            .envelope
+            .heads
+            .iter()
+            .filter(|h| h.height > 0 || h.epoch > 0)
+        {
+            let _ = self.tx_fetch_hint.send((h.hash.clone(), sender));
+        }
+
+        // The PARENT sig-element must be present before we agree, so the
+        // committer never walks into a chain gap. If missing, park and request
+        // it from the SENDER (invariant 2) — the proposer built on it, so it has
+        // it; never the data author.
         let parent_hash = proposal.block().parent_hash();
         match self.sig_chain_state.get_element(parent_hash.clone()).await {
             Ok(Some(_)) => {}
             Ok(None) => {
-                debug!(
-                    "Hera: sig proposal round={} parked for missing parent {:?}",
+                info!(
+                    "Hera[n{}]: PARKED sig proposal round={} for missing parent (req from sender {})",
+                    self.my_id,
                     proposal.round(),
-                    parent_hash
+                    sender
                 );
                 let parked = HeraMsg::SigPropose {
                     proposal: proposal.clone(),
                     auth: auth.clone(),
                     attestation: attestation.clone(),
-                    sender: 0, // sender not needed for park/drain replay
+                    sender, // preserve the real sender for re-driven fetches
                 };
                 self.pending_sig_proposals
                     .entry(parent_hash.clone())
                     .or_default()
                     .push(parked);
-                self.broadcast_sig_element_request(parent_hash).await?;
+                self.request_sig_element_from(parent_hash, sender).await?;
                 return Ok(());
             }
             Err(e) => {
@@ -230,12 +229,14 @@ where
             .await?;
 
         // Update sig-chain state.
+        let r = proposal.round();
         let batch = Batch {
             payload: vec![attestation],
         };
         self.sig_chain_state
             .update_highest_chain(proposal, auth, batch)
             .await?;
+        info!("Hera[n{}]: AGREED round={} -> advancing", self.my_id, r);
 
         // Advance sig-chain round.
         self.advance_sig_round().await
@@ -301,6 +302,39 @@ where
             if let Ok(h) = result {
                 self.push_cancel_handler(*peer, h);
             }
+        }
+        Ok(())
+    }
+
+    /// Request a missing sig-chain element from a specific `holder`
+    /// (request-from-sender, invariant 2): the node that referenced the element
+    /// to us provably has it (invariant 1). Falls back to a broadcast if the
+    /// holder is unknown (`holder == 0` sentinel) or is ourselves.
+    pub(crate) async fn request_sig_element_from(
+        &mut self,
+        target_hash: crate::server::hera::core::SigElementHash<Tx>,
+        holder: Id,
+    ) -> Result<()>
+    where
+        Tx: Clone + Serialize,
+    {
+        if holder == self.my_id {
+            return self.broadcast_sig_element_request(target_hash).await;
+        }
+        // Dedupe: skip if a fetch for this element is already outstanding.
+        if !self
+            .pending_sig_element_requests
+            .insert(target_hash.clone())
+        {
+            return Ok(());
+        }
+        let msg = HeraMsg::<Tx>::SigElementRequest {
+            source: self.my_id,
+            request: Request::new(target_hash),
+        };
+        let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
+        if let Ok(h) = self.consensus_net.send(holder, bytes).await {
+            self.push_cancel_handler(holder, h);
         }
         Ok(())
     }
@@ -428,6 +462,8 @@ where
         &mut self,
         blame_round: Round,
         auth: Signature<Id, Round>,
+        highest_round: Round,
+        highest_hash: crate::server::hera::core::SigElementHash<Tx>,
     ) -> Result<()>
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
@@ -455,19 +491,30 @@ where
         auth.verify_without_id_check(&blame_hash, pk)?;
 
         self.round_state.blame_map.insert(auth.get_id(), auth);
-        debug!(
-            "Hera[n{}]: blame round {} map={}/{} (cur_round={})",
+        // Track the highest chain reported across this round's blames (the next
+        // leader extends it). `origin` is a holder of that element (invariant 1).
+        let better = match &self.round_state.blame_best {
+            Some((r, _)) => highest_round > *r,
+            None => true,
+        };
+        if better {
+            self.round_state.blame_best = Some((highest_round, highest_hash));
+        }
+        info!(
+            "Hera[n{}]: BLAME-RX round={} from={} map={}/{} cur={} reported_highest={}",
             self.my_id,
             blame_round,
+            origin,
             self.round_state.blame_map.len(),
             qc_len,
-            self.round_state.round()
+            self.round_state.round(),
+            highest_round,
         );
         if self.round_state.blame_map.len() < qc_len {
             return Ok(());
         }
 
-        debug!(
+        info!(
             "Hera[n{}]: BLAME-QC formed for round {} ({} blames)",
             self.my_id, blame_round, qc_len
         );
@@ -477,29 +524,48 @@ where
         for (_, a) in blame_map {
             qc.add(a);
         }
-        self.handle_sig_blame_qc(blame_round, qc).await
+        let (best_round, best_hash) = self
+            .round_state
+            .blame_best
+            .clone()
+            .unwrap_or_else(|| (Round::MIN, self.sig_chain_state.highest_hash()));
+        self.handle_sig_blame_qc(blame_round, qc, best_round, best_hash)
+            .await
     }
 
     pub async fn on_sig_blame_qc(
         &mut self,
         blame_round: Round,
         qc: Certificate<Id, Round>,
+        highest_round: Round,
+        highest_hash: crate::server::hera::core::SigElementHash<Tx>,
     ) -> Result<()>
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
     {
+        info!(
+            "Hera[n{}]: BLAMEQC-RX round={} cur={} got_qc={} reported_highest={}",
+            self.my_id,
+            blame_round,
+            self.round_state.round(),
+            self.round_state.got_qc,
+            highest_round,
+        );
         if self.round_state.got_qc {
             return Ok(());
         }
         let blame_hash = Hash::ser_and_hash(&blame_round);
         qc.verify(&blame_hash, &self.crypto_system.system)?;
-        self.handle_sig_blame_qc(blame_round, qc).await
+        self.handle_sig_blame_qc(blame_round, qc, highest_round, highest_hash)
+            .await
     }
 
     async fn handle_sig_blame_qc(
         &mut self,
         blame_round: Round,
         qc: Certificate<Id, Round>,
+        highest_round: Round,
+        highest_hash: crate::server::hera::core::SigElementHash<Tx>,
     ) -> Result<()>
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
@@ -509,6 +575,8 @@ where
         let pmsg = HeraMsg::<Tx>::SigBlameQC {
             round: blame_round,
             qc: qc.clone(),
+            highest_round,
+            highest_hash: highest_hash.clone(),
         };
         let bytes = bytes::Bytes::from(bincode::serialize(&pmsg).map_err(anyhow::Error::new)?);
         let peers = self.broadcast_peers.clone();
@@ -520,6 +588,19 @@ where
         }
 
         self.sig_chain_state.add_qc(blame_round, qc);
+
+        // Forward catch-up of chain DATA: if the quorum's reported highest is
+        // ahead of ours, fetch that element (its ancestors recurse) so a node
+        // that missed agreements does not lack chain elements; its highest then
+        // advances as the fetched element's proposal is re-driven/agreed. The QC
+        // is broadcast and carries no single sender, so we broadcast the request
+        // (any holder answers — still "ask a holder", never the dead author).
+        if highest_round > self.sig_chain_state.highest_chain().proposal.round() {
+            if let Ok(None) = self.sig_chain_state.get_element(highest_hash.clone()).await {
+                self.broadcast_sig_element_request(highest_hash).await?;
+            }
+        }
+
         info!(
             "Hera[n{}]: BLAMEQC-ADVANCE past round={}",
             self.my_id, blame_round
@@ -551,9 +632,16 @@ where
         );
         let blame_hash = Hash::ser_and_hash(&blame_msg);
         let auth = Signature::<Id, Round>::new(blame_hash, self.my_id, &self.crypto_system.secret)?;
+        // Carry our highest sig-chain element so the next leader can extend the
+        // true highest chain (it fetches the element from a blamer if missing —
+        // request-from-sender, invariant 2).
+        let highest_round = self.sig_chain_state.highest_chain().proposal.round();
+        let highest_hash = self.sig_chain_state.highest_hash();
         let pmsg = HeraMsg::<Tx>::SigBlame {
             round: blame_msg,
             auth,
+            highest_round,
+            highest_hash,
         };
         let bytes = bytes::Bytes::from(bincode::serialize(&pmsg).map_err(anyhow::Error::new)?);
         let peers = self.broadcast_peers.clone();

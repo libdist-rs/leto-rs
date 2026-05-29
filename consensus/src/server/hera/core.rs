@@ -5,18 +5,17 @@
 /// never enters this event loop.
 ///
 /// ## Cross-plane edges (unbounded — sig-plane discipline, never drop)
-/// - `tx_fetch_hint` → data actor: (hash, author) hint for a missing block.
+/// - `tx_fetch_hint` → data actor: (hash, holder) hint to fetch a missing block
+///   from `holder` (the sig-proposal sender — a guaranteed holder by invariant 1).
 /// - `tx_commit_emit` → data actor: committed `{author→height}` set.
 ///
-/// ## Gating via Storage::notify_read (FuturesUnordered)
-/// After sig verify, for each incoming `SigPropose`, we push a `GateFut` into
-/// `self.gating`. The future calls
-/// `store.notify_read(data_block_key(hash)).await` for each non-genesis head
-/// in the attestation, then yields the proposal. `notify_read` resolves
-/// immediately if the data actor has already written the block (common case);
-/// otherwise it parks in the store's in-memory obligation map until the data
-/// actor's `store.write(data_block_key(hash), bytes)` lands (no disk flush
-/// needed — the store task resolves obligations synchronously on Write).
+/// ## Agreement is decoupled from data availability (spec invariant 1)
+/// A sig proposal references only data the proposer holds, so agreement depends
+/// on the leader signature + the parent sig-element — NOT on having the data
+/// blocks locally. We fire non-blocking fetch-from-sender hints for referenced
+/// heads (so the data is present by commit time) and agree immediately. This is
+/// what prevents a node momentarily missing a data block from stranding. The
+/// data actor consumes the blocks at commit and lags gracefully if any are late.
 ///
 /// ## Head reads (lock-free, stale-OK)
 /// When building a SigPropose, reads per-author
@@ -26,7 +25,7 @@
 use crate::{
     server::{
         hera::{
-            chain_state::{data_block_key, MultiAuthorDataChainState},
+            chain_state::MultiAuthorDataChainState,
             data_actor::{CommitEmit, HeraDataActor},
             phases::HeraCommitContext,
         },
@@ -44,9 +43,7 @@ use log::*;
 use mempool::Batch;
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::future::Future;
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, Ordering as AOrdering};
 use std::sync::Arc;
 use storage::rocksdb::Storage;
@@ -68,12 +65,6 @@ pub(crate) static INFLIGHT_LOOPBACK: AtomicI64 = AtomicI64::new(0);
 pub(crate) static INFLIGHT_COMMIT_TX_INNER: AtomicI64 = AtomicI64::new(0);
 /// Depth of rx_committed (commit task → consensus actor).
 pub(crate) static INFLIGHT_COMMITTED: AtomicI64 = AtomicI64::new(0);
-/// PROFILE: max gating `notify_read` latency (ms) seen in the current HB
-/// window. High values ⇒ the shared store command channel is congested by the
-/// per-block write flood, delaying gating (the suspected intermittent-stall
-/// cause).
-pub(crate) static NOTIFY_READ_MAX_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -94,24 +85,6 @@ pub type SigLeaderContext = LeaderContext;
 pub type PendingSigProposals<Tx> = FnvHashMap<SigElementHash<Tx>, Vec<HeraMsg<Tx>>>;
 
 // ---------------------------------------------------------------------------
-// Gating future type alias
-// ---------------------------------------------------------------------------
-
-/// A gating future: waits for all referenced data blocks to be present in the
-/// shared store (via `notify_read`), then yields the proposal triple.
-pub type GateFut<Tx> = Pin<
-    Box<
-        dyn Future<
-                Output = (
-                    Proposal<Id, MultiAttestation<Tx>, Round>,
-                    Signature<Id, Proposal<Id, MultiAttestation<Tx>, Round>>,
-                    MultiAttestation<Tx>,
-                ),
-            > + Send,
-    >,
->;
-
-// ---------------------------------------------------------------------------
 // HeraRoundState
 // ---------------------------------------------------------------------------
 
@@ -121,6 +94,11 @@ pub struct HeraRoundState<Tx> {
     msg_buf: VecDeque<HeraMsg<Tx>>,
     future_msgs: FnvHashMap<Round, VecDeque<HeraMsg<Tx>>>,
     pub blame_map: FnvHashMap<Id, Signature<Id, Round>>,
+    /// Highest sig-chain `(round, element-hash)` reported across the blames
+    /// collected for the current round. The next leader extends this (the true
+    /// highest chain among the quorum), fetching the element from a blamer if it
+    /// does not have it (request-from-sender). Reset whenever blame_map clears.
+    pub blame_best: Option<(Round, SigElementHash<Tx>)>,
     pub got_qc: bool,
     #[allow(dead_code)]
     num_nodes: usize,
@@ -133,6 +111,7 @@ impl<Tx> HeraRoundState<Tx> {
             msg_buf: VecDeque::new(),
             future_msgs: FnvHashMap::default(),
             blame_map: FnvHashMap::default(),
+            blame_best: None,
             got_qc: false,
             num_nodes,
         }
@@ -178,6 +157,7 @@ impl<Tx> HeraRoundState<Tx> {
     ) {
         self.current_round += 1;
         self.blame_map.clear();
+        self.blame_best = None;
         self.got_qc = false;
         if let Some(msgs) = self.future_msgs.remove(&self.current_round) {
             for m in msgs {
@@ -205,6 +185,7 @@ impl<Tx> HeraRoundState<Tx> {
         }
         self.current_round = target;
         self.blame_map.clear();
+        self.blame_best = None;
         self.got_qc = false;
         // Old current-round messages are now stale (round < target); drop them.
         self.msg_buf.clear();
@@ -235,12 +216,6 @@ impl<Tx> HeraRoundState<Tx> {
 /// cancelling that stale in-flight message.  1024 >> a few rounds of sig
 /// messages, so the backlog to a late-connecting peer drains before the cap.
 pub const MAX_CANCEL_HANDLERS_PER_PEER: usize = 1024;
-
-/// Grace window before the gate falls back to an explicit data fetch. In steady
-/// state the referenced DataPropose is already buffered, so the gate resolves
-/// immediately and this never elapses. Must be ≪ the round/blame timeout so a
-/// genuinely-late block can be refetched (and the fetch retried) before blame.
-const GATE_FETCH_GRACE: std::time::Duration = std::time::Duration::from_millis(30);
 
 /// Maximum round gap this node will fast-forward in a single forward-catch-up
 /// step. Bounds the deterministic leader-rotation replay (and the gap to fill
@@ -304,18 +279,6 @@ pub struct Hera<Tx> {
     // ------------------------------------------------------------------
     pub(crate) pending_sig_proposals: PendingSigProposals<Tx>,
     pub(crate) pending_sig_element_requests: FnvHashSet<SigElementHash<Tx>>,
-
-    // ------------------------------------------------------------------
-    // Gating (Storage::notify_read path)
-    // ------------------------------------------------------------------
-    /// Clone of the shared `Storage` handle.  GateFuts clone this and call
-    /// `store.notify_read(data_block_key(hash)).await` for each non-genesis
-    /// head in the attestation.  The data actor writes the same key on block
-    /// admission, which wakes the obligation synchronously (no disk flush).
-    pub(crate) store: Storage,
-    /// FuturesUnordered of gating futures: each resolves when all referenced
-    /// data blocks for that proposal have been written to the shared store.
-    pub(crate) gating: FuturesUnordered<GateFut<Tx>>,
 
     // ------------------------------------------------------------------
     // Heartbeat (info-level round/commit progress)
@@ -452,7 +415,7 @@ where
                     Ok(msg) => {
                         let ok = match &msg {
                             HeraMsg::DataPropose { block, .. }
-                            | HeraMsg::DataResponse { block } => {
+                            | HeraMsg::DataResponse { block, .. } => {
                                 verify_data_block_sig(&crypto_for_verify, block)
                             }
                             HeraMsg::DataRequest { .. } => true,
@@ -549,9 +512,8 @@ where
             tx_data_commit: tx_data_commit.clone(),
             tx_consensus_to_batcher: tx_consensus_to_batcher.clone(),
             block_store: fnv::FnvHashMap::default(),
-            store: store.clone(),
             multi_data_chain,
-            pending_data_requests: fnv::FnvHashSet::default(),
+            pending_data_requests: fnv::FnvHashMap::default(),
             my_height: 0,
             my_last_hash: None,
             commit_event_count: 0,
@@ -609,8 +571,6 @@ where
             prev_attested_heights: FnvHashMap::default(),
             pending_sig_proposals: FnvHashMap::default(),
             pending_sig_element_requests: FnvHashSet::default(),
-            store: store.clone(),
-            gating: FuturesUnordered::new(),
             bench_emit_interval,
             emit_dp,
             settings,
@@ -708,18 +668,6 @@ where
                     }
                 }
 
-                // Gating future resolved: all referenced blocks now exist in store.
-                // This branch beats blame so a ready gate promotes before blame fires.
-                Some((proposal, auth, attestation)) = self.gating.next(), if !self.gating.is_empty() => {
-                    let cur = self.round_state.round();
-                    if proposal.round() == cur {
-                        if let Err(e) = self.handle_sig_proposal_post_gate(proposal, auth, attestation).await {
-                            error!("Hera: handle_sig_proposal_post_gate (from gating): {e}");
-                        }
-                    }
-                    // else: round advanced while block was missing — drop (blame fired first, legitimate).
-                }
-
                 // Sig-plane self-deliver loopback (unbounded).
                 msg = self.rx_msg_loopback.recv() => {
                     INFLIGHT_LOOPBACK.fetch_sub(1, AOrdering::Relaxed);
@@ -749,12 +697,10 @@ where
 
                 // Heartbeat (info-level round/commit progress).
                 _ = self.bench_emit_interval.tick(), if self.emit_dp => {
-                    let nr_max = NOTIFY_READ_MAX_MS.swap(0, AOrdering::Relaxed);
                     info!(
-                        "Hera HB: round={} highest_chained={} notify_read_max_ms={}",
+                        "Hera HB: round={} highest_chained={}",
                         self.round_state.round(),
                         self.sig_chain_state.highest_chain().proposal.round(),
-                        nr_max,
                     );
                     let sig_net = INFLIGHT_SIG_NET.load(AOrdering::Relaxed);
                     let loopback = INFLIGHT_LOOPBACK.load(AOrdering::Relaxed);
@@ -801,7 +747,7 @@ where
                 self.round_state.enqueue(msg, r);
                 Ok(())
             }
-            HeraMsg::SigBlameQC { round, ref qc } => {
+            HeraMsg::SigBlameQC { round, ref qc, .. } => {
                 // A valid blame-QC for `round` is unforgeable proof the cluster
                 // blamed `round` and advanced. Catch up to `round` so the normal
                 // handler advances us to round+1.
@@ -888,6 +834,10 @@ where
             );
             true
         } else {
+            warn!(
+                "Hera[n{}]: FUTURE-PROP-REJECT round={} (cur={}) computed_leader={} sig_invalid",
+                self.my_id, r, cur, leader
+            );
             false
         }
     }
@@ -927,8 +877,24 @@ where
                 self.handle_sig_proposal(proposal, auth, attestation, sender)
                     .await
             }
-            HeraMsg::SigBlame { round, auth } => self.handle_sig_blame(round, auth).await,
-            HeraMsg::SigBlameQC { round, qc } => self.on_sig_blame_qc(round, qc).await,
+            HeraMsg::SigBlame {
+                round,
+                auth,
+                highest_round,
+                highest_hash,
+            } => {
+                self.handle_sig_blame(round, auth, highest_round, highest_hash)
+                    .await
+            }
+            HeraMsg::SigBlameQC {
+                round,
+                qc,
+                highest_round,
+                highest_hash,
+            } => {
+                self.on_sig_blame_qc(round, qc, highest_round, highest_hash)
+                    .await
+            }
             _ => {
                 debug!("Hera: unexpected msg in handle_sig_ordered");
                 Ok(())
@@ -939,76 +905,6 @@ where
     /// Returns the current rleader id.
     pub fn rleader(&self) -> Id {
         self.sig_leader_context.leader()
-    }
-
-    /// Build and push a gating future for this proposal.
-    ///
-    /// For each non-genesis head in the attestation, sends a fetch hint to the
-    /// data actor (fire-and-forget) and calls
-    /// `store.notify_read(data_block_key(hash)).await` in the gating future.
-    /// `notify_read` resolves immediately if the data actor has already written
-    /// the key; otherwise it parks in the store's in-memory obligation map
-    /// until `store.write(data_block_key(hash), bytes)` lands (woken
-    /// synchronously by the store task, before any RocksDB flush).
-    pub(crate) fn push_gating_future(
-        &mut self,
-        proposal: Proposal<Id, MultiAttestation<Tx>, Round>,
-        auth: Signature<Id, Proposal<Id, MultiAttestation<Tx>, Round>>,
-        attestation: MultiAttestation<Tx>,
-    ) where
-        Tx: Clone + Serialize + PartialEq + 'static,
-    {
-        // (key, hash, author) for each non-genesis referenced head.
-        let heads: Vec<(Vec<u8>, super::chain_state::DataBlockHash<Tx>, Id)> = attestation
-            .envelope
-            .heads
-            .iter()
-            .filter(|h| h.height > 0 || h.epoch > 0)
-            .map(|h| (data_block_key(&h.hash), h.hash.clone(), h.author))
-            .collect();
-
-        // Clone the shared store handle + fetch-hint sender into the async closure.
-        let mut store = self.store.clone();
-        let tx_fetch_hint = self.tx_fetch_hint.clone();
-
-        let fut: GateFut<Tx> = Box::pin(async move {
-            for (key, hash, author) in heads {
-                // Gate on the BUFFERED block: in steady state the author's
-                // DataPropose has already arrived and been admitted, so
-                // notify_read resolves immediately with no request traffic. Only
-                // if the block hasn't landed within a grace window do we fall back
-                // to an explicit fetch hint — re-fired every grace tick until the
-                // block is present, so a shed DataRequest/DataResponse is retried.
-                // This makes request/response a reliable *backstop*, not a
-                // steady-state dependency. The single notify_read future is kept
-                // alive across ticks (no obligation churn in the store).
-                let t0 = std::time::Instant::now();
-                let notify = store.notify_read(key);
-                tokio::pin!(notify);
-                let mut ticker = tokio::time::interval(GATE_FETCH_GRACE);
-                ticker.tick().await; // consume the immediate first tick (no t=0 fetch)
-                loop {
-                    tokio::select! {
-                        _ = &mut notify => break,
-                        _ = ticker.tick() => {
-                            let _ = tx_fetch_hint.send((hash.clone(), author));
-                            debug!(
-                                "Hera: gate waited {} ms for data block author={} {:?}; (re)fired fetch hint",
-                                t0.elapsed().as_millis(), author, hash
-                            );
-                        }
-                    }
-                }
-                let ms = t0.elapsed().as_millis() as u64;
-                let prev = NOTIFY_READ_MAX_MS.load(AOrdering::Relaxed);
-                if ms > prev {
-                    NOTIFY_READ_MAX_MS.store(ms, AOrdering::Relaxed);
-                }
-            }
-            (proposal, auth, attestation)
-        });
-
-        self.gating.push(fut);
     }
 
     /// Emit committed {author→height} set to the data actor via unbounded

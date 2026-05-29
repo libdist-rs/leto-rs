@@ -44,15 +44,28 @@ pub enum HeraMsg<Tx> {
     },
 
     /// Hera: OnSignatureBlame — blame for the current sig-chain round.
+    ///
+    /// Carries the blamer's highest known sig-chain element so the next leader
+    /// can extend the true highest chain (it asks a blamer for the element if it
+    /// does not have it — request-from-sender). `highest_hash` is the element
+    /// hash; `highest_round` is that element's round (genesis = Round::MIN).
     SigBlame {
         round: Round,
         auth: Signature<Id, Round>,
+        highest_round: Round,
+        highest_hash: Hash<Element<Id, MultiAttestation<Tx>, Round>>,
     },
 
     /// Hera: BlameQC for sig-chain.
+    ///
+    /// Carries the maximum highest-chain reference among the quorum of blames
+    /// that formed the QC, so a node that only receives the QC (did not collect
+    /// the individual blames) also learns which chain the new leader must extend.
     SigBlameQC {
         round: Round,
         qc: Certificate<Id, Round>,
+        highest_round: Round,
+        highest_hash: Hash<Element<Id, MultiAttestation<Tx>, Round>>,
     },
 
     // -----------------------------------------------------------------------
@@ -85,8 +98,10 @@ pub enum HeraMsg<Tx> {
         source: Id,
     },
 
-    /// Hera: peer responds with a data block.
-    DataResponse { block: DataBlock<Tx> },
+    /// Hera: peer responds with a data block. `responder` is the node serving
+    /// the block (a guaranteed holder); the requester fetches a missing parent
+    /// from `responder` (request-from-sender), never the possibly-dead author.
+    DataResponse { block: DataBlock<Tx>, responder: Id },
 }
 
 impl<Tx> Message for HeraMsg<Tx>

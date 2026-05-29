@@ -1,0 +1,70 @@
+{
+  "committee_config": {
+    "parties": {
+      "0": {
+        "id": 0,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18001,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18000,
+        "data_port": 18004,
+        "client_port": 18002,
+        "consensus_client_port": 18006
+      },
+      "1": {
+        "id": 1,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18101,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18100,
+        "data_port": 18104,
+        "client_port": 18102,
+        "consensus_client_port": 18106
+      },
+      "2": {
+        "id": 2,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18201,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18200,
+        "data_port": 18204,
+        "client_port": 18202,
+        "consensus_client_port": 18206
+      },
+      "3": {
+        "id": 3,
+        "mempool_address": "127.0.0.1",
+        "mempool_port": 18301,
+        "consensus_address": "127.0.0.1",
+        "consensus_port": 18300,
+        "data_port": 18304,
+        "client_port": 18302,
+        "consensus_client_port": 18306
+      }
+    }
+  },
+  "mempool_config": {
+    "gc_depth": 5,
+    "sync_retry_delay": {
+      "secs": 1,
+      "nanos": 0
+    },
+    "sync_retry_nodes": 4
+  },
+  "storage": {
+    "base": ".",
+    "prefix": "db"
+  },
+  "bench_config": {
+    "batch_size": 500000,
+    "batch_timeout": {
+      "secs": 0,
+      "nanos": 100000000
+    },
+    "delay_in_ms": 2000,
+    "eleader_pipeline_depth": 16,
+    "data_timer_duration_ms": 1000,
+    "bench_emit_window_secs": 5,
+    "bench_metrics_node": 0
+  }
+}

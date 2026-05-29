@@ -43,9 +43,7 @@
 /// 5. Verified data blocks (recv_many(K), last) — high volume, shedding OK.
 use crate::{
     server::{
-        hera::chain_state::{
-            data_block_key, AdmitTypedResult, DataBlockHash, MultiAuthorDataChainState,
-        },
+        hera::chain_state::{AdmitTypedResult, DataBlockHash, MultiAuthorDataChainState},
         BatcherConsensusMsg,
     },
     types::{DataBlock, DataBlockEnvelope, DataBlockSig, HeraMsg, Transaction},
@@ -54,7 +52,7 @@ use crate::{
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use crypto::hash::Hash;
-use fnv::{FnvHashMap, FnvHashSet};
+use fnv::FnvHashMap;
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use log::*;
@@ -64,7 +62,6 @@ use serde::Serialize;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
 use std::sync::Arc;
-use storage::rocksdb::Storage;
 use tcp_reliable_sender::{CancelHandler, TcpReliableSender};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
@@ -114,6 +111,12 @@ static CANT_SERVE_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 /// GC the block store every N commit events.
 const GC_EVERY_N_COMMITS: u64 = 40;
+
+/// Minimum interval between (re)sends of the same data-block fetch. The gate
+/// re-fires fetch hints every ~30 ms; this throttles the actual network sends
+/// and bounds re-broadcast traffic. Must be << the blame timer so a missing
+/// block is recovered before the round is blamed.
+const DATA_REQ_RETRY: std::time::Duration = std::time::Duration::from_millis(150);
 
 pub struct HeraDataActor<Tx> {
     // ------------------------------------------------------------------
@@ -171,21 +174,13 @@ pub struct HeraDataActor<Tx> {
     pub block_store: FnvHashMap<DataBlockHash<Tx>, DataBlock<Tx>>,
 
     // ------------------------------------------------------------------
-    // Component 2: shared RocksDB store (for notify_read gating)
-    // ------------------------------------------------------------------
-    /// Clone of the shared `Storage` handle.  On every valid block admission,
-    /// `store.write(data_block_key(hash), serialized_block)` is issued so that
-    /// the consensus actor's `store.notify_read(data_block_key(hash))` GateFut
-    /// resolves (the store task wakes obligations synchronously on write,
-    /// before the RocksDB flush).
-    pub store: Storage,
-
-    // ------------------------------------------------------------------
     // Data-plane state
     // ------------------------------------------------------------------
     pub multi_data_chain: MultiAuthorDataChainState<Tx>,
-    /// In-flight data-block fetches (dedup).
-    pub pending_data_requests: FnvHashSet<DataBlockHash<Tx>>,
+    /// In-flight data-block fetches: hash → time of last request. Time-stamped
+    /// (not a plain set) so a fetch is RE-SENT if it goes unanswered — a single
+    /// lost request/response, or a crashed author, must not wedge the gate.
+    pub pending_data_requests: FnvHashMap<DataBlockHash<Tx>, std::time::Instant>,
 
     // ------------------------------------------------------------------
     // Own sub-chain state
@@ -480,7 +475,9 @@ where
                 target_hash,
                 source,
             } => self.on_data_request(target_hash, source).await,
-            HeraMsg::DataResponse { block } => self.on_data_response(block).await,
+            HeraMsg::DataResponse { block, responder } => {
+                self.on_data_response(block, responder).await
+            }
             _ => {
                 debug!("HeraDataActor: unexpected msg in dispatch_data");
                 Ok(())
@@ -526,11 +523,14 @@ where
         );
 
         if let Some(missing_hash) = missing_parent {
+            // Request-from-sender (inv. 2): the node that sent us this block has
+            // its parent too (it extended its own chain), so ask `sender`, not
+            // the original author (which may be the crashed node).
             debug!(
-                "HeraDataActor: data block parked; requesting parent {:?} from author {}",
-                missing_hash, author
+                "HeraDataActor: data block parked; requesting parent {:?} from sender {}",
+                missing_hash, sender
             );
-            self.request_data(missing_hash, author).await;
+            self.request_data(missing_hash, sender).await;
         }
 
         Ok(())
@@ -557,7 +557,10 @@ where
 
         match block {
             Some(b) => {
-                let msg = HeraMsg::<Tx>::DataResponse { block: b };
+                let msg = HeraMsg::<Tx>::DataResponse {
+                    block: b,
+                    responder: self.my_id,
+                };
                 match bincode::serialize(&msg) {
                     Ok(bytes) => {
                         if let Err(e) = self.data_net.send(source, Bytes::from(bytes)).await {
@@ -591,6 +594,7 @@ where
     pub async fn on_data_response(
         &mut self,
         block: DataBlock<Tx>,
+        responder: Id,
     ) -> Result<()>
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
@@ -618,7 +622,9 @@ where
         );
 
         if let Some(missing_hash) = missing_parent {
-            self.request_data(missing_hash, author).await;
+            // Request-from-sender (inv. 2): ask the responder that just served
+            // us this block for its parent, not the (possibly dead) author.
+            self.request_data(missing_hash, responder).await;
         }
         Ok(())
     }
@@ -627,10 +633,11 @@ where
     // Core admission helper (synchronous — hashmap insert)
     // -----------------------------------------------------------------------
 
-    /// Insert body into `block_store`, write to shared store (wakes
-    /// notify_read GateFuts), then admit metadata.  Returns
-    /// `Some(missing_parent_hash)` if the block was parked (parent not yet
-    /// admitted).
+    /// Insert body into the in-memory `block_store`, then admit metadata.
+    /// Returns `Some(missing_parent_hash)` if the block was parked (parent not
+    /// yet admitted). Bodies live only in `block_store` (commit reads them via
+    /// `walk_range`); agreement no longer gates on disk presence, so no
+    /// per-block RocksDB write is needed.
     fn admit_block(
         &mut self,
         block: DataBlock<Tx>,
@@ -643,25 +650,10 @@ where
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
     {
-        // 1. Body → plain hashmap (synchronous, allocation-light, no disk).
-        self.block_store.insert(hash.clone(), block.clone());
+        // Body → plain hashmap (synchronous, allocation-light, no disk).
+        self.block_store.insert(hash.clone(), block);
 
-        // 2. Write to the shared store — wakes any consensus actor GateFuts that are
-        //    parked on notify_read(data_block_key(hash)).  The store task resolves
-        //    obligations synchronously on Write before touching RocksDB, so there is no
-        //    disk-I/O latency on the gating path.
-        let key = data_block_key(&hash);
-        let mut store = self.store.clone();
-        match bincode::serialize(&block) {
-            Ok(bytes) => {
-                tokio::spawn(async move {
-                    store.write(key, bytes).await;
-                });
-            }
-            Err(e) => warn!("HeraDataActor: admit_block serialize: {e}"),
-        }
-
-        // 3. Metadata admission.
+        // Metadata admission.
         match self
             .multi_data_chain
             .admit_metadata(hash, height, parent_hash, author, epoch)
@@ -680,48 +672,83 @@ where
     }
 
     // -----------------------------------------------------------------------
-    // Request a missing data block point-to-point from its author, deduped.
+    // Request a missing data block, with retry + holder→broadcast escalation.
     // -----------------------------------------------------------------------
 
+    /// Fetch a missing data block. `holder` is who to ask — by invariant (2),
+    /// the node that handed us the reference (DataPropose/DataResponse sender, or
+    /// the sig-proposal sender), which provably holds it by invariant (1). First
+    /// attempt is a unicast to `holder` (cheapest). If unanswered for
+    /// `DATA_REQ_RETRY` — message lost, or `holder` itself crashed — the retry
+    /// escalates to a BROADCAST so any live peer holding the block answers. Never
+    /// targets the original author (which may be the crashed node). The data
+    /// plane is reliable + ack-gated (low volume), so the rare broadcast is cheap.
     pub async fn request_data(
         &mut self,
         target_hash: DataBlockHash<Tx>,
-        author: Id,
+        holder: Id,
     ) where
         Tx: Clone + Serialize,
     {
-        // Already admitted — nothing to fetch (avoids requesting a block we hold;
-        // the gate's notify_read will resolve from the buffered block directly).
+        // Already admitted — nothing to fetch (gate resolves from the buffered
+        // block directly). Clear any stale pending entry.
         if self.block_store.contains_key(&target_hash) {
+            self.pending_data_requests.remove(&target_hash);
             return;
         }
-        // Dedup WITHOUT inserting yet: mark pending only on a successful send, so
-        // a send that fails (peer not in map) is retried on the next grace-tick
-        // hint instead of being pinned forever by the dedup set.
-        if self.pending_data_requests.contains(&target_hash) {
-            return; // already outstanding (reliable delivery in progress)
-        }
+
+        let now = std::time::Instant::now();
+        let escalate = match self.pending_data_requests.get(&target_hash) {
+            // Requested recently — wait for the in-flight reply.
+            Some(&last) if now.duration_since(last) < DATA_REQ_RETRY => return,
+            // Requested before but unanswered past the retry window — escalate
+            // to a broadcast (author may be dead / message lost).
+            Some(_) => true,
+            // First attempt — unicast to the author.
+            None => false,
+        };
+
         let msg = HeraMsg::<Tx>::DataRequest {
             target_hash: target_hash.clone(),
             source: self.my_id,
         };
-        match bincode::serialize(&msg) {
-            Ok(bytes) => match self.data_net.send(author, Bytes::from(bytes)).await {
-                Ok(_handler) => {
-                    // Reliable delivery in progress — dedup until the block lands.
-                    // Drop the ACK handler (we don't gate catch-up on it).
-                    self.pending_data_requests.insert(target_hash);
-                }
-                Err(e) => {
-                    debug!(
-                        "HeraDataActor: DataRequest to author {} not sent ({e}); \
-                         will retry on next grace tick: {:?}",
-                        author, target_hash
-                    );
-                }
-            },
-            Err(e) => warn!("HeraDataActor: serialize DataRequest: {e}"),
+        let bytes = match bincode::serialize(&msg) {
+            Ok(b) => Bytes::from(b),
+            Err(e) => {
+                warn!("HeraDataActor: serialize DataRequest: {e}");
+                return;
+            }
+        };
+
+        if escalate {
+            // Broadcast to every peer; a live holder (incl. the attestation's
+            // proposer) answers even if `holder` crashed.
+            let _ = self.data_net.broadcast(&self.broadcast_peers, bytes).await;
+            debug!(
+                "HeraDataActor: DataRequest ESCALATED to broadcast (holder {} unanswered) {:?}",
+                holder, target_hash
+            );
+        } else if let Err(e) = self.data_net.send(holder, bytes).await {
+            // Targeted send failed outright (holder not connected); broadcast now.
+            let _ = self
+                .data_net
+                .broadcast(
+                    &self.broadcast_peers,
+                    Bytes::from(
+                        bincode::serialize(&HeraMsg::<Tx>::DataRequest {
+                            target_hash: target_hash.clone(),
+                            source: self.my_id,
+                        })
+                        .unwrap_or_default(),
+                    ),
+                )
+                .await;
+            debug!(
+                "HeraDataActor: DataRequest to holder {} failed ({e}); broadcast fallback {:?}",
+                holder, target_hash
+            );
         }
+        self.pending_data_requests.insert(target_hash, now);
     }
 
     // -----------------------------------------------------------------------
