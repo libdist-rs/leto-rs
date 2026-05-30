@@ -620,6 +620,7 @@ where
             data_net,
             n_minus_t: num_nodes.saturating_sub(num_faults),
             can_propose: true,
+            paused_by_cap: false,
             acks_for_current: 0,
             awaiting_acks: FuturesUnordered::new(),
             _exit_placeholder: None,

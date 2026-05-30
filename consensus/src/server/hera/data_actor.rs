@@ -139,6 +139,11 @@ pub struct HeraDataActor<Tx> {
     /// True when the previous self-proposed block has been received by >= n-f
     /// nodes (or there is no outstanding block). Gates `on_self_propose`.
     pub can_propose: bool,
+    /// True when self-production was paused because the chain-lead cap fired
+    /// (my_height - committed >= max_chain_lead). The batcher's `proposed`
+    /// flag is left set; we re-prime it (NewRound) once commit advances and
+    /// the cap releases — NOT immediately (that would spin/drop in a loop).
+    pub paused_by_cap: bool,
     /// Count of peer ACKs collected for the current outstanding block.
     pub acks_for_current: usize,
     /// CancelHandlers (ACK oneshots) for the current outstanding block; each
@@ -402,6 +407,12 @@ where
                 "HeraDataActor: chain-lead cap: my_height={} committed={} lead={} >= max={}, dropping batch",
                 self.my_height, committed_height, lead, self.max_chain_lead
             );
+            // Mark production paused. We deliberately do NOT re-prime the
+            // batcher here (that would spin: propose -> cap -> drop -> repeat).
+            // on_commit_emit re-primes once commit pulls `lead` back under the
+            // cap. Without this flag the batcher's `proposed` stays true and
+            // production deadlocks the same way the empty-batch path did.
+            self.paused_by_cap = true;
             return Ok(());
         }
 
@@ -931,6 +942,22 @@ where
             if author == self.my_id {
                 self.my_committed_height_atomic
                     .store(to_height, AOrdering::Relaxed);
+                // Cap-release re-prime: if self-production was paused by the
+                // chain-lead cap and commit has now pulled `lead` back under
+                // the cap, re-prime the batcher exactly once so production
+                // resumes (the batcher's `proposed` flag is still set from the
+                // dropped batch).
+                if self.paused_by_cap
+                    && self.my_height.saturating_sub(to_height) < self.max_chain_lead
+                {
+                    self.paused_by_cap = false;
+                    let _ = self
+                        .tx_consensus_to_batcher
+                        .send(BatcherConsensusMsg::NewRound {
+                            leader: self.my_id,
+                            round: self.my_height + 1,
+                        });
+                }
             }
         }
 
