@@ -372,6 +372,20 @@ where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
     {
         if batch.payload.is_empty() {
+            // Re-prime the batcher even for an empty batch. The batcher's
+            // timer can emit an empty batch during a tx lull; it sets the
+            // batcher's `proposed` flag true and waits for a NewRound to
+            // clear it. If we just drop the empty batch without re-priming,
+            // `proposed` stays true forever and this node's data production
+            // DEADLOCKS (no further batches emitted). At high n the per-node
+            // tx rate is low, so empty timer-batches are common — this was
+            // the n=61 production freeze.
+            let _ = self
+                .tx_consensus_to_batcher
+                .send(BatcherConsensusMsg::NewRound {
+                    leader: self.my_id,
+                    round: self.my_height + 1,
+                });
             return Ok(());
         }
 
