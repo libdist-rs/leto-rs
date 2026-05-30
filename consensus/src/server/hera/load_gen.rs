@@ -61,6 +61,7 @@ pub fn spawn<Tx, F>(
             let height = my_height.load(Ordering::Relaxed);
             let committed = my_committed_height.load(Ordering::Relaxed);
             if height.saturating_sub(committed) >= max_chain_lead {
+                crate::server::hera::core::LG_WINDOWS_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
 
@@ -68,6 +69,7 @@ pub fn spawn<Tx, F>(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
+            let mut sent_this_window: u64 = 0;
             for _ in 0..txs_per_100ms {
                 let tx = make_tx(my_id, nonce, now_ns);
                 let size = bincode::serialized_size(&tx).unwrap_or(0) as usize;
@@ -75,7 +77,9 @@ pub fn spawn<Tx, F>(
                     return; // channel closed — server shutting down
                 }
                 nonce += 1;
+                sent_this_window += 1;
             }
+            crate::server::hera::core::LG_TXS_SENT.fetch_add(sent_this_window, Ordering::Relaxed);
         }
     });
 }

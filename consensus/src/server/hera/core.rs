@@ -112,6 +112,55 @@ pub(crate) static DP_ATTEST_LAG_SUM: AtomicU64 = AtomicU64::new(0);
 pub(crate) static DP_ATTEST_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
+// DA_BRANCHES: per-select-branch fire counters (data actor).
+// Updated by HeraDataActor::run(); read by the 2-s monitor task.
+// ---------------------------------------------------------------------------
+/// Branch 1: rx_commit_emit fires (low-vol, liveness-critical).
+pub(crate) static DA_BR_COMMIT: AtomicU64 = AtomicU64::new(0);
+/// Branch 2: rx_fetch_hint fires.
+pub(crate) static DA_BR_HINT: AtomicU64 = AtomicU64::new(0);
+/// Branch 3: awaiting_acks.next() fires (ack gate).
+pub(crate) static DA_BR_ACK: AtomicU64 = AtomicU64::new(0);
+/// Branch 4: rx_data_batch fires (self-propose — the stall suspect).
+pub(crate) static DA_BR_SELF_PROPOSE: AtomicU64 = AtomicU64::new(0);
+/// Branch 5: rx_verified_blocks recv_many fires.
+pub(crate) static DA_BR_INBOUND: AtomicU64 = AtomicU64::new(0);
+/// Branch 6: bench_emit_interval tick fires.
+pub(crate) static DA_BR_BENCH: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// DA_PIPE: data-actor pipeline health counters.
+// ---------------------------------------------------------------------------
+/// Cumulative blocks drained from rx_verified_blocks (sum of recv_many counts).
+pub(crate) static DA_INBOUND_BLOCKS_DRAINED: AtomicU64 = AtomicU64::new(0);
+/// Cumulative times on_self_propose was entered but the chain-lead cap fired
+/// (batch dropped because lead >= max_chain_lead).
+pub(crate) static DA_LEAD_CAP_DROPS: AtomicU64 = AtomicU64::new(0);
+/// Cumulative microseconds spent inside on_commit_emit (Branch 1 wall-time).
+pub(crate) static DA_COMMIT_US: AtomicU64 = AtomicU64::new(0);
+/// Monotone ns timestamp of the last time on_self_propose ran to completion
+/// (block actually produced). 0 = never. Written with Relaxed; used for
+/// stall detection in the bench tick (delta since last self-propose).
+pub(crate) static DA_LAST_SELF_PROPOSE_NS: AtomicU64 = AtomicU64::new(0);
+/// Cumulative nanoseconds can_propose was False at the start of each loop
+/// iteration where branch 4 was evaluated but skipped (ack-gate wait time
+/// proxy). Incremented only in the bench tick using a local accumulator so
+/// overhead is zero on the hot path.
+pub(crate) static DA_CAN_PROPOSE_FALSE_NS: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
+// DA_PIPE: load-gen + batcher pipeline counters.
+// Updated by load_gen::spawn task and RRBatcher; read by monitor task.
+// ---------------------------------------------------------------------------
+/// Cumulative txs the load generator successfully sent into the batcher
+/// channel.
+pub(crate) static LG_TXS_SENT: AtomicU64 = AtomicU64::new(0);
+/// Cumulative 100-ms windows the load generator SKIPPED (chain-lead gate).
+pub(crate) static LG_WINDOWS_SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// Cumulative batches the RRBatcher emitted into rx_data_batch.
+pub(crate) static RRB_BATCHES_EMITTED: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
 // Type aliases
 // ---------------------------------------------------------------------------
 
@@ -750,6 +799,21 @@ where
                 let mut prev_commit_tx: u64 = 0;
                 let mut prev_attest_lag: u64 = 0;
                 let mut prev_attest_cnt: u64 = 0;
+                // DA_BRANCHES previous values.
+                let mut prev_da_br_commit: u64 = 0;
+                let mut prev_da_br_hint: u64 = 0;
+                let mut prev_da_br_ack: u64 = 0;
+                let mut prev_da_br_self_propose: u64 = 0;
+                let mut prev_da_br_inbound: u64 = 0;
+                let mut prev_da_br_bench: u64 = 0;
+                // DA_PIPE previous values.
+                let mut prev_da_inbound_drained: u64 = 0;
+                let mut prev_da_lead_cap_drops: u64 = 0;
+                let mut prev_da_commit_us: u64 = 0;
+                // LG / RRB previous values.
+                let mut prev_lg_txs_sent: u64 = 0;
+                let mut prev_lg_windows_skipped: u64 = 0;
+                let mut prev_rrb_batches: u64 = 0;
                 loop {
                     ticker.tick().await;
                     let sig_net = INFLIGHT_SIG_NET.load(AOrdering::Relaxed);
@@ -844,6 +908,93 @@ where
                         dattest_cnt,
                     );
 
+                    // --- DA_BRANCHES: per-select-branch fire rates ---
+                    let da_br_commit = DA_BR_COMMIT.load(AOrdering::Relaxed);
+                    let da_br_hint = DA_BR_HINT.load(AOrdering::Relaxed);
+                    let da_br_ack = DA_BR_ACK.load(AOrdering::Relaxed);
+                    let da_br_sp = DA_BR_SELF_PROPOSE.load(AOrdering::Relaxed);
+                    let da_br_inbound = DA_BR_INBOUND.load(AOrdering::Relaxed);
+                    let da_br_bench = DA_BR_BENCH.load(AOrdering::Relaxed);
+                    let dda_commit = da_br_commit.saturating_sub(prev_da_br_commit);
+                    let dda_hint = da_br_hint.saturating_sub(prev_da_br_hint);
+                    let dda_ack = da_br_ack.saturating_sub(prev_da_br_ack);
+                    let dda_sp = da_br_sp.saturating_sub(prev_da_br_self_propose);
+                    let dda_inbound = da_br_inbound.saturating_sub(prev_da_br_inbound);
+                    let dda_bench = da_br_bench.saturating_sub(prev_da_br_bench);
+
+                    // --- DA_PIPE: pipeline health ---
+                    let da_in_drained = DA_INBOUND_BLOCKS_DRAINED.load(AOrdering::Relaxed);
+                    let da_lead_drops = DA_LEAD_CAP_DROPS.load(AOrdering::Relaxed);
+                    let da_commit_us = DA_COMMIT_US.load(AOrdering::Relaxed);
+                    let da_last_sp_ns = DA_LAST_SELF_PROPOSE_NS.load(AOrdering::Relaxed);
+                    let dda_in_drained = da_in_drained.saturating_sub(prev_da_inbound_drained);
+                    let dda_lead_drops = da_lead_drops.saturating_sub(prev_da_lead_cap_drops);
+                    let dda_commit_us = da_commit_us.saturating_sub(prev_da_commit_us);
+
+                    // Time since last self-propose (0 if never ran).
+                    let stall_since_ms: i64 = if da_last_sp_ns > 0 {
+                        let now_ns = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0);
+                        (now_ns.saturating_sub(da_last_sp_ns) / 1_000_000) as i64
+                    } else {
+                        -1 // never produced
+                    };
+
+                    // Avg blocks per inbound recv_many call.
+                    let avg_inbound_drain = if dda_inbound > 0 {
+                        dda_in_drained as f64 / dda_inbound as f64
+                    } else {
+                        0.0
+                    };
+                    // Fraction of wall-time Branch 1 consumed (us spent / interval_us).
+                    let commit_wall_pct = dda_commit_us as f64 / (interval_s * 1_000_000.0) * 100.0;
+
+                    eprintln!(
+                        "DA_BRANCHES: node={} \
+                         commit/s={:.1} hint/s={:.1} ack/s={:.1} \
+                         self_propose/s={:.1} inbound/s={:.1} bench/s={:.1}",
+                        my_id,
+                        dda_commit as f64 / interval_s,
+                        dda_hint as f64 / interval_s,
+                        dda_ack as f64 / interval_s,
+                        dda_sp as f64 / interval_s,
+                        dda_inbound as f64 / interval_s,
+                        dda_bench as f64 / interval_s,
+                    );
+                    eprintln!(
+                        "DA_PIPE: node={} \
+                         inbound_blk/s={:.1} avg_drain_per_call={:.1} \
+                         lead_cap_drops/s={:.1} \
+                         commit_wall_pct={:.1} commit_us/s={:.0} \
+                         stall_since_ms={}",
+                        my_id,
+                        dda_in_drained as f64 / interval_s,
+                        avg_inbound_drain,
+                        dda_lead_drops as f64 / interval_s,
+                        commit_wall_pct,
+                        dda_commit_us as f64 / interval_s,
+                        stall_since_ms,
+                    );
+
+                    // --- LG + RRB: upstream pipeline ---
+                    let lg_sent = LG_TXS_SENT.load(AOrdering::Relaxed);
+                    let lg_skipped = LG_WINDOWS_SKIPPED.load(AOrdering::Relaxed);
+                    let rrb_batches = RRB_BATCHES_EMITTED.load(AOrdering::Relaxed);
+                    let dlg_sent = lg_sent.saturating_sub(prev_lg_txs_sent);
+                    let dlg_skipped = lg_skipped.saturating_sub(prev_lg_windows_skipped);
+                    let drrb = rrb_batches.saturating_sub(prev_rrb_batches);
+                    eprintln!(
+                        "DA_PIPE_UP: node={} \
+                         lg_tx_sent/s={:.1} lg_windows_skipped/s={:.1} \
+                         rrb_batches_emitted/s={:.1}",
+                        my_id,
+                        dlg_sent as f64 / interval_s,
+                        dlg_skipped as f64 / interval_s,
+                        drrb as f64 / interval_s,
+                    );
+
                     prev_blk_prod = blk_prod;
                     prev_tx_prod = tx_prod;
                     prev_blk_recv = blk_recv;
@@ -853,6 +1004,18 @@ where
                     prev_commit_tx = commit_tx;
                     prev_attest_lag = attest_lag;
                     prev_attest_cnt = attest_cnt;
+                    prev_da_br_commit = da_br_commit;
+                    prev_da_br_hint = da_br_hint;
+                    prev_da_br_ack = da_br_ack;
+                    prev_da_br_self_propose = da_br_sp;
+                    prev_da_br_inbound = da_br_inbound;
+                    prev_da_br_bench = da_br_bench;
+                    prev_da_inbound_drained = da_in_drained;
+                    prev_da_lead_cap_drops = da_lead_drops;
+                    prev_da_commit_us = da_commit_us;
+                    prev_lg_txs_sent = lg_sent;
+                    prev_lg_windows_skipped = lg_skipped;
+                    prev_rrb_batches = rrb_batches;
                 }
             });
         }

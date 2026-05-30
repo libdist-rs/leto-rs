@@ -258,12 +258,17 @@ where
 
                 // 1. Commit emission from consensus (low-volume, liveness-critical).
                 commit = self.rx_commit_emit.recv() => {
+                    crate::server::hera::core::DA_BR_COMMIT.fetch_add(1, AOrdering::Relaxed);
                     let commit = commit.ok_or_else(|| anyhow!("rx_commit_emit closed"))?;
+                    let t0 = std::time::Instant::now();
                     self.on_commit_emit(commit);
+                    let elapsed_us = t0.elapsed().as_micros() as u64;
+                    crate::server::hera::core::DA_COMMIT_US.fetch_add(elapsed_us, AOrdering::Relaxed);
                 }
 
                 // 2. Fetch hint from consensus (fire-and-forget).
                 hint = self.rx_fetch_hint.recv() => {
+                    crate::server::hera::core::DA_BR_HINT.fetch_add(1, AOrdering::Relaxed);
                     let (hash, author) = hint.ok_or_else(|| anyhow!("rx_fetch_hint closed"))?;
                     self.request_data(hash, author).await;
                 }
@@ -273,6 +278,7 @@ where
                 //    the self-propose gate. Polled above self-propose so the gate
                 //    opens promptly. Disabled when no block is outstanding.
                 ack = self.awaiting_acks.next(), if !self.awaiting_acks.is_empty() => {
+                    crate::server::hera::core::DA_BR_ACK.fetch_add(1, AOrdering::Relaxed);
                     if matches!(ack, Some(Ok(Ok(_)))) {
                         self.acks_for_current += 1;
                         // self counts as 1, so n-f-1 peer ACKs suffice.
@@ -286,6 +292,7 @@ where
                 // 4. Self-propose batch — gated: only when the previous block has
                 //    been received by >= n-f nodes (window = 1).
                 batch = self.rx_data_batch.recv(), if self.can_propose => {
+                    crate::server::hera::core::DA_BR_SELF_PROPOSE.fetch_add(1, AOrdering::Relaxed);
                     let batch = batch.ok_or_else(|| anyhow!("rx_data_batch closed"))?;
                     if let Err(e) = self.on_self_propose(batch).await {
                         error!("HeraDataActor: on_self_propose: {e}");
@@ -294,9 +301,12 @@ where
 
                 // 5. Verified data blocks — last, drained in batches (bounded budget).
                 n = self.rx_verified_blocks.recv_many(&mut data_buf, DATA_DRAIN_BUDGET) => {
+                    crate::server::hera::core::DA_BR_INBOUND.fetch_add(1, AOrdering::Relaxed);
                     if n == 0 {
                         return Err(anyhow!("rx_verified_blocks closed"));
                     }
+                    crate::server::hera::core::DA_INBOUND_BLOCKS_DRAINED
+                        .fetch_add(n as u64, AOrdering::Relaxed);
                     for msg in data_buf.drain(..) {
                         if let Err(e) = self.dispatch_data(msg).await {
                             error!("HeraDataActor: dispatch_data: {e}");
@@ -306,6 +316,7 @@ where
 
                 // DP[Throughput] + DP[Latency] emission.
                 _ = self.bench_emit_interval.tick(), if self.emit_dp => {
+                    crate::server::hera::core::DA_BR_BENCH.fetch_add(1, AOrdering::Relaxed);
                     eprintln!(
                         "DP[Throughput]: {}",
                         self.committed_tx_count as f64 / self.bench_emit_window_secs
@@ -372,6 +383,7 @@ where
         let committed_height = self.multi_data_chain.committed_height(self.my_id);
         let lead = self.my_height.saturating_sub(committed_height);
         if lead >= self.max_chain_lead {
+            crate::server::hera::core::DA_LEAD_CAP_DROPS.fetch_add(1, AOrdering::Relaxed);
             debug!(
                 "HeraDataActor: chain-lead cap: my_height={} committed={} lead={} >= max={}, dropping batch",
                 self.my_height, committed_height, lead, self.max_chain_lead
@@ -420,6 +432,14 @@ where
         let tx_count = block.envelope.payload.len() as u64;
         crate::server::hera::core::DP_BLOCKS_PRODUCED.fetch_add(1, AOrdering::Relaxed);
         crate::server::hera::core::DP_TXS_PRODUCED.fetch_add(tx_count, AOrdering::Relaxed);
+        // Record wall-clock ns of last successful self-propose (for stall detection).
+        {
+            let now_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            crate::server::hera::core::DA_LAST_SELF_PROPOSE_NS.store(now_ns, AOrdering::Relaxed);
+        }
 
         // Prime batcher for next block.
         let _ = self
