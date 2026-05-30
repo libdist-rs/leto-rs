@@ -109,8 +109,31 @@ where
         let genesis_element = Arc::new(SigElement::<Tx>::genesis(START_ID));
         let genesis_hash = Hash::ser_and_hash(genesis_element.as_ref());
 
+        // Commit quorum: minimum unique proposers in the sliding window required
+        // to commit a sig-chain element.  The safety-correct formula is
+        // (n+f+1)/2.  HERA_COMMIT_LEN overrides this for EXPERIMENTS ONLY
+        // (e.g. testing larger windows to understand commit-rate sensitivity).
+        // DEFAULT = (n+f+1)/2.  Clamped to [1, n].  Values below (n+f+1)/2 are
+        // unsafe; the env override is deliberately unclamped below the safety
+        // threshold so the user can run controlled experiments. Do NOT set this
+        // in production.
         #[allow(clippy::manual_div_ceil)]
-        let commit_len = (num_nodes + num_faults + 1) / 2;
+        let safety_commit_len = (num_nodes + num_faults + 1) / 2;
+        let commit_len: usize = std::env::var("HERA_COMMIT_LEN")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|v| v.max(1).min(num_nodes))
+            .unwrap_or(safety_commit_len);
+        if commit_len != safety_commit_len {
+            log::warn!(
+                "Hera commit: HERA_COMMIT_LEN={} overrides safety formula {} \
+                 (n={} f={}) — EXPERIMENTS ONLY, not safe in production",
+                commit_len,
+                safety_commit_len,
+                num_nodes,
+                num_faults,
+            );
+        }
 
         let mut highest_committed_element = genesis_element.clone();
         let mut highest_committed_hash = genesis_hash.clone();

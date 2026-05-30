@@ -81,6 +81,37 @@ pub(crate) static BACKFILL_REQUESTS: AtomicI64 = AtomicI64::new(0);
 pub(crate) static BACKFILL_RESPONSES: AtomicI64 = AtomicI64::new(0);
 
 // ---------------------------------------------------------------------------
+// DATA-PLANE PROFILE COUNTERS
+// These are updated by the data actor and read by the CHANDEPTH monitor task.
+// All counters are global (process-wide); in the stress-test harness each node
+// runs in its own process so there is no aliasing.
+//
+// DP_BLOCKS_PRODUCED  — cumulative data blocks self-proposed (my_height tip).
+// DP_TXS_PRODUCED     — cumulative txs batched into self-proposed blocks.
+// DP_BLOCKS_RECEIVED  — cumulative data blocks received + admitted (peer
+// DataPropose/DataResponse). DP_VERIFY_CALLS     — cumulative
+// verify_data_block_sig calls (in pump task). DP_VERIFY_SLOW      — cumulative
+// calls that took > 200 µs (saturation proxy). DP_HEAD_PUBS        — cumulative
+// ArcSwap head_snapshot publications (per-author head updates).
+// DP_COMMIT_EVENTS    — cumulative commit-emit events (rx_commit_emit drains).
+// DP_COMMIT_TXS       — cumulative txs emitted via on_commit_emit.
+// DP_ATTEST_LAG_SUM   — cumulative sum of (local_head - attested_head)
+// per-author per proposal. DP_ATTEST_COUNT     — cumulative proposals for which
+// attest lag was measured.
+// ---------------------------------------------------------------------------
+use std::sync::atomic::AtomicU64;
+pub(crate) static DP_BLOCKS_PRODUCED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DP_TXS_PRODUCED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DP_BLOCKS_RECEIVED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DP_VERIFY_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DP_VERIFY_SLOW: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DP_HEAD_PUBS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DP_COMMIT_EVENTS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DP_COMMIT_TXS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DP_ATTEST_LAG_SUM: AtomicU64 = AtomicU64::new(0);
+pub(crate) static DP_ATTEST_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// ---------------------------------------------------------------------------
 // Type aliases
 // ---------------------------------------------------------------------------
 
@@ -696,10 +727,29 @@ where
         // delivered even to late-connecting peers.
 
         // PROFILE INSTRUMENTATION: independent monitor task.
+        // Ticks every 2 s and emits two log lines:
+        //   CHANDEPTH — sig-plane channel depths + backfill gaps (existing)
+        //   DP_PROFILE — data-plane production/admission/commit/attest-lag rates
+        // Rates are computed as deltas over the 2 s window (divide by interval_s
+        // to get per-second rates). All reads are Relaxed; the monitor only reads.
         {
             let my_id = self.my_id;
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_millis(250));
+                // 2-second tick keeps the log volume low (~30 lines/min per node).
+                let interval_ms: u64 = 2_000;
+                let interval_s = interval_ms as f64 / 1_000.0;
+                let mut ticker =
+                    tokio::time::interval(std::time::Duration::from_millis(interval_ms));
+                // Shadow-previous values for delta computation.
+                let mut prev_blk_prod: u64 = 0;
+                let mut prev_tx_prod: u64 = 0;
+                let mut prev_blk_recv: u64 = 0;
+                let mut prev_verify: u64 = 0;
+                let mut prev_head_pubs: u64 = 0;
+                let mut prev_commit_ev: u64 = 0;
+                let mut prev_commit_tx: u64 = 0;
+                let mut prev_attest_lag: u64 = 0;
+                let mut prev_attest_cnt: u64 = 0;
                 loop {
                     ticker.tick().await;
                     let sig_net = INFLIGHT_SIG_NET.load(AOrdering::Relaxed);
@@ -736,6 +786,73 @@ where
                         bf_req - bf_resp,
                         rss_kb,
                     );
+
+                    // --- Data-plane profile snapshot ---
+                    let blk_prod = DP_BLOCKS_PRODUCED.load(AOrdering::Relaxed);
+                    let tx_prod = DP_TXS_PRODUCED.load(AOrdering::Relaxed);
+                    let blk_recv = DP_BLOCKS_RECEIVED.load(AOrdering::Relaxed);
+                    let verify = DP_VERIFY_CALLS.load(AOrdering::Relaxed);
+                    let verify_slow = DP_VERIFY_SLOW.load(AOrdering::Relaxed);
+                    let head_pubs = DP_HEAD_PUBS.load(AOrdering::Relaxed);
+                    let commit_ev = DP_COMMIT_EVENTS.load(AOrdering::Relaxed);
+                    let commit_tx = DP_COMMIT_TXS.load(AOrdering::Relaxed);
+                    let attest_lag = DP_ATTEST_LAG_SUM.load(AOrdering::Relaxed);
+                    let attest_cnt = DP_ATTEST_COUNT.load(AOrdering::Relaxed);
+
+                    // Rates over the last interval.
+                    let dblk_prod = blk_prod.saturating_sub(prev_blk_prod);
+                    let dtx_prod = tx_prod.saturating_sub(prev_tx_prod);
+                    let dblk_recv = blk_recv.saturating_sub(prev_blk_recv);
+                    let dverify = verify.saturating_sub(prev_verify);
+                    let dhead = head_pubs.saturating_sub(prev_head_pubs);
+                    let dcommit_ev = commit_ev.saturating_sub(prev_commit_ev);
+                    let dcommit_tx = commit_tx.saturating_sub(prev_commit_tx);
+                    let dattest_lag = attest_lag.saturating_sub(prev_attest_lag);
+                    let dattest_cnt = attest_cnt.saturating_sub(prev_attest_cnt);
+
+                    // Average attest-lag per proposal over this window.
+                    let avg_attest_lag = if dattest_cnt > 0 {
+                        dattest_lag as f64 / dattest_cnt as f64
+                    } else {
+                        0.0
+                    };
+                    // Average txs emitted per commit event.
+                    let avg_tx_per_commit = if dcommit_ev > 0 {
+                        dcommit_tx as f64 / dcommit_ev as f64
+                    } else {
+                        0.0
+                    };
+
+                    eprintln!(
+                        "DP_PROFILE: node={} \
+                         blk_prod/s={:.1} tx_prod/s={:.1} \
+                         blk_recv/s={:.1} verify/s={:.1} verify_slow_cum={} \
+                         head_pub/s={:.1} \
+                         commit_ev/s={:.1} commit_tx/s={:.1} avg_tx_per_commit={:.1} \
+                         attest_lag_avg={:.1} attest_proposals={}",
+                        my_id,
+                        dblk_prod as f64 / interval_s,
+                        dtx_prod as f64 / interval_s,
+                        dblk_recv as f64 / interval_s,
+                        dverify as f64 / interval_s,
+                        verify_slow,
+                        dhead as f64 / interval_s,
+                        dcommit_ev as f64 / interval_s,
+                        dcommit_tx as f64 / interval_s,
+                        avg_tx_per_commit,
+                        avg_attest_lag,
+                        dattest_cnt,
+                    );
+
+                    prev_blk_prod = blk_prod;
+                    prev_tx_prod = tx_prod;
+                    prev_blk_recv = blk_recv;
+                    prev_verify = verify;
+                    prev_head_pubs = head_pubs;
+                    prev_commit_ev = commit_ev;
+                    prev_commit_tx = commit_tx;
+                    prev_attest_lag = attest_lag;
+                    prev_attest_cnt = attest_cnt;
                 }
             });
         }
@@ -1105,6 +1222,10 @@ impl<Tx> std::fmt::Debug for Hera<Tx> {
 
 /// Verify a DataBlock's author signature. Used in the data-plane inbound pump
 /// task (off the actor loop) so verification parallelizes across peers/cores.
+///
+/// Instrumentation: increments DP_VERIFY_CALLS on every call and DP_VERIFY_SLOW
+/// when the verify takes > 200 µs (a proxy for CPU saturation in the pump
+/// task).
 fn verify_data_block_sig<Tx>(
     crypto_system: &KeyConfig,
     block: &crate::types::DataBlock<Tx>,
@@ -1112,11 +1233,20 @@ fn verify_data_block_sig<Tx>(
 where
     Tx: serde::Serialize + Clone,
 {
+    let t0 = Instant::now();
     let author = block.sig.signer;
     let pk = match crypto_system.system.get(&author) {
         Some(pk) => pk,
-        None => return false,
+        None => {
+            DP_VERIFY_CALLS.fetch_add(1, AOrdering::Relaxed);
+            return false;
+        }
     };
     let env_hash = block.hash();
-    pk.verify(env_hash.as_ref(), &block.sig.raw)
+    let ok = pk.verify(env_hash.as_ref(), &block.sig.raw);
+    DP_VERIFY_CALLS.fetch_add(1, AOrdering::Relaxed);
+    if t0.elapsed().as_micros() > 200 {
+        DP_VERIFY_SLOW.fetch_add(1, AOrdering::Relaxed);
+    }
+    ok
 }

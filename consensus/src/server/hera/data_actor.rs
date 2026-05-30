@@ -317,11 +317,19 @@ where
                         eprintln!("DP[Latency]: {}", median_ms);
                         self.latency_samples_ms.clear();
                     }
+                    let committed_h = self.multi_data_chain.committed_height(self.my_id);
+                    let lead = self.my_height.saturating_sub(committed_h);
                     // Liveness/flow telemetry: inbound queue depth, n-f ack-gate
                     // state (can_propose + acks collected for the outstanding
                     // block), outstanding refetches, and resident block bodies.
+                    // Also emits production/commit head state so stale-head
+                    // hypothesis (chain-lead cap or commit lag) is visible.
                     info!(
-                        "HeraDataActor: inbound_depth={} can_propose={} acks={}/{} pending_reqs={} block_store={}",
+                        "HeraDataActor: my_height={} committed_height={} lead={} \
+                         inbound_depth={} can_propose={} acks={}/{} pending_reqs={} block_store={}",
+                        self.my_height,
+                        committed_h,
+                        lead,
                         self.rx_verified_blocks.len(),
                         self.can_propose,
                         self.acks_for_current,
@@ -407,6 +415,11 @@ where
         self.my_height_atomic
             .store(self.my_height, AOrdering::Relaxed);
         self.my_last_hash = Some(block.hash().clone());
+
+        // DP_PROFILE instrumentation: count produced blocks + txs.
+        let tx_count = block.envelope.payload.len() as u64;
+        crate::server::hera::core::DP_BLOCKS_PRODUCED.fetch_add(1, AOrdering::Relaxed);
+        crate::server::hera::core::DP_TXS_PRODUCED.fetch_add(tx_count, AOrdering::Relaxed);
 
         // Prime batcher for next block.
         let _ = self
@@ -521,6 +534,12 @@ where
             author,
             block_epoch,
         );
+
+        // DP_PROFILE: count admitted peer blocks (Extended or Bridge → not
+        // parked/dup/invalid).
+        if missing_parent.is_none() {
+            crate::server::hera::core::DP_BLOCKS_RECEIVED.fetch_add(1, AOrdering::Relaxed);
+        }
 
         if let Some(missing_hash) = missing_parent {
             // Request-from-sender (inv. 2): the node that sent us this block has
@@ -676,13 +695,14 @@ where
     // -----------------------------------------------------------------------
 
     /// Fetch a missing data block. `holder` is who to ask — by invariant (2),
-    /// the node that handed us the reference (DataPropose/DataResponse sender, or
-    /// the sig-proposal sender), which provably holds it by invariant (1). First
-    /// attempt is a unicast to `holder` (cheapest). If unanswered for
-    /// `DATA_REQ_RETRY` — message lost, or `holder` itself crashed — the retry
-    /// escalates to a BROADCAST so any live peer holding the block answers. Never
-    /// targets the original author (which may be the crashed node). The data
-    /// plane is reliable + ack-gated (low volume), so the rare broadcast is cheap.
+    /// the node that handed us the reference (DataPropose/DataResponse sender,
+    /// or the sig-proposal sender), which provably holds it by invariant
+    /// (1). First attempt is a unicast to `holder` (cheapest). If
+    /// unanswered for `DATA_REQ_RETRY` — message lost, or `holder` itself
+    /// crashed — the retry escalates to a BROADCAST so any live peer
+    /// holding the block answers. Never targets the original author (which
+    /// may be the crashed node). The data plane is reliable + ack-gated
+    /// (low volume), so the rare broadcast is cheap.
     pub async fn request_data(
         &mut self,
         target_hash: DataBlockHash<Tx>,
@@ -792,9 +812,16 @@ where
                 .store(heads_len, std::sync::atomic::Ordering::Relaxed);
         }
 
+        // DP_PROFILE: count commit events.
+        crate::server::hera::core::DP_COMMIT_EVENTS.fetch_add(1, AOrdering::Relaxed);
+
         // Sort heads by author id for determinism.
         let mut sorted_heads = commit.heads.clone();
         sorted_heads.sort_by_key(|h| h.author);
+
+        // Accumulate per-commit-event totals for the DP_PROFILE log.
+        let mut commit_total_blocks: u64 = 0;
+        let mut commit_total_txs: u64 = 0;
 
         for head in &sorted_heads {
             let author = head.author;
@@ -813,8 +840,11 @@ where
                 to_height,
             );
 
+            commit_total_blocks += blocks.len() as u64;
+
             for block in &blocks {
                 let payload = Arc::clone(&block.envelope.payload);
+                commit_total_txs += payload.len() as u64;
                 if !payload.is_empty() {
                     if self.emit_dp {
                         self.committed_tx_count += payload.len() as u64;
@@ -870,8 +900,29 @@ where
             }
         }
 
-        // GC block_store every GC_EVERY_N_COMMITS commit events.
+        // DP_PROFILE: update global commit-tx counter.
+        crate::server::hera::core::DP_COMMIT_TXS.fetch_add(commit_total_txs, AOrdering::Relaxed);
+
+        // Throttled per-commit diagnostic: log every 256 commit events so the
+        // committed-data-per-sig-commit distribution is visible without
+        // spamming the log at 2000+ commits/s.
         self.commit_event_count += 1;
+        if self.commit_event_count % 256 == 0 {
+            let committed_h = self.multi_data_chain.committed_height(self.my_id);
+            debug!(
+                "HeraDataActor COMMIT_SAMPLE: event={} sig_round={} \
+                 heads={} blocks_walked={} txs_committed={} \
+                 my_committed_height={}",
+                self.commit_event_count,
+                commit.sig_round,
+                sorted_heads.len(),
+                commit_total_blocks,
+                commit_total_txs,
+                committed_h,
+            );
+        }
+
+        // GC block_store every GC_EVERY_N_COMMITS commit events.
         if self.commit_event_count % GC_EVERY_N_COMMITS == 0 {
             self.gc_block_store();
         }
