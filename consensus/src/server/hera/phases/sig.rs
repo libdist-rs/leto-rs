@@ -186,11 +186,12 @@ where
         match self.sig_chain_state.get_element(parent_hash.clone()).await {
             Ok(Some(_)) => {}
             Ok(None) => {
+                let our_highest = self.sig_chain_state.highest_chain().proposal.round();
+                let proposal_round = proposal.round();
                 info!(
-                    "Hera[n{}]: PARKED sig proposal round={} for missing parent (req from sender {})",
-                    self.my_id,
-                    proposal.round(),
-                    sender
+                    "Hera[n{}]: PARKED sig proposal round={} for missing parent \
+                     (req from sender {} our_highest={})",
+                    self.my_id, proposal_round, sender, our_highest
                 );
                 let parked = HeraMsg::SigPropose {
                     proposal: proposal.clone(),
@@ -202,7 +203,27 @@ where
                     .entry(parent_hash.clone())
                     .or_default()
                     .push(parked);
-                self.request_sig_element_from(parent_hash, sender).await?;
+                // If more than one element is missing, a ranged request
+                // fills the gap in one RTT; otherwise fall back to single.
+                let parent_round = proposal_round.saturating_sub(1);
+                if parent_round > our_highest + 1 {
+                    crate::server::hera::core::BACKFILL_REQUESTS.fetch_add(
+                        (parent_round - our_highest) as i64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    let msg = HeraMsg::<Tx>::SigElementRangeRequest {
+                        source: self.my_id,
+                        from_round: our_highest + 1,
+                        to_round: parent_round,
+                    };
+                    let bytes =
+                        bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
+                    if let Ok(h) = self.consensus_net.send(sender, bytes).await {
+                        self.push_cancel_handler(sender, h);
+                    }
+                } else {
+                    self.request_sig_element_from(parent_hash, sender).await?;
+                }
                 return Ok(());
             }
             Err(e) => {
@@ -388,6 +409,7 @@ where
 
         // Recurse if this element's own parent is missing (fills a gap chain).
         let parent_hash = element.proposal.block().parent_hash();
+        let element_round = element.proposal.round(); // capture before move
         let parent_present = matches!(
             self.sig_chain_state.get_element(parent_hash.clone()).await,
             Ok(Some(_))
@@ -398,7 +420,19 @@ where
             .await?;
 
         if !parent_present {
-            self.broadcast_sig_element_request(parent_hash).await?;
+            // The parent is missing. Rather than requesting one element at a
+            // time, request a range: from just above our current highest to
+            // the parent's round (parent_round = element_round - 1).
+            let our_highest = self.sig_chain_state.highest_chain().proposal.round();
+            let parent_round = element_round.saturating_sub(1);
+            if parent_round > our_highest + 1 {
+                // Multiple ancestors missing — use range request.
+                self.broadcast_sig_range_request(our_highest + 1, parent_round)
+                    .await?;
+            } else {
+                // At most one ancestor missing — single-element fallback.
+                self.broadcast_sig_element_request(parent_hash).await?;
+            }
         }
 
         self.drain_pending_sig_proposals(element_hash);
@@ -424,6 +458,146 @@ where
                 warn!("Hera: loopback channel closed; dropping parked sig proposal");
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Ranged sig-element backfill (O(1) RTT for a K-element gap).
+    // -----------------------------------------------------------------------
+
+    /// Broadcast a SigElementRangeRequest covering rounds `[from_round,
+    /// to_round]`. The first respondent that holds the range fills the gap;
+    /// subsequent responses are deduplicated by
+    /// `on_sig_element_range_response`.
+    pub(crate) async fn broadcast_sig_range_request(
+        &mut self,
+        from_round: crate::Round,
+        to_round: crate::Round,
+    ) -> Result<()>
+    where
+        Tx: Clone + Serialize,
+    {
+        if from_round > to_round {
+            return Ok(());
+        }
+        crate::server::hera::core::BACKFILL_REQUESTS.fetch_add(
+            (to_round - from_round + 1) as i64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let msg = HeraMsg::<Tx>::SigElementRangeRequest {
+            source: self.my_id,
+            from_round,
+            to_round,
+        };
+        let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
+        let peers = self.broadcast_peers.clone();
+        let results = self.consensus_net.broadcast(&peers, bytes).await;
+        for (peer, result) in peers.iter().zip(results.into_iter()) {
+            if let Ok(h) = result {
+                self.push_cancel_handler(*peer, h);
+            }
+        }
+        Ok(())
+    }
+
+    /// Serve a peer's SigElementRangeRequest. Walk backward from our
+    /// `highest_chain` collecting elements whose round is in `[from, to]`,
+    /// capped at `MAX_RANGE_RESPONSE`. Elements are sent in ascending round
+    /// order (ancestor-first) so the receiver can store them left-to-right
+    /// and satisfy parent-present checks.
+    pub async fn on_sig_element_range_request(
+        &mut self,
+        source: Id,
+        from_round: crate::Round,
+        to_round: crate::Round,
+    ) -> Result<()>
+    where
+        Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
+    {
+        use crate::server::hera::core::MAX_RANGE_RESPONSE;
+        let highest = self.sig_chain_state.highest_chain();
+        if highest.proposal.round() < from_round {
+            // We don't have anything in range; skip.
+            return Ok(());
+        }
+        let mut elements: Vec<crate::server::hera::core::SigElement<Tx>> = Vec::new();
+        let mut cur_hash = self.sig_chain_state.highest_hash();
+        let mut cur_element = highest;
+        loop {
+            let r = cur_element.proposal.round();
+            if r < from_round {
+                break;
+            }
+            if r <= to_round {
+                elements.push((*cur_element).clone());
+            }
+            if elements.len() >= MAX_RANGE_RESPONSE {
+                break;
+            }
+            if r == 0 {
+                break; // reached genesis
+            }
+            let parent_hash = cur_element.proposal.block().parent_hash();
+            if parent_hash == cur_hash {
+                break; // circular / genesis guard
+            }
+            cur_hash = parent_hash.clone();
+            match self.sig_chain_state.get_element(parent_hash).await {
+                Ok(Some(e)) => cur_element = Arc::new(e),
+                Ok(None) => break, // we don't have this ancestor
+                Err(_) => break,
+            }
+        }
+        if elements.is_empty() {
+            return Ok(());
+        }
+        // Reverse to ascending round order (ancestor-first).
+        elements.reverse();
+        let msg = HeraMsg::<Tx>::SigElementRangeResponse { elements };
+        let bytes = bytes::Bytes::from(bincode::serialize(&msg).map_err(anyhow::Error::new)?);
+        if let Ok(h) = self.consensus_net.send(source, bytes).await {
+            self.push_cancel_handler(source, h);
+        }
+        Ok(())
+    }
+
+    /// Admit a batch of sig-chain elements delivered by a
+    /// SigElementRangeResponse. Stores elements in the received order
+    /// (ancestor-first) so each element's parent is already stored when
+    /// the next one is written. Retries any proposals parked on elements
+    /// within the batch.
+    pub async fn on_sig_element_range_response(
+        &mut self,
+        elements: Vec<crate::server::hera::core::SigElement<Tx>>,
+    ) -> Result<()>
+    where
+        Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
+    {
+        crate::server::hera::core::BACKFILL_RESPONSES
+            .fetch_add(elements.len() as i64, std::sync::atomic::Ordering::Relaxed);
+        for element in elements {
+            let element_hash: crate::server::hera::core::SigElementHash<Tx> =
+                Hash::ser_and_hash(&element);
+            // Only store elements we want (parked on or explicitly requested)
+            // or that correspond to known gaps. Accept if: it's in pending
+            // proposals, we issued a request for it, or its round is ≤ our
+            // current round (covering catch-up range fills).
+            let cur_round = self.round_state.round();
+            let wanted = self.pending_sig_proposals.contains_key(&element_hash)
+                || self.pending_sig_element_requests.contains(&element_hash)
+                || element.proposal.round() <= cur_round;
+            if !wanted {
+                continue;
+            }
+            // Remove from pending requests if present.
+            self.pending_sig_element_requests.remove(&element_hash);
+            // Write to storage (idempotent: re-writing an existing element is a no-op).
+            self.sig_chain_state
+                .write_element(Arc::new(element))
+                .await?;
+            // Drain any proposals parked on this hash.
+            self.drain_pending_sig_proposals(element_hash);
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -590,14 +764,19 @@ where
         self.sig_chain_state.add_qc(blame_round, qc);
 
         // Forward catch-up of chain DATA: if the quorum's reported highest is
-        // ahead of ours, fetch that element (its ancestors recurse) so a node
-        // that missed agreements does not lack chain elements; its highest then
-        // advances as the fetched element's proposal is re-driven/agreed. The QC
-        // is broadcast and carries no single sender, so we broadcast the request
-        // (any holder answers — still "ask a holder", never the dead author).
-        if highest_round > self.sig_chain_state.highest_chain().proposal.round() {
+        // ahead of ours, fetch the missing range in a single round-trip rather
+        // than one-element-per-RTT. The gap is (our_highest+1 .. reported_highest).
+        let our_highest_round = self.sig_chain_state.highest_chain().proposal.round();
+        if highest_round > our_highest_round {
             if let Ok(None) = self.sig_chain_state.get_element(highest_hash.clone()).await {
-                self.broadcast_sig_element_request(highest_hash).await?;
+                if highest_round > our_highest_round + 1 {
+                    // Large gap: request the whole range at once.
+                    self.broadcast_sig_range_request(our_highest_round + 1, highest_round)
+                        .await?;
+                } else {
+                    // Small gap (1 element): fall back to single-element request.
+                    self.broadcast_sig_element_request(highest_hash).await?;
+                }
             }
         }
 

@@ -46,9 +46,10 @@ pub enum HeraMsg<Tx> {
     /// Hera: OnSignatureBlame — blame for the current sig-chain round.
     ///
     /// Carries the blamer's highest known sig-chain element so the next leader
-    /// can extend the true highest chain (it asks a blamer for the element if it
-    /// does not have it — request-from-sender). `highest_hash` is the element
-    /// hash; `highest_round` is that element's round (genesis = Round::MIN).
+    /// can extend the true highest chain (it asks a blamer for the element if
+    /// it does not have it — request-from-sender). `highest_hash` is the
+    /// element hash; `highest_round` is that element's round (genesis =
+    /// Round::MIN).
     SigBlame {
         round: Round,
         auth: Signature<Id, Round>,
@@ -60,7 +61,8 @@ pub enum HeraMsg<Tx> {
     ///
     /// Carries the maximum highest-chain reference among the quorum of blames
     /// that formed the QC, so a node that only receives the QC (did not collect
-    /// the individual blames) also learns which chain the new leader must extend.
+    /// the individual blames) also learns which chain the new leader must
+    /// extend.
     SigBlameQC {
         round: Round,
         qc: Certificate<Id, Round>,
@@ -84,6 +86,26 @@ pub enum HeraMsg<Tx> {
     },
     SigElementResponse {
         response: Response<Element<Id, MultiAttestation<Tx>, Round>>,
+    },
+
+    /// Hera: ranged sig-element catch-up request.
+    ///
+    /// The requester holds elements up to (but not including) `from_round` and
+    /// needs all elements up through `to_round` to close the gap.  The
+    /// responder returns up to `MAX_RANGE_RESPONSE` elements in ancestor-first
+    /// order (lowest round first) that it holds in the requested range.
+    SigElementRangeRequest {
+        source: Id,
+        from_round: Round,
+        to_round: Round,
+    },
+
+    /// Hera: response to a SigElementRangeRequest.
+    ///
+    /// Carries elements in ascending round order (lowest first) so the receiver
+    /// can store them in order and satisfy parent-present checks for each.
+    SigElementRangeResponse {
+        elements: Vec<Element<Id, MultiAttestation<Tx>, Round>>,
     },
 
     // -----------------------------------------------------------------------

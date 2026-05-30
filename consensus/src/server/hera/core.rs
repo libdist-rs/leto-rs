@@ -6,7 +6,8 @@
 ///
 /// ## Cross-plane edges (unbounded — sig-plane discipline, never drop)
 /// - `tx_fetch_hint` → data actor: (hash, holder) hint to fetch a missing block
-///   from `holder` (the sig-proposal sender — a guaranteed holder by invariant 1).
+///   from `holder` (the sig-proposal sender — a guaranteed holder by invariant
+///   1).
 /// - `tx_commit_emit` → data actor: committed `{author→height}` set.
 ///
 /// ## Agreement is decoupled from data availability (spec invariant 1)
@@ -15,7 +16,8 @@
 /// blocks locally. We fire non-blocking fetch-from-sender hints for referenced
 /// heads (so the data is present by commit time) and agree immediately. This is
 /// what prevents a node momentarily missing a data block from stranding. The
-/// data actor consumes the blocks at commit and lags gracefully if any are late.
+/// data actor consumes the blocks at commit and lags gracefully if any are
+/// late.
 ///
 /// ## Head reads (lock-free, stale-OK)
 /// When building a SigPropose, reads per-author
@@ -67,6 +69,17 @@ pub(crate) static INFLIGHT_COMMIT_TX_INNER: AtomicI64 = AtomicI64::new(0);
 pub(crate) static INFLIGHT_COMMITTED: AtomicI64 = AtomicI64::new(0);
 
 // ---------------------------------------------------------------------------
+// Backfill divergence counters (sig-element range requests / responses).
+// A growing (BACKFILL_REQUESTS - BACKFILL_RESPONSES) gap means backfill is
+// not keeping up and will diverge.
+// ---------------------------------------------------------------------------
+/// Total ranged/single sig-element fetch requests issued (single + range).
+pub(crate) static BACKFILL_REQUESTS: AtomicI64 = AtomicI64::new(0);
+/// Total sig-element fetch responses consumed (single + range, counted per
+/// element in a range response so the units match BACKFILL_REQUESTS).
+pub(crate) static BACKFILL_RESPONSES: AtomicI64 = AtomicI64::new(0);
+
+// ---------------------------------------------------------------------------
 // Type aliases
 // ---------------------------------------------------------------------------
 
@@ -96,8 +109,9 @@ pub struct HeraRoundState<Tx> {
     pub blame_map: FnvHashMap<Id, Signature<Id, Round>>,
     /// Highest sig-chain `(round, element-hash)` reported across the blames
     /// collected for the current round. The next leader extends this (the true
-    /// highest chain among the quorum), fetching the element from a blamer if it
-    /// does not have it (request-from-sender). Reset whenever blame_map clears.
+    /// highest chain among the quorum), fetching the element from a blamer if
+    /// it does not have it (request-from-sender). Reset whenever blame_map
+    /// clears.
     pub blame_best: Option<(Round, SigElementHash<Tx>)>,
     pub got_qc: bool,
     #[allow(dead_code)]
@@ -171,9 +185,10 @@ impl<Tx> HeraRoundState<Tx> {
 
     /// Forward catch-up: jump `current_round` directly to `target` (> current).
     /// Used when a *verified* SigPropose / SigBlameQC proves the cluster is
-    /// already at a higher round, so this node should rejoin the frontier rather
-    /// than strand in `future_msgs`. Stale current-round messages are dropped;
-    /// any messages already buffered for `target` are released for processing.
+    /// already at a higher round, so this node should rejoin the frontier
+    /// rather than strand in `future_msgs`. Stale current-round messages
+    /// are dropped; any messages already buffered for `target` are released
+    /// for processing.
     pub fn fast_forward(
         &mut self,
         target: Round,
@@ -222,6 +237,10 @@ pub const MAX_CANCEL_HANDLERS_PER_PEER: usize = 1024;
 /// via sig-element fetch), preventing a Byzantine-inflated round number from
 /// forcing an unbounded replay. Normal lag is a few rounds; this is generous.
 const MAX_SIG_CATCHUP: Round = 4096;
+
+/// Maximum number of sig-elements returned in a single SigElementRangeResponse.
+/// Caps message size; 256 elements covers ~200ms of lag at 1200 rounds/s.
+pub(crate) const MAX_RANGE_RESPONSE: usize = 256;
 
 pub struct Hera<Tx> {
     // ------------------------------------------------------------------
@@ -621,10 +640,21 @@ where
                     };
                     #[cfg(not(target_os = "linux"))]
                     let rss_kb: i64 = -1;
+                    let bf_req = BACKFILL_REQUESTS.load(AOrdering::Relaxed);
+                    let bf_resp = BACKFILL_RESPONSES.load(AOrdering::Relaxed);
                     eprintln!(
                         "CHANDEPTH: node={} sig_net={} loopback={} \
-                         commit_tx_inner={} rx_committed={} rss_kb={}",
-                        my_id, sig_net, loopback, tx_inner, committed, rss_kb,
+                         commit_tx_inner={} rx_committed={} \
+                         backfill_req={} backfill_resp={} backfill_gap={} rss_kb={}",
+                        my_id,
+                        sig_net,
+                        loopback,
+                        tx_inner,
+                        committed,
+                        bf_req,
+                        bf_resp,
+                        bf_req - bf_resp,
+                        rss_kb,
                     );
                 }
             });
@@ -706,9 +736,13 @@ where
                     let loopback = INFLIGHT_LOOPBACK.load(AOrdering::Relaxed);
                     let tx_inner = INFLIGHT_COMMIT_TX_INNER.load(AOrdering::Relaxed);
                     let committed_depth = INFLIGHT_COMMITTED.load(AOrdering::Relaxed);
+                    let bf_req = BACKFILL_REQUESTS.load(AOrdering::Relaxed);
+                    let bf_resp = BACKFILL_RESPONSES.load(AOrdering::Relaxed);
                     info!(
-                        "CHAN_DEPTH: sig_net={} loopback={} commit_tx_inner={} rx_committed={}",
+                        "CHAN_DEPTH: sig_net={} loopback={} commit_tx_inner={} rx_committed={} \
+                         backfill_req={} backfill_resp={} backfill_gap={}",
                         sig_net, loopback, tx_inner, committed_depth,
+                        bf_req, bf_resp, bf_req - bf_resp,
                     );
                 }
             }
@@ -742,7 +776,14 @@ where
                 // future_msgs; the parent sig-element chain is filled by the
                 // existing fetch path when the proposal is processed.
                 if r > self.round_state.round() && self.verify_future_proposal(proposal, auth, r) {
-                    self.catch_up_to(r);
+                    // catch_up_to always performs the fast-forward; it also returns
+                    // the skipped range (if > 1 round) so we can request the missing
+                    // sig-elements in a single bulk fetch.
+                    if let Some((from, to)) = self.catch_up_to(r) {
+                        if let Err(e) = self.broadcast_sig_range_request(from, to).await {
+                            warn!("Hera: range request after catch-up: {}", e);
+                        }
+                    }
                 }
                 self.round_state.enqueue(msg, r);
                 Ok(())
@@ -760,7 +801,11 @@ where
                             round,
                             self.round_state.round()
                         );
-                        self.catch_up_to(round);
+                        if let Some((from, to)) = self.catch_up_to(round) {
+                            if let Err(e) = self.broadcast_sig_range_request(from, to).await {
+                                warn!("Hera: range request after blame-QC catch-up: {}", e);
+                            }
+                        }
                     }
                 }
                 self.round_state.enqueue(msg, round);
@@ -778,6 +823,19 @@ where
             }
             HeraMsg::SigElementResponse { response } => {
                 self.on_sig_element_response(response.response()).await
+            }
+
+            // Ranged sig-element catch-up (fixes O(K) RTT backfill).
+            HeraMsg::SigElementRangeRequest {
+                source,
+                from_round,
+                to_round,
+            } => {
+                self.on_sig_element_range_request(source, from_round, to_round)
+                    .await
+            }
+            HeraMsg::SigElementRangeResponse { elements } => {
+                self.on_sig_element_range_response(elements).await
             }
 
             // Data-plane messages must NOT arrive on the sig transport.
@@ -845,19 +903,33 @@ where
     /// Fast-forward both the round buffer and the (lock-step) leader context to
     /// `target`. Caller must have already validated that `target` is justified
     /// (verified proposal or blame-QC) and within `MAX_SIG_CATCHUP`.
+    ///
+    /// Returns `Some((from_round, to_round))` if the jump skipped one or more
+    /// rounds for which we may be missing sig-chain elements. The caller
+    /// should fire a `SigElementRangeRequest` covering that range so the gap
+    /// does not cause the commit walker to stall.
     fn catch_up_to(
         &mut self,
         target: Round,
-    ) {
+    ) -> Option<(Round, Round)> {
         let cur = self.round_state.round();
         if target <= cur || target - cur > MAX_SIG_CATCHUP {
-            return;
+            return None;
         }
+        // Any rounds between cur (exclusive) and target (inclusive) were
+        // skipped; we may be missing their sig-chain elements.
+        let skipped_from = cur;
+        let skipped_to = target;
         for _ in 0..(target - cur) {
             self.sig_leader_context.advance_round();
         }
         self.round_state
             .fast_forward(target, &mut self.timer, &mut self.timer_enabled);
+        if skipped_to > skipped_from + 1 {
+            Some((skipped_from + 1, skipped_to))
+        } else {
+            None
+        }
     }
 
     async fn handle_sig_ordered(

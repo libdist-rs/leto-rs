@@ -19,8 +19,20 @@ use crypto::hash::Hash;
 use linked_hash_map::LinkedHashMap;
 use log::*;
 use serde::Serialize;
+use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+// ---------------------------------------------------------------------------
+// Walk instrumentation counters (commit task only; no cross-thread contention).
+// WALK_STORAGE_READS  = cumulative storage get_element calls.
+// WALK_SLOW_READS     = cumulative reads that took > 500 µs (saturation proxy).
+// WALK_STORAGE_MISSES = cumulative Ok(None) responses (chain gap indicator).
+// ---------------------------------------------------------------------------
+static WALK_COUNT: AtomicU64 = AtomicU64::new(0);
+static WALK_STORAGE_READS: AtomicU64 = AtomicU64::new(0);
+static WALK_SLOW_READS: AtomicU64 = AtomicU64::new(0);
+static WALK_STORAGE_MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Messages sent to the Hera commit task.
 pub enum HeraCommitMsg<Tx> {
@@ -127,17 +139,33 @@ where
                         continue;
                     }
 
+                    // --- Walk instrumentation ---
+                    let walk_start = std::time::Instant::now();
+                    let walk_id = WALK_COUNT.fetch_add(1, AOrdering::Relaxed);
+                    let walk_round = round_element.proposal.round();
+                    let mut walk_reads: u32 = 0;
+                    let mut walk_misses: u32 = 0;
+                    // Pending-depth log: warn when rx_inner has a large backlog
+                    // (proxy: we can't directly read the channel depth, but
+                    // INFLIGHT_COMMIT_TX_INNER gives us the enqueued count).
+                    let enqueued = crate::server::hera::core::INFLIGHT_COMMIT_TX_INNER
+                        .load(AOrdering::Relaxed);
+                    if enqueued > 100 {
+                        warn!(
+                            "Hera commit: rx_inner backlog={} (EndRound queue deep)",
+                            enqueued
+                        );
+                    }
+
                     debug!(
                         "Hera commit: EndRound round={} head_hash={:?} queue_len={} \
                          unique_proposers={}",
-                        round_element.proposal.round(),
+                        walk_round,
                         &round_element_hash,
                         commit_queue.len(),
                         unique_proposers.len(),
                     );
 
-                    let mut head = round_element;
-                    let mut head_hash = round_element_hash;
                     let mut local_queue =
                         LinkedHashMap::<SigElementHash<Tx>, Arc<SigElement<Tx>>>::with_capacity(
                             commit_len,
@@ -145,7 +173,24 @@ where
                     let mut local_unique_proposers = LinkedHashMap::<Id, usize>::default();
                     let mut connected = false;
 
-                    while head.proposal.round() > highest_committed_element.proposal.round() {
+                    // FIX 1: Derive the parent hash from the in-memory element
+                    // WITHOUT a storage read, eliminating the wasted first read
+                    // that was present in the old loop.  Insert the current head
+                    // once and immediately step to the parent.
+                    //
+                    // We carry `Option<Arc<SigElement<Tx>>>` so the loop can
+                    // detect the "moved out / broke early" case without a borrow.
+                    let mut cur: Option<Arc<SigElement<Tx>>> = Some(round_element);
+                    let mut head_hash = round_element_hash;
+
+                    loop {
+                        let head = match cur.take() {
+                            Some(h) => h,
+                            None => break,
+                        };
+                        if head.proposal.round() <= highest_committed_element.proposal.round() {
+                            break;
+                        }
                         if let Some((h, _)) = commit_queue.back() {
                             if h == &head_hash {
                                 connected = true;
@@ -155,14 +200,40 @@ where
                         if head_hash == highest_committed_hash {
                             break;
                         }
+
+                        // Record this element.
                         *local_unique_proposers
                             .entry(head.auth.get_id())
                             .or_insert(0) += 1;
-                        local_queue.insert(head_hash.clone(), head);
+                        // Extract parent hash from in-memory element — no read.
+                        let parent_hash = head.proposal.block().parent_hash();
+                        local_queue.insert(head_hash, head);
 
-                        head = match sig_chain_state.get_element(head_hash).await {
-                            Ok(Some(e)) => Arc::new(e),
+                        // FIX 1: Consult in-memory maps before hitting storage.
+                        // The fast path (connected chain) does ~0 storage reads.
+                        head_hash = parent_hash.clone();
+                        if let Some(e) = local_queue.get(&parent_hash) {
+                            cur = Some(Arc::clone(e));
+                            continue;
+                        }
+                        if let Some(e) = commit_queue.get(&parent_hash) {
+                            cur = Some(Arc::clone(e));
+                            continue;
+                        }
+
+                        // Fallback: read from storage.
+                        walk_reads += 1;
+                        let read_start = std::time::Instant::now();
+                        let fetched = sig_chain_state.get_element(parent_hash.clone()).await;
+                        let read_us = read_start.elapsed().as_micros();
+                        if read_us > 500 {
+                            WALK_SLOW_READS.fetch_add(1, AOrdering::Relaxed);
+                            warn!("Hera commit: slow storage read {}us", read_us,);
+                        }
+                        match fetched {
+                            Ok(Some(e)) => cur = Some(Arc::new(e)),
                             Ok(None) => {
+                                walk_misses += 1;
                                 error!("Hera commit: missing parent element");
                                 break;
                             }
@@ -170,8 +241,32 @@ where
                                 error!("Hera commit: error reading parent: {}", e);
                                 break;
                             }
-                        };
-                        head_hash = head.proposal.block().parent_hash();
+                        }
+                    }
+
+                    // Periodic walk diagnostics (every ~1000 walks).
+                    WALK_STORAGE_READS.fetch_add(walk_reads as u64, AOrdering::Relaxed);
+                    WALK_STORAGE_MISSES.fetch_add(walk_misses as u64, AOrdering::Relaxed);
+                    let walk_us = walk_start.elapsed().as_micros();
+                    if walk_id % 1000 == 0 {
+                        let total_reads = WALK_STORAGE_READS.load(AOrdering::Relaxed);
+                        let total_slow = WALK_SLOW_READS.load(AOrdering::Relaxed);
+                        let total_misses = WALK_STORAGE_MISSES.load(AOrdering::Relaxed);
+                        info!(
+                            "Hera commit WALK#{}: round={} reads={} misses={} walk_us={} \
+                             queue_len={} unique_proposers={} \
+                             cum_reads={} cum_slow={} cum_misses={}",
+                            walk_id,
+                            walk_round,
+                            walk_reads,
+                            walk_misses,
+                            walk_us,
+                            local_queue.len(),
+                            local_unique_proposers.len(),
+                            total_reads,
+                            total_slow,
+                            total_misses,
+                        );
                     }
 
                     if !connected {
