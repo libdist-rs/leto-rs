@@ -48,6 +48,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, Ordering as AOrdering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use storage::rocksdb::Storage;
 use tcp_reliable_sender::{CancelHandler, TcpReliableSender};
 use tokio::sync::{
@@ -304,6 +305,24 @@ pub struct Hera<Tx> {
     // ------------------------------------------------------------------
     pub(crate) bench_emit_interval: tokio::time::Interval,
     pub(crate) emit_dp: bool,
+
+    // ------------------------------------------------------------------
+    // Proposal pacing (env HERA_PROPOSE_INTERVAL_MS, default 0 = off)
+    // ------------------------------------------------------------------
+    /// If > 0, the sig-chain leader waits at least this long between proposals.
+    /// Default 0 means propose immediately (current behavior), so existing
+    /// tests and n=4..31 runs are unaffected unless the env var is set.
+    pub(crate) propose_interval: Duration,
+    /// Wall-clock instant of the last proposal we actually sent.
+    pub(crate) last_propose_at: Option<Instant>,
+    /// Round for which a proposal has been deferred by the pacing logic.
+    /// Cleared when the deferred proposal fires or the round advances past it.
+    pub(crate) pending_propose_round: Option<Round>,
+    /// Pacing timer: ticks at ~`propose_interval` so the deferred proposal
+    /// fires within one tick of becoming eligible. Only armed when pacing is
+    /// active (propose_interval > 0); otherwise driven by a far-future dummy
+    /// interval so the select arm is effectively disabled.
+    pub(crate) pace_timer: Interval,
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +578,25 @@ where
         // ---------------------------------------------------------------
         // Consensus (sig) actor
         // ---------------------------------------------------------------
+        // HERA_PROPOSE_INTERVAL_MS — proposal pacing interval (ms).
+        // 0 (default) = propose immediately on round entry (current behavior).
+        // >0 = the sig-chain leader waits at least this many ms between
+        //      proposals so data batches have time to fill.
+        let propose_interval_ms: u64 = std::env::var("HERA_PROPOSE_INTERVAL_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let propose_interval = Duration::from_millis(propose_interval_ms);
+        // Pacing timer: ticks at the propose interval when pacing is active,
+        // or at 1 hour (effectively never) when pacing is off, so the select
+        // arm is a no-op in the common case without any runtime overhead.
+        let pace_timer_ms = if propose_interval_ms > 0 {
+            propose_interval_ms
+        } else {
+            3_600_000 // 1 hour — effectively never fires
+        };
+        let pace_timer = interval(Duration::from_millis(pace_timer_ms));
+
         let consensus_actor = Hera::<Tx> {
             my_id,
             crypto_system,
@@ -578,7 +616,7 @@ where
             ),
             hera_commit_ctx,
             round_state: HeraRoundState::new(num_nodes),
-            timer: interval(std::time::Duration::from_millis(
+            timer: interval(Duration::from_millis(
                 std::env::var("HERA_ROUND_TIMER_MS")
                     .ok()
                     .and_then(|s| s.parse().ok())
@@ -593,6 +631,10 @@ where
             bench_emit_interval,
             emit_dp,
             settings,
+            propose_interval,
+            last_propose_at: None,
+            pending_propose_round: None,
+            pace_timer,
         };
 
         tokio::spawn(async move {
@@ -603,6 +645,44 @@ where
         });
 
         Ok(())
+    }
+
+    /// Called by the pace_timer select arm.  If a proposal was deferred (via
+    /// `pending_propose_round`) and the interval has now elapsed, send it.
+    /// Stale deferred rounds (behind current round) are silently dropped.
+    pub(crate) async fn try_fire_pending_propose(&mut self) -> Result<()>
+    where
+        Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
+    {
+        // No pending proposal — nothing to do.
+        let Some(deferred_round) = self.pending_propose_round else {
+            return Ok(());
+        };
+        let cur = self.round_state.round();
+        // The round advanced past the deferred proposal — drop the stale entry.
+        if deferred_round != cur {
+            self.pending_propose_round = None;
+            return Ok(());
+        }
+        // Not the leader for this round (shouldn't happen, but guard).
+        if self.sig_leader_context.leader() != self.my_id {
+            self.pending_propose_round = None;
+            return Ok(());
+        }
+        // Check elapsed since last proposal.
+        let elapsed = self
+            .last_propose_at
+            .map(|t| t.elapsed())
+            .unwrap_or(self.propose_interval + Duration::from_millis(1));
+        if elapsed < self.propose_interval {
+            // Interval hasn't elapsed yet — wait for the next tick.
+            return Ok(());
+        }
+        // Interval elapsed: fire the deferred proposal directly (bypassing the
+        // pacing gate in handle_new_sig_round to avoid a double-check).
+        self.pending_propose_round = None;
+        self.last_propose_at = Some(Instant::now());
+        self.do_propose(cur).await
     }
 
     async fn run(&mut self) -> Result<()>
@@ -685,6 +765,16 @@ where
                 _ = self.timer.tick(), if self.timer_enabled => {
                     if let Err(e) = self.on_round_timeout().await {
                         error!("Hera: on_round_timeout: {}", e);
+                    }
+                }
+
+                // Proposal pacing timer — fires deferred proposals once the
+                // interval has elapsed.  When pacing is off (propose_interval
+                // == 0) the pace_timer ticks every hour and the guard below
+                // immediately falls through, so this arm is effectively free.
+                _ = self.pace_timer.tick() => {
+                    if let Err(e) = self.try_fire_pending_propose().await {
+                        error!("Hera: pace timer proposal: {}", e);
                     }
                 }
 
