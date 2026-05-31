@@ -166,15 +166,9 @@ where
         batch: Batch<Tx>,
     ) -> Result<()> {
         self.proposed = true;
-        let result = self
-            .tx_outgoing_batch
+        self.tx_outgoing_batch
             .send(batch)
-            .map_err(anyhow::Error::new);
-        if result.is_ok() {
-            crate::server::hera::RRB_BATCHES_EMITTED
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        result
+            .map_err(anyhow::Error::new)
     }
 
     /// Proposes immediately if there are enough buffered transactions.

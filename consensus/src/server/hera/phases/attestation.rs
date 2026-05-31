@@ -22,7 +22,6 @@ use crypto::hash::Hash;
 use log::warn;
 use serde::Serialize;
 use std::marker::PhantomData;
-use std::sync::atomic::Ordering as AOrdering;
 
 /// Result of the sig-only validation (`multi_attestation_sig_valid`).
 #[derive(Debug)]
@@ -61,14 +60,6 @@ where
         let mut sorted_ids = all_ids;
         sorted_ids.sort_unstable();
 
-        // DP_PROFILE: measure attestation lag — how stale are the attested
-        // heads compared to the data actor's freshest locally-known head?
-        // lag_sum = sum over committee of max(0, local_latest_height -
-        // attested_height). A large value means the sig leader is attesting
-        // stale data (the data actor is not publishing fresh heads fast enough
-        // or the ArcSwap is behind).
-        let mut attest_lag_sum: u64 = 0;
-
         for id in sorted_ids {
             let prev_attested = self.prev_attested_heights.get(&id).copied().unwrap_or(0);
 
@@ -79,15 +70,6 @@ where
                 .map(|slot| (**slot.load()).clone());
 
             if let Some(snap) = snap {
-                // Attest-lag for this author: local freshest vs what we will attest.
-                let attesting_height = if snap.height > prev_attested {
-                    snap.height
-                } else {
-                    prev_attested
-                };
-                // local freshest - what we are about to attest (≥ 0).
-                attest_lag_sum += snap.height.saturating_sub(attesting_height);
-
                 if snap.height > prev_attested {
                     heads.push(DataHead {
                         author: id,
@@ -102,10 +84,6 @@ where
                 blames.push(id);
             }
         }
-
-        // Update global attest-lag counters (read by DP_PROFILE monitor).
-        crate::server::hera::core::DP_ATTEST_LAG_SUM.fetch_add(attest_lag_sum, AOrdering::Relaxed);
-        crate::server::hera::core::DP_ATTEST_COUNT.fetch_add(1, AOrdering::Relaxed);
 
         // Derive parent_hash_s from sig-chain highest hash.
         let parent_hash_s: Hash<MultiAttestationEnvelope<Tx>> = unsafe {

@@ -19,20 +19,8 @@ use crypto::hash::Hash;
 use linked_hash_map::LinkedHashMap;
 use log::*;
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-
-// ---------------------------------------------------------------------------
-// Walk instrumentation counters (commit task only; no cross-thread contention).
-// WALK_STORAGE_READS  = cumulative storage get_element calls.
-// WALK_SLOW_READS     = cumulative reads that took > 500 µs (saturation proxy).
-// WALK_STORAGE_MISSES = cumulative Ok(None) responses (chain gap indicator).
-// ---------------------------------------------------------------------------
-static WALK_COUNT: AtomicU64 = AtomicU64::new(0);
-static WALK_STORAGE_READS: AtomicU64 = AtomicU64::new(0);
-static WALK_SLOW_READS: AtomicU64 = AtomicU64::new(0);
-static WALK_STORAGE_MISSES: AtomicU64 = AtomicU64::new(0);
 
 /// Messages sent to the Hera commit task.
 pub enum HeraCommitMsg<Tx> {
@@ -110,30 +98,9 @@ where
         let genesis_hash = Hash::ser_and_hash(genesis_element.as_ref());
 
         // Commit quorum: minimum unique proposers in the sliding window required
-        // to commit a sig-chain element.  The safety-correct formula is
-        // (n+f+1)/2.  HERA_COMMIT_LEN overrides this for EXPERIMENTS ONLY
-        // (e.g. testing larger windows to understand commit-rate sensitivity).
-        // DEFAULT = (n+f+1)/2.  Clamped to [1, n].  Values below (n+f+1)/2 are
-        // unsafe; the env override is deliberately unclamped below the safety
-        // threshold so the user can run controlled experiments. Do NOT set this
-        // in production.
+        // to commit a sig-chain element.  Safety-correct formula: (n+f+1)/2.
         #[allow(clippy::manual_div_ceil)]
-        let safety_commit_len = (num_nodes + num_faults + 1) / 2;
-        let commit_len: usize = std::env::var("HERA_COMMIT_LEN")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .map(|v| v.max(1).min(num_nodes))
-            .unwrap_or(safety_commit_len);
-        if commit_len != safety_commit_len {
-            log::warn!(
-                "Hera commit: HERA_COMMIT_LEN={} overrides safety formula {} \
-                 (n={} f={}) — EXPERIMENTS ONLY, not safe in production",
-                commit_len,
-                safety_commit_len,
-                num_nodes,
-                num_faults,
-            );
-        }
+        let commit_len: usize = (num_nodes + num_faults + 1) / 2;
 
         let mut highest_committed_element = genesis_element.clone();
         let mut highest_committed_hash = genesis_hash.clone();
@@ -162,24 +129,7 @@ where
                         continue;
                     }
 
-                    // --- Walk instrumentation ---
-                    let walk_start = std::time::Instant::now();
-                    let walk_id = WALK_COUNT.fetch_add(1, AOrdering::Relaxed);
                     let walk_round = round_element.proposal.round();
-                    let mut walk_reads: u32 = 0;
-                    let mut walk_misses: u32 = 0;
-                    // Pending-depth log: warn when rx_inner has a large backlog
-                    // (proxy: we can't directly read the channel depth, but
-                    // INFLIGHT_COMMIT_TX_INNER gives us the enqueued count).
-                    let enqueued = crate::server::hera::core::INFLIGHT_COMMIT_TX_INNER
-                        .load(AOrdering::Relaxed);
-                    if enqueued > 100 {
-                        warn!(
-                            "Hera commit: rx_inner backlog={} (EndRound queue deep)",
-                            enqueued
-                        );
-                    }
-
                     debug!(
                         "Hera commit: EndRound round={} head_hash={:?} queue_len={} \
                          unique_proposers={}",
@@ -245,18 +195,10 @@ where
                         }
 
                         // Fallback: read from storage.
-                        walk_reads += 1;
-                        let read_start = std::time::Instant::now();
                         let fetched = sig_chain_state.get_element(parent_hash.clone()).await;
-                        let read_us = read_start.elapsed().as_micros();
-                        if read_us > 500 {
-                            WALK_SLOW_READS.fetch_add(1, AOrdering::Relaxed);
-                            warn!("Hera commit: slow storage read {}us", read_us,);
-                        }
                         match fetched {
                             Ok(Some(e)) => cur = Some(Arc::new(e)),
                             Ok(None) => {
-                                walk_misses += 1;
                                 error!("Hera commit: missing parent element");
                                 break;
                             }
@@ -265,31 +207,6 @@ where
                                 break;
                             }
                         }
-                    }
-
-                    // Periodic walk diagnostics (every ~1000 walks).
-                    WALK_STORAGE_READS.fetch_add(walk_reads as u64, AOrdering::Relaxed);
-                    WALK_STORAGE_MISSES.fetch_add(walk_misses as u64, AOrdering::Relaxed);
-                    let walk_us = walk_start.elapsed().as_micros();
-                    if walk_id % 1000 == 0 {
-                        let total_reads = WALK_STORAGE_READS.load(AOrdering::Relaxed);
-                        let total_slow = WALK_SLOW_READS.load(AOrdering::Relaxed);
-                        let total_misses = WALK_STORAGE_MISSES.load(AOrdering::Relaxed);
-                        info!(
-                            "Hera commit WALK#{}: round={} reads={} misses={} walk_us={} \
-                             queue_len={} unique_proposers={} \
-                             cum_reads={} cum_slow={} cum_misses={}",
-                            walk_id,
-                            walk_round,
-                            walk_reads,
-                            walk_misses,
-                            walk_us,
-                            local_queue.len(),
-                            local_unique_proposers.len(),
-                            total_reads,
-                            total_slow,
-                            total_misses,
-                        );
                     }
 
                     if !connected {

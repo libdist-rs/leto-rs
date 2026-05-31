@@ -22,7 +22,6 @@ use log::*;
 use mempool::Batch;
 use serde::Serialize;
 use std::sync::Arc;
-use std::time::Instant;
 
 impl<Tx> Hera<Tx>
 where
@@ -33,61 +32,12 @@ where
     // -----------------------------------------------------------------------
 
     /// Called when this node is the sig-chain leader and a new sig-chain round
-    /// begins.  When proposal pacing is active (`propose_interval > 0`) and
-    /// the last proposal was sent less than `propose_interval` ago, the
-    /// proposal is deferred: `pending_propose_round` is set to the current
-    /// round and `Ok(())` is returned without sending anything.  The
-    /// `pace_timer` select arm fires `try_fire_pending_propose` once the
-    /// interval elapses, which calls `do_propose` directly (no re-check).
-    ///
-    /// When pacing is off (default, `propose_interval == 0`), this is
-    /// byte-for-byte the previous behavior.
+    /// begins. Builds and broadcasts a SigPropose immediately.
     pub async fn handle_new_sig_round(&mut self) -> Result<()>
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
     {
         let r = self.round_state.round();
-
-        // --- Proposal pacing gate ---
-        // Only active when propose_interval > 0 (env HERA_PROPOSE_INTERVAL_MS).
-        if !self.propose_interval.is_zero() {
-            if let Some(last) = self.last_propose_at {
-                if last.elapsed() < self.propose_interval {
-                    // Too soon — defer this proposal.
-                    debug!(
-                        "Hera[n{}]: PACE-DEFER round={} (elapsed={:?} < interval={:?})",
-                        self.my_id,
-                        r,
-                        last.elapsed(),
-                        self.propose_interval,
-                    );
-                    self.pending_propose_round = Some(r);
-                    return Ok(());
-                }
-            }
-        }
-
-        // Update last_propose_at and clear any pending flag before sending.
-        self.last_propose_at = Some(Instant::now());
-        self.pending_propose_round = None;
-
-        self.do_propose(r).await
-    }
-
-    /// Unconditionally build and broadcast a SigPropose for round `r`.
-    /// Called by `handle_new_sig_round` (immediate path) and
-    /// `try_fire_pending_propose` (deferred path).  Callers are responsible
-    /// for updating `last_propose_at` / `pending_propose_round` before
-    /// calling this function.
-    pub(crate) async fn do_propose(
-        &mut self,
-        r: Round,
-    ) -> Result<()>
-    where
-        Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
-    {
-        // STALL DIAGNOSTIC: log every proposal so a stalled round can be
-        // correlated to whether its leader actually proposed (and when).
         info!("Hera[n{}]: PROPOSE round={}", self.my_id, r);
 
         let attestation = self.make_multi_attestation(r)?;
@@ -250,10 +200,6 @@ where
                 // fills the gap in one RTT; otherwise fall back to single.
                 let parent_round = proposal_round.saturating_sub(1);
                 if parent_round > our_highest + 1 {
-                    crate::server::hera::core::BACKFILL_REQUESTS.fetch_add(
-                        (parent_round - our_highest) as i64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
                     let msg = HeraMsg::<Tx>::SigElementRangeRequest {
                         source: self.my_id,
                         from_round: our_highest + 1,
@@ -522,10 +468,6 @@ where
         if from_round > to_round {
             return Ok(());
         }
-        crate::server::hera::core::BACKFILL_REQUESTS.fetch_add(
-            (to_round - from_round + 1) as i64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
         let msg = HeraMsg::<Tx>::SigElementRangeRequest {
             source: self.my_id,
             from_round,
@@ -615,8 +557,6 @@ where
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
     {
-        crate::server::hera::core::BACKFILL_RESPONSES
-            .fetch_add(elements.len() as i64, std::sync::atomic::Ordering::Relaxed);
         for element in elements {
             let element_hash: crate::server::hera::core::SigElementHash<Tx> =
                 Hash::ser_and_hash(&element);

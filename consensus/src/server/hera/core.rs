@@ -48,7 +48,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, Ordering as AOrdering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use storage::rocksdb::Storage;
 use tcp_reliable_sender::{CancelHandler, TcpReliableSender};
 use tokio::sync::{
@@ -58,7 +58,9 @@ use tokio::sync::{
 use tokio::time::{interval, Interval};
 
 // ---------------------------------------------------------------------------
-// PROFILE INSTRUMENTATION: in-flight depth counters for unbounded channels.
+// In-flight depth counters for unbounded channels.
+// These are functional: the commit task uses INFLIGHT_COMMIT_TX_INNER to track
+// send/recv symmetry, and the sig actor uses the others for the heartbeat log.
 // ---------------------------------------------------------------------------
 /// Depth of rx_sig_net (net → consensus actor, sig-plane).
 pub(crate) static INFLIGHT_SIG_NET: AtomicI64 = AtomicI64::new(0);
@@ -68,97 +70,6 @@ pub(crate) static INFLIGHT_LOOPBACK: AtomicI64 = AtomicI64::new(0);
 pub(crate) static INFLIGHT_COMMIT_TX_INNER: AtomicI64 = AtomicI64::new(0);
 /// Depth of rx_committed (commit task → consensus actor).
 pub(crate) static INFLIGHT_COMMITTED: AtomicI64 = AtomicI64::new(0);
-
-// ---------------------------------------------------------------------------
-// Backfill divergence counters (sig-element range requests / responses).
-// A growing (BACKFILL_REQUESTS - BACKFILL_RESPONSES) gap means backfill is
-// not keeping up and will diverge.
-// ---------------------------------------------------------------------------
-/// Total ranged/single sig-element fetch requests issued (single + range).
-pub(crate) static BACKFILL_REQUESTS: AtomicI64 = AtomicI64::new(0);
-/// Total sig-element fetch responses consumed (single + range, counted per
-/// element in a range response so the units match BACKFILL_REQUESTS).
-pub(crate) static BACKFILL_RESPONSES: AtomicI64 = AtomicI64::new(0);
-
-// ---------------------------------------------------------------------------
-// DATA-PLANE PROFILE COUNTERS
-// These are updated by the data actor and read by the CHANDEPTH monitor task.
-// All counters are global (process-wide); in the stress-test harness each node
-// runs in its own process so there is no aliasing.
-//
-// DP_BLOCKS_PRODUCED  — cumulative data blocks self-proposed (my_height tip).
-// DP_TXS_PRODUCED     — cumulative txs batched into self-proposed blocks.
-// DP_BLOCKS_RECEIVED  — cumulative data blocks received + admitted (peer
-// DataPropose/DataResponse). DP_VERIFY_CALLS     — cumulative
-// verify_data_block_sig calls (in pump task). DP_VERIFY_SLOW      — cumulative
-// calls that took > 200 µs (saturation proxy). DP_HEAD_PUBS        — cumulative
-// ArcSwap head_snapshot publications (per-author head updates).
-// DP_COMMIT_EVENTS    — cumulative commit-emit events (rx_commit_emit drains).
-// DP_COMMIT_TXS       — cumulative txs emitted via on_commit_emit.
-// DP_ATTEST_LAG_SUM   — cumulative sum of (local_head - attested_head)
-// per-author per proposal. DP_ATTEST_COUNT     — cumulative proposals for which
-// attest lag was measured.
-// ---------------------------------------------------------------------------
-use std::sync::atomic::AtomicU64;
-pub(crate) static DP_BLOCKS_PRODUCED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DP_TXS_PRODUCED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DP_BLOCKS_RECEIVED: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DP_VERIFY_CALLS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DP_VERIFY_SLOW: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DP_HEAD_PUBS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DP_COMMIT_EVENTS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DP_COMMIT_TXS: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DP_ATTEST_LAG_SUM: AtomicU64 = AtomicU64::new(0);
-pub(crate) static DP_ATTEST_COUNT: AtomicU64 = AtomicU64::new(0);
-
-// ---------------------------------------------------------------------------
-// DA_BRANCHES: per-select-branch fire counters (data actor).
-// Updated by HeraDataActor::run(); read by the 2-s monitor task.
-// ---------------------------------------------------------------------------
-/// Branch 1: rx_commit_emit fires (low-vol, liveness-critical).
-pub(crate) static DA_BR_COMMIT: AtomicU64 = AtomicU64::new(0);
-/// Branch 2: rx_fetch_hint fires.
-pub(crate) static DA_BR_HINT: AtomicU64 = AtomicU64::new(0);
-/// Branch 3: awaiting_acks.next() fires (ack gate).
-pub(crate) static DA_BR_ACK: AtomicU64 = AtomicU64::new(0);
-/// Branch 4: rx_data_batch fires (self-propose — the stall suspect).
-pub(crate) static DA_BR_SELF_PROPOSE: AtomicU64 = AtomicU64::new(0);
-/// Branch 5: rx_verified_blocks recv_many fires.
-pub(crate) static DA_BR_INBOUND: AtomicU64 = AtomicU64::new(0);
-/// Branch 6: bench_emit_interval tick fires.
-pub(crate) static DA_BR_BENCH: AtomicU64 = AtomicU64::new(0);
-
-// ---------------------------------------------------------------------------
-// DA_PIPE: data-actor pipeline health counters.
-// ---------------------------------------------------------------------------
-/// Cumulative blocks drained from rx_verified_blocks (sum of recv_many counts).
-pub(crate) static DA_INBOUND_BLOCKS_DRAINED: AtomicU64 = AtomicU64::new(0);
-/// Cumulative times on_self_propose was entered but the chain-lead cap fired
-/// (batch dropped because lead >= max_chain_lead).
-pub(crate) static DA_LEAD_CAP_DROPS: AtomicU64 = AtomicU64::new(0);
-/// Cumulative microseconds spent inside on_commit_emit (Branch 1 wall-time).
-pub(crate) static DA_COMMIT_US: AtomicU64 = AtomicU64::new(0);
-/// Monotone ns timestamp of the last time on_self_propose ran to completion
-/// (block actually produced). 0 = never. Written with Relaxed; used for
-/// stall detection in the bench tick (delta since last self-propose).
-pub(crate) static DA_LAST_SELF_PROPOSE_NS: AtomicU64 = AtomicU64::new(0);
-/// Cumulative nanoseconds can_propose was False at the start of each loop
-/// iteration where branch 4 was evaluated but skipped (ack-gate wait time
-/// proxy). Incremented only in the bench tick using a local accumulator so
-/// overhead is zero on the hot path.
-pub(crate) static DA_CAN_PROPOSE_FALSE_NS: AtomicU64 = AtomicU64::new(0);
-
-// ---------------------------------------------------------------------------
-// DA_PIPE: load-gen + batcher pipeline counters.
-// Updated by load_gen::spawn task and RRBatcher; read by monitor task.
-// ---------------------------------------------------------------------------
-/// Cumulative txs the load generator successfully sent into the batcher
-/// channel.
-pub(crate) static LG_TXS_SENT: AtomicU64 = AtomicU64::new(0);
-/// Cumulative 100-ms windows the load generator SKIPPED (chain-lead gate).
-pub(crate) static LG_WINDOWS_SKIPPED: AtomicU64 = AtomicU64::new(0);
-/// Cumulative batches the RRBatcher emitted into rx_data_batch.
-pub(crate) static RRB_BATCHES_EMITTED: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Type aliases
@@ -385,24 +296,6 @@ pub struct Hera<Tx> {
     // ------------------------------------------------------------------
     pub(crate) bench_emit_interval: tokio::time::Interval,
     pub(crate) emit_dp: bool,
-
-    // ------------------------------------------------------------------
-    // Proposal pacing (env HERA_PROPOSE_INTERVAL_MS, default 0 = off)
-    // ------------------------------------------------------------------
-    /// If > 0, the sig-chain leader waits at least this long between proposals.
-    /// Default 0 means propose immediately (current behavior), so existing
-    /// tests and n=4..31 runs are unaffected unless the env var is set.
-    pub(crate) propose_interval: Duration,
-    /// Wall-clock instant of the last proposal we actually sent.
-    pub(crate) last_propose_at: Option<Instant>,
-    /// Round for which a proposal has been deferred by the pacing logic.
-    /// Cleared when the deferred proposal fires or the round advances past it.
-    pub(crate) pending_propose_round: Option<Round>,
-    /// Pacing timer: ticks at ~`propose_interval` so the deferred proposal
-    /// fires within one tick of becoming eligible. Only armed when pacing is
-    /// active (propose_interval > 0); otherwise driven by a far-future dummy
-    /// interval so the select arm is effectively disabled.
-    pub(crate) pace_timer: Interval,
 }
 
 // ---------------------------------------------------------------------------
@@ -659,25 +552,6 @@ where
         // ---------------------------------------------------------------
         // Consensus (sig) actor
         // ---------------------------------------------------------------
-        // HERA_PROPOSE_INTERVAL_MS — proposal pacing interval (ms).
-        // 0 (default) = propose immediately on round entry (current behavior).
-        // >0 = the sig-chain leader waits at least this many ms between
-        //      proposals so data batches have time to fill.
-        let propose_interval_ms: u64 = std::env::var("HERA_PROPOSE_INTERVAL_MS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let propose_interval = Duration::from_millis(propose_interval_ms);
-        // Pacing timer: ticks at the propose interval when pacing is active,
-        // or at 1 hour (effectively never) when pacing is off, so the select
-        // arm is a no-op in the common case without any runtime overhead.
-        let pace_timer_ms = if propose_interval_ms > 0 {
-            propose_interval_ms
-        } else {
-            3_600_000 // 1 hour — effectively never fires
-        };
-        let pace_timer = interval(Duration::from_millis(pace_timer_ms));
-
         let consensus_actor = Hera::<Tx> {
             my_id,
             crypto_system,
@@ -712,10 +586,6 @@ where
             bench_emit_interval,
             emit_dp,
             settings,
-            propose_interval,
-            last_propose_at: None,
-            pending_propose_round: None,
-            pace_timer,
         };
 
         tokio::spawn(async move {
@@ -728,44 +598,6 @@ where
         Ok(())
     }
 
-    /// Called by the pace_timer select arm.  If a proposal was deferred (via
-    /// `pending_propose_round`) and the interval has now elapsed, send it.
-    /// Stale deferred rounds (behind current round) are silently dropped.
-    pub(crate) async fn try_fire_pending_propose(&mut self) -> Result<()>
-    where
-        Tx: Clone + Serialize + PartialEq + std::fmt::Debug,
-    {
-        // No pending proposal — nothing to do.
-        let Some(deferred_round) = self.pending_propose_round else {
-            return Ok(());
-        };
-        let cur = self.round_state.round();
-        // The round advanced past the deferred proposal — drop the stale entry.
-        if deferred_round != cur {
-            self.pending_propose_round = None;
-            return Ok(());
-        }
-        // Not the leader for this round (shouldn't happen, but guard).
-        if self.sig_leader_context.leader() != self.my_id {
-            self.pending_propose_round = None;
-            return Ok(());
-        }
-        // Check elapsed since last proposal.
-        let elapsed = self
-            .last_propose_at
-            .map(|t| t.elapsed())
-            .unwrap_or(self.propose_interval + Duration::from_millis(1));
-        if elapsed < self.propose_interval {
-            // Interval hasn't elapsed yet — wait for the next tick.
-            return Ok(());
-        }
-        // Interval elapsed: fire the deferred proposal directly (bypassing the
-        // pacing gate in handle_new_sig_round to avoid a double-check).
-        self.pending_propose_round = None;
-        self.last_propose_at = Some(Instant::now());
-        self.do_propose(cur).await
-    }
-
     async fn run(&mut self) -> Result<()>
     where
         Tx: Clone + Serialize + PartialEq + std::fmt::Debug + 'static,
@@ -775,251 +607,6 @@ where
         // No startup gate needed: TcpReliableSender queues and retransmits
         // until each peer connects, so the bootstrap proposal is reliably
         // delivered even to late-connecting peers.
-
-        // PROFILE INSTRUMENTATION: independent monitor task.
-        // Ticks every 2 s and emits two log lines:
-        //   CHANDEPTH — sig-plane channel depths + backfill gaps (existing)
-        //   DP_PROFILE — data-plane production/admission/commit/attest-lag rates
-        // Rates are computed as deltas over the 2 s window (divide by interval_s
-        // to get per-second rates). All reads are Relaxed; the monitor only reads.
-        {
-            let my_id = self.my_id;
-            tokio::spawn(async move {
-                // 2-second tick keeps the log volume low (~30 lines/min per node).
-                let interval_ms: u64 = 2_000;
-                let interval_s = interval_ms as f64 / 1_000.0;
-                let mut ticker =
-                    tokio::time::interval(std::time::Duration::from_millis(interval_ms));
-                // Shadow-previous values for delta computation.
-                let mut prev_blk_prod: u64 = 0;
-                let mut prev_tx_prod: u64 = 0;
-                let mut prev_blk_recv: u64 = 0;
-                let mut prev_verify: u64 = 0;
-                let mut prev_head_pubs: u64 = 0;
-                let mut prev_commit_ev: u64 = 0;
-                let mut prev_commit_tx: u64 = 0;
-                let mut prev_attest_lag: u64 = 0;
-                let mut prev_attest_cnt: u64 = 0;
-                // DA_BRANCHES previous values.
-                let mut prev_da_br_commit: u64 = 0;
-                let mut prev_da_br_hint: u64 = 0;
-                let mut prev_da_br_ack: u64 = 0;
-                let mut prev_da_br_self_propose: u64 = 0;
-                let mut prev_da_br_inbound: u64 = 0;
-                let mut prev_da_br_bench: u64 = 0;
-                // DA_PIPE previous values.
-                let mut prev_da_inbound_drained: u64 = 0;
-                let mut prev_da_lead_cap_drops: u64 = 0;
-                let mut prev_da_commit_us: u64 = 0;
-                // LG / RRB previous values.
-                let mut prev_lg_txs_sent: u64 = 0;
-                let mut prev_lg_windows_skipped: u64 = 0;
-                let mut prev_rrb_batches: u64 = 0;
-                loop {
-                    ticker.tick().await;
-                    let sig_net = INFLIGHT_SIG_NET.load(AOrdering::Relaxed);
-                    let loopback = INFLIGHT_LOOPBACK.load(AOrdering::Relaxed);
-                    let tx_inner = INFLIGHT_COMMIT_TX_INNER.load(AOrdering::Relaxed);
-                    let committed = INFLIGHT_COMMITTED.load(AOrdering::Relaxed);
-                    #[cfg(target_os = "linux")]
-                    let rss_kb: i64 = {
-                        std::fs::read_to_string("/proc/self/status")
-                            .ok()
-                            .and_then(|s| {
-                                s.lines()
-                                    .find(|l| l.starts_with("VmRSS:"))
-                                    .and_then(|l| l.split_whitespace().nth(1))
-                                    .and_then(|v| v.parse().ok())
-                            })
-                            .unwrap_or(-1)
-                    };
-                    #[cfg(not(target_os = "linux"))]
-                    let rss_kb: i64 = -1;
-                    let bf_req = BACKFILL_REQUESTS.load(AOrdering::Relaxed);
-                    let bf_resp = BACKFILL_RESPONSES.load(AOrdering::Relaxed);
-                    eprintln!(
-                        "CHANDEPTH: node={} sig_net={} loopback={} \
-                         commit_tx_inner={} rx_committed={} \
-                         backfill_req={} backfill_resp={} backfill_gap={} rss_kb={}",
-                        my_id,
-                        sig_net,
-                        loopback,
-                        tx_inner,
-                        committed,
-                        bf_req,
-                        bf_resp,
-                        bf_req - bf_resp,
-                        rss_kb,
-                    );
-
-                    // --- Data-plane profile snapshot ---
-                    let blk_prod = DP_BLOCKS_PRODUCED.load(AOrdering::Relaxed);
-                    let tx_prod = DP_TXS_PRODUCED.load(AOrdering::Relaxed);
-                    let blk_recv = DP_BLOCKS_RECEIVED.load(AOrdering::Relaxed);
-                    let verify = DP_VERIFY_CALLS.load(AOrdering::Relaxed);
-                    let verify_slow = DP_VERIFY_SLOW.load(AOrdering::Relaxed);
-                    let head_pubs = DP_HEAD_PUBS.load(AOrdering::Relaxed);
-                    let commit_ev = DP_COMMIT_EVENTS.load(AOrdering::Relaxed);
-                    let commit_tx = DP_COMMIT_TXS.load(AOrdering::Relaxed);
-                    let attest_lag = DP_ATTEST_LAG_SUM.load(AOrdering::Relaxed);
-                    let attest_cnt = DP_ATTEST_COUNT.load(AOrdering::Relaxed);
-
-                    // Rates over the last interval.
-                    let dblk_prod = blk_prod.saturating_sub(prev_blk_prod);
-                    let dtx_prod = tx_prod.saturating_sub(prev_tx_prod);
-                    let dblk_recv = blk_recv.saturating_sub(prev_blk_recv);
-                    let dverify = verify.saturating_sub(prev_verify);
-                    let dhead = head_pubs.saturating_sub(prev_head_pubs);
-                    let dcommit_ev = commit_ev.saturating_sub(prev_commit_ev);
-                    let dcommit_tx = commit_tx.saturating_sub(prev_commit_tx);
-                    let dattest_lag = attest_lag.saturating_sub(prev_attest_lag);
-                    let dattest_cnt = attest_cnt.saturating_sub(prev_attest_cnt);
-
-                    // Average attest-lag per proposal over this window.
-                    let avg_attest_lag = if dattest_cnt > 0 {
-                        dattest_lag as f64 / dattest_cnt as f64
-                    } else {
-                        0.0
-                    };
-                    // Average txs emitted per commit event.
-                    let avg_tx_per_commit = if dcommit_ev > 0 {
-                        dcommit_tx as f64 / dcommit_ev as f64
-                    } else {
-                        0.0
-                    };
-
-                    eprintln!(
-                        "DP_PROFILE: node={} \
-                         blk_prod/s={:.1} tx_prod/s={:.1} \
-                         blk_recv/s={:.1} verify/s={:.1} verify_slow_cum={} \
-                         head_pub/s={:.1} \
-                         commit_ev/s={:.1} commit_tx/s={:.1} avg_tx_per_commit={:.1} \
-                         attest_lag_avg={:.1} attest_proposals={}",
-                        my_id,
-                        dblk_prod as f64 / interval_s,
-                        dtx_prod as f64 / interval_s,
-                        dblk_recv as f64 / interval_s,
-                        dverify as f64 / interval_s,
-                        verify_slow,
-                        dhead as f64 / interval_s,
-                        dcommit_ev as f64 / interval_s,
-                        dcommit_tx as f64 / interval_s,
-                        avg_tx_per_commit,
-                        avg_attest_lag,
-                        dattest_cnt,
-                    );
-
-                    // --- DA_BRANCHES: per-select-branch fire rates ---
-                    let da_br_commit = DA_BR_COMMIT.load(AOrdering::Relaxed);
-                    let da_br_hint = DA_BR_HINT.load(AOrdering::Relaxed);
-                    let da_br_ack = DA_BR_ACK.load(AOrdering::Relaxed);
-                    let da_br_sp = DA_BR_SELF_PROPOSE.load(AOrdering::Relaxed);
-                    let da_br_inbound = DA_BR_INBOUND.load(AOrdering::Relaxed);
-                    let da_br_bench = DA_BR_BENCH.load(AOrdering::Relaxed);
-                    let dda_commit = da_br_commit.saturating_sub(prev_da_br_commit);
-                    let dda_hint = da_br_hint.saturating_sub(prev_da_br_hint);
-                    let dda_ack = da_br_ack.saturating_sub(prev_da_br_ack);
-                    let dda_sp = da_br_sp.saturating_sub(prev_da_br_self_propose);
-                    let dda_inbound = da_br_inbound.saturating_sub(prev_da_br_inbound);
-                    let dda_bench = da_br_bench.saturating_sub(prev_da_br_bench);
-
-                    // --- DA_PIPE: pipeline health ---
-                    let da_in_drained = DA_INBOUND_BLOCKS_DRAINED.load(AOrdering::Relaxed);
-                    let da_lead_drops = DA_LEAD_CAP_DROPS.load(AOrdering::Relaxed);
-                    let da_commit_us = DA_COMMIT_US.load(AOrdering::Relaxed);
-                    let da_last_sp_ns = DA_LAST_SELF_PROPOSE_NS.load(AOrdering::Relaxed);
-                    let dda_in_drained = da_in_drained.saturating_sub(prev_da_inbound_drained);
-                    let dda_lead_drops = da_lead_drops.saturating_sub(prev_da_lead_cap_drops);
-                    let dda_commit_us = da_commit_us.saturating_sub(prev_da_commit_us);
-
-                    // Time since last self-propose (0 if never ran).
-                    let stall_since_ms: i64 = if da_last_sp_ns > 0 {
-                        let now_ns = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_nanos() as u64)
-                            .unwrap_or(0);
-                        (now_ns.saturating_sub(da_last_sp_ns) / 1_000_000) as i64
-                    } else {
-                        -1 // never produced
-                    };
-
-                    // Avg blocks per inbound recv_many call.
-                    let avg_inbound_drain = if dda_inbound > 0 {
-                        dda_in_drained as f64 / dda_inbound as f64
-                    } else {
-                        0.0
-                    };
-                    // Fraction of wall-time Branch 1 consumed (us spent / interval_us).
-                    let commit_wall_pct = dda_commit_us as f64 / (interval_s * 1_000_000.0) * 100.0;
-
-                    eprintln!(
-                        "DA_BRANCHES: node={} \
-                         commit/s={:.1} hint/s={:.1} ack/s={:.1} \
-                         self_propose/s={:.1} inbound/s={:.1} bench/s={:.1}",
-                        my_id,
-                        dda_commit as f64 / interval_s,
-                        dda_hint as f64 / interval_s,
-                        dda_ack as f64 / interval_s,
-                        dda_sp as f64 / interval_s,
-                        dda_inbound as f64 / interval_s,
-                        dda_bench as f64 / interval_s,
-                    );
-                    eprintln!(
-                        "DA_PIPE: node={} \
-                         inbound_blk/s={:.1} avg_drain_per_call={:.1} \
-                         lead_cap_drops/s={:.1} \
-                         commit_wall_pct={:.1} commit_us/s={:.0} \
-                         stall_since_ms={}",
-                        my_id,
-                        dda_in_drained as f64 / interval_s,
-                        avg_inbound_drain,
-                        dda_lead_drops as f64 / interval_s,
-                        commit_wall_pct,
-                        dda_commit_us as f64 / interval_s,
-                        stall_since_ms,
-                    );
-
-                    // --- LG + RRB: upstream pipeline ---
-                    let lg_sent = LG_TXS_SENT.load(AOrdering::Relaxed);
-                    let lg_skipped = LG_WINDOWS_SKIPPED.load(AOrdering::Relaxed);
-                    let rrb_batches = RRB_BATCHES_EMITTED.load(AOrdering::Relaxed);
-                    let dlg_sent = lg_sent.saturating_sub(prev_lg_txs_sent);
-                    let dlg_skipped = lg_skipped.saturating_sub(prev_lg_windows_skipped);
-                    let drrb = rrb_batches.saturating_sub(prev_rrb_batches);
-                    eprintln!(
-                        "DA_PIPE_UP: node={} \
-                         lg_tx_sent/s={:.1} lg_windows_skipped/s={:.1} \
-                         rrb_batches_emitted/s={:.1}",
-                        my_id,
-                        dlg_sent as f64 / interval_s,
-                        dlg_skipped as f64 / interval_s,
-                        drrb as f64 / interval_s,
-                    );
-
-                    prev_blk_prod = blk_prod;
-                    prev_tx_prod = tx_prod;
-                    prev_blk_recv = blk_recv;
-                    prev_verify = verify;
-                    prev_head_pubs = head_pubs;
-                    prev_commit_ev = commit_ev;
-                    prev_commit_tx = commit_tx;
-                    prev_attest_lag = attest_lag;
-                    prev_attest_cnt = attest_cnt;
-                    prev_da_br_commit = da_br_commit;
-                    prev_da_br_hint = da_br_hint;
-                    prev_da_br_ack = da_br_ack;
-                    prev_da_br_self_propose = da_br_sp;
-                    prev_da_br_inbound = da_br_inbound;
-                    prev_da_br_bench = da_br_bench;
-                    prev_da_inbound_drained = da_in_drained;
-                    prev_da_lead_cap_drops = da_lead_drops;
-                    prev_da_commit_us = da_commit_us;
-                    prev_lg_txs_sent = lg_sent;
-                    prev_lg_windows_skipped = lg_skipped;
-                    prev_rrb_batches = rrb_batches;
-                }
-            });
-        }
 
         self.timer.reset();
         self.bench_emit_interval.tick().await;
@@ -1046,16 +633,6 @@ where
                 _ = self.timer.tick(), if self.timer_enabled => {
                     if let Err(e) = self.on_round_timeout().await {
                         error!("Hera: on_round_timeout: {}", e);
-                    }
-                }
-
-                // Proposal pacing timer — fires deferred proposals once the
-                // interval has elapsed.  When pacing is off (propose_interval
-                // == 0) the pace_timer ticks every hour and the guard below
-                // immediately falls through, so this arm is effectively free.
-                _ = self.pace_timer.tick() => {
-                    if let Err(e) = self.try_fire_pending_propose().await {
-                        error!("Hera: pace timer proposal: {}", e);
                     }
                 }
 
@@ -1102,18 +679,6 @@ where
                         "Hera HB: round={} highest_chained={}",
                         self.round_state.round(),
                         self.sig_chain_state.highest_chain().proposal.round(),
-                    );
-                    let sig_net = INFLIGHT_SIG_NET.load(AOrdering::Relaxed);
-                    let loopback = INFLIGHT_LOOPBACK.load(AOrdering::Relaxed);
-                    let tx_inner = INFLIGHT_COMMIT_TX_INNER.load(AOrdering::Relaxed);
-                    let committed_depth = INFLIGHT_COMMITTED.load(AOrdering::Relaxed);
-                    let bf_req = BACKFILL_REQUESTS.load(AOrdering::Relaxed);
-                    let bf_resp = BACKFILL_RESPONSES.load(AOrdering::Relaxed);
-                    info!(
-                        "CHAN_DEPTH: sig_net={} loopback={} commit_tx_inner={} rx_committed={} \
-                         backfill_req={} backfill_resp={} backfill_gap={}",
-                        sig_net, loopback, tx_inner, committed_depth,
-                        bf_req, bf_resp, bf_req - bf_resp,
                     );
                 }
             }
@@ -1386,10 +951,6 @@ impl<Tx> std::fmt::Debug for Hera<Tx> {
 
 /// Verify a DataBlock's author signature. Used in the data-plane inbound pump
 /// task (off the actor loop) so verification parallelizes across peers/cores.
-///
-/// Instrumentation: increments DP_VERIFY_CALLS on every call and DP_VERIFY_SLOW
-/// when the verify takes > 200 µs (a proxy for CPU saturation in the pump
-/// task).
 fn verify_data_block_sig<Tx>(
     crypto_system: &KeyConfig,
     block: &crate::types::DataBlock<Tx>,
@@ -1397,20 +958,11 @@ fn verify_data_block_sig<Tx>(
 where
     Tx: serde::Serialize + Clone,
 {
-    let t0 = Instant::now();
     let author = block.sig.signer;
     let pk = match crypto_system.system.get(&author) {
         Some(pk) => pk,
-        None => {
-            DP_VERIFY_CALLS.fetch_add(1, AOrdering::Relaxed);
-            return false;
-        }
+        None => return false,
     };
     let env_hash = block.hash();
-    let ok = pk.verify(env_hash.as_ref(), &block.sig.raw);
-    DP_VERIFY_CALLS.fetch_add(1, AOrdering::Relaxed);
-    if t0.elapsed().as_micros() > 200 {
-        DP_VERIFY_SLOW.fetch_add(1, AOrdering::Relaxed);
-    }
-    ok
+    pk.verify(env_hash.as_ref(), &block.sig.raw)
 }

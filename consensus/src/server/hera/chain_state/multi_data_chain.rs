@@ -173,9 +173,6 @@ where
 
     /// Publish the current admitted head for `author` into the lock-free
     /// ArcSwap slot. Called internally after every successful admission.
-    ///
-    /// DP_PROFILE instrumentation: increments DP_HEAD_PUBS on every publication
-    /// so the monitor task can measure head-snapshot update frequency.
     pub fn publish_head(
         &self,
         author: Id,
@@ -192,10 +189,6 @@ where
                 hash: hash.clone(),
             }));
             snap_slot.store(snap);
-            // Count every ArcSwap publication so the CHANDEPTH monitor can
-            // confirm that heads are being refreshed fast enough.
-            crate::server::hera::core::DP_HEAD_PUBS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
